@@ -23,6 +23,7 @@
 #include "libpq/libpq-be.h"
 #include "libpq/libpq.h"
 #include "miscadmin.h"
+#include "parser/parsereng.h"
 #include "postmaster/protocol_routine.h"
 #include "tcop/dest.h"
 #include "utils/builtins.h"
@@ -803,7 +804,7 @@ static const ProtocolRoutine MySQLProtocolRoutine = {
     .send_error = mysql_send_error,
     .report_parameter_status = mysql_report_parameter_status,
 
-    .parser_routine = NULL,         /* standard PG parser for M1             */
+    .parser_routine = &MySQLParserRoutine,
 };
 
 /* ----------------------------------------------------------------
