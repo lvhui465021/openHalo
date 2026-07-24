@@ -30,6 +30,7 @@
 #include "adapter/mysql/mysql_packet.h"
 #include "libpq/crypt.h"
 #include "libpq/libpq-be.h"
+#include "libpq/libpq.h"
 #include "libpq/pqcomm.h"           /* pq_getmsgstring, etc. (may borrow)  */
 #include "miscadmin.h"
 #include "postmaster/protocol_routine.h"
@@ -212,9 +213,7 @@ mysql_send_greeting(MysPacketState *ps, Port *port)
         payload[pos++] = '\0';
     }
 
-    ereport(LOG, (errmsg("MySQL: sending greeting packet, %d bytes", pos)));
     mysql_packet_write(ps, payload, (size_t) pos);
-    ereport(LOG, (errmsg("MySQL: greeting sent")));
 }
 
 /* ----------------------------------------------------------------
@@ -263,20 +262,16 @@ mysql_verify_login(MysPacketState *ps, Port *port)
     const char *schema_name = NULL;
     const char *auth_plugin_name = NULL;
 
-    ereport(LOG, (errmsg("MySQL: waiting for login packet...")));
     /* Read the login (handshake response) packet. */
     if (!mysql_packet_read(ps, &payload, &len))
     {
-        ereport(LOG, (errmsg("MySQL: login packet read FAILED")));
         ereport(COMMERROR,
                 (errmsg("failed to read MySQL login packet")));
         return STATUS_ERROR;
     }
-    ereport(LOG, (errmsg("MySQL: received login packet, %zu bytes", len)));
 
     if (len < 36)
     {
-        ereport(LOG, (errmsg("MySQL: login packet too short (%zu < 36)", len)));
         ereport(COMMERROR,
                 (errmsg("MySQL login packet too short (%zu bytes)", len)));
         pfree(payload);
@@ -345,8 +340,6 @@ mysql_verify_login(MysPacketState *ps, Port *port)
         }
     }
 
-    ereport(LOG, (errmsg("MySQL: parsed login: cap=0x%08x, remaining=%zu",
-                         client_cap, remaining)));
 
     /* --- Auth plugin name (NUL-terminated, if CLIENT_PLUGIN_AUTH) --- */
     if ((client_cap & CLIENT_PLUGIN_AUTH) && remaining > 0)
@@ -428,8 +421,6 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
     const char   *logdetail;
     int           auth_result;
 
-    ereport(LOG, (errmsg("MySQL: authenticate begin, user=%s",
-                         port->user_name ? port->user_name : "(null)")));
 
     if (auth == NULL)
     {
@@ -471,7 +462,6 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
                         port->user_name)));
     }
 
-    ereport(LOG, (errmsg("MySQL: authentication OK for %s", port->user_name)));
 
     /*
      * Send the MySQL OK packet.  This is the server's response to the login
@@ -494,11 +484,18 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
     }
 
     /*
+     * Flush the OK packet to the client immediately.  secure_write() may
+     * buffer data in the SSL layer; without this flush the client never
+     * sees the OK, waits forever, and eventually closes the connection.
+     * openHalo's netTransceiver->finishWriteToBufFlush serves the same role.
+     */
+    pq_flush();
+
+    /*
      * The handshake is complete.  Reset both sequence counters to 0 for
      * the command phase (MySQL protocol resets after auth).
      */
     mysql_packet_reset_seq(ps);
-    mysql_packet_set_server_seq(ps, 0);
 
     /*
      * The MysPacketState (port->protocol_state) stays alive for the

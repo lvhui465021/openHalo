@@ -80,6 +80,15 @@ mysql_init(Port *port)
 {
     MysPacketState *ps;
 
+    /*
+     * Set the backend type early so that pgstat tracks our I/O operations.
+     * This mirrors openHalo's adapter.c:startServer which also sets
+     * MyBackendType = B_BACKEND.  Without this, the first catalog access
+     * during authentication (SearchSysCache→read from disk) triggers an
+     * assertion failure in pgstat_tracks_io_op() when cassert is enabled.
+     */
+    MyBackendType = B_BACKEND;
+
     ps = mysql_packet_create(port);
     port->protocol_state = (void *) ps;
 }
@@ -90,7 +99,6 @@ mysql_startup_exchange(Port *port)
     MysPacketState *ps = (MysPacketState *) port->protocol_state;
     int            status;
 
-    ereport(LOG, (errmsg("MySQL: startup_exchange begin")));
     Assert(ps != NULL);
 
     /*
@@ -179,42 +187,85 @@ mysql_process_command(int *command, StringInfo inBuf)
                 strncmp(sql, "SELECT @@version_comment", 24) == 0 ||
                 strncmp(sql, "SELECT @@version", 15) == 0)
             {
-                char colcnt, coldef[52], row[32], eof[5] = {0xFE,0x00,0x00,0x02,0x00};
-                /* column count: lenenc(1) */
-                colcnt = 1;
+                char colcnt = 1, eof[5] = {0xFE,0x00,0x00,0x02,0x00};
+                char coldef[52], row[21];
+                char *p;
+
+                /*
+                 * ColumnDefinition41 for "version_comment" — 53 bytes.
+                 * Layout and offsets verified against MySQL 8.0 protocol spec.
+                 */
+                p = coldef;
+                /* catalog: lenenc(3) + "def" */
+                *p++ = 3;  memcpy(p, "def", 3); p += 3;
+                /* schema */     *p++ = 0;
+                /* table */      *p++ = 0;
+                /* org_table */  *p++ = 0;
+                /* name: "version_comment" (15 chars) */
+                *p++ = 15; memcpy(p, "version_comment", 15); p += 15;
+                /* org_name: "version_comment" (15 chars) */
+                *p++ = 15; memcpy(p, "version_comment", 15); p += 15;
+                /* fixed length = 0x0c */
+                *p++ = 0x0c;
+                /* charset: utf8mb4 = 45 (0x2D 0x00) */
+                *p++ = 0x2D; *p++ = 0x00;
+                /* column length: 30 (little-endian) */
+                *p++ = 30; *p++ = 0; *p++ = 0; *p++ = 0;
+                /* type: MYSQL_TYPE_VAR_STRING = 253 */
+                *p++ = 253;
+                /* flags: 0 (2 bytes) */
+                *p++ = 0; *p++ = 0;
+                /* decimals: 0 */
+                *p++ = 0;
+                /* filler: 0 (2 bytes) */
+                *p++ = 0; *p++ = 0;
+                Assert(p - coldef == 52);
+
                 mysql_packet_write_ok(mysql_ps(), &colcnt, 1, 0x00);
-                /* column definition (lenenc_str for all string fields) */
-                memcpy(coldef, "\x03""def\0\0\0\x0f""version_comment\x0f""version_comment\x0c\x2D\0", 40);
-                memset(coldef+40, 0, 4); coldef[40] = 30; /* col len = 30 */
-                coldef[44] = 253; /* MYSQL_TYPE_VAR_STRING */
-                memset(coldef+45, 0, 7); /* flags(2)=0, decimals(1)=0, filler(2)=0 */
                 mysql_packet_write_ok(mysql_ps(), coldef, 52, 0x00);
                 mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
-                /* row: lenenc(30) + '8.0.40-openhalo-1.0' */
-                memset(row, 0, sizeof(row));
-                row[0] = 30;
-                memcpy(row + 1, "8.0.40-openhalo-1.0", 22);
-                mysql_packet_write_ok(mysql_ps(), row, 31, 0x00);
+
+                /* row: lenenc(19) + "8.0.40-openhalo-1.0" (19 chars) */
+                row[0] = 19;
+                memcpy(row + 1, "8.0.40-openhalo-1.0", 19);
+                mysql_packet_write_ok(mysql_ps(), row, 20, 0x00);
                 mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
+                pq_flush();
                 return PROTOCOL_COMMAND_HANDLED;
             }
             if (strncmp(sql, "SELECT 1", 8) == 0 ||
                 strncmp(sql, "select 1", 8) == 0)
             {
                 char colcnt = 1;
-                char cdef[28], row[3], eof[5] = {0xFE,0x00,0x00,0x02,0x00};
+                char cdef[31], row[2], eof[5] = {0xFE,0x00,0x00,0x02,0x00};
                 mysql_packet_write_ok(mysql_ps(), &colcnt, 1, 0x00);
-                /* column definition for "1": lenenc_str "def", catalog, schema, table, org_table, col_name, org_col_name, then fixed fields */
-                memcpy(cdef, "\x03""def\0\0\0\x01""1\x01""1\x0c\x2d\0", 17);
-                memset(cdef+17, 0, 4); cdef[17] = 1; /* col len */
-                cdef[21] = 8; /* MYSQL_TYPE_LONGLONG */
-                memset(cdef+22, 0, 6);
-                mysql_packet_write_ok(mysql_ps(), cdef, 28, 0x00);
+                /*
+                 * ColumnDefinition41 for "1":
+                 *   "def"  catalog  schema  table  org_table  col_name
+                 *   org_col_name  0x0c  charset(utf8mb4=45)  col_len  type
+                 *   flags  decimals  filler
+                 */
+                memcpy(cdef,
+                       "\x03""def"        /* catalog marker */
+                       "\x00"             /* catalog */
+                       "\x00"             /* schema */
+                       "\x00"             /* table alias */
+                       "\x00"             /* org_table */
+                       "\x01""1"          /* col_name = "1" */
+                       "\x01""1"          /* org_col_name = "1" */
+                       "\x0c"             /* fixed length */
+                       , 17);
+                cdef[17] = 0x2D; cdef[18] = 0x00;  /* charset utf8mb4 */
+                memset(cdef+19, 0, 4); cdef[19] = 1;  /* col len = 1 */
+                cdef[23] = 8; /* MYSQL_TYPE_LONGLONG */
+                memset(cdef+24, 0, 7);
+                mysql_packet_write_ok(mysql_ps(), cdef, 31, 0x00);
                 mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
                 /* row: lenenc(1) + '1' */
                 row[0] = 1; row[1] = '1';
                 mysql_packet_write_ok(mysql_ps(), row, 2, 0x00);
                 mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
+                pq_flush();
                 return PROTOCOL_COMMAND_HANDLED;
             }
         }
@@ -248,7 +299,13 @@ mysql_process_command(int *command, StringInfo inBuf)
 static void
 mysql_comm_reset(void)
 {
-    mysql_packet_reset_seq(mysql_ps());
+    /*
+     * No-op: mirror openHalo's .comm_reset = NULL.
+     * MySQL protocol does NOT reset sequence numbers between commands.
+     * Both ps->seq (read) and ps->server_seq (write) track independently
+     * and naturally wrap at 256, which is correct per protocol spec.
+     * Resetting here would break the sequence for end_command's EOF/OK.
+     */
 }
 
 static bool
@@ -275,10 +332,14 @@ mysql_set_remote_dest_receiver_params(DestReceiver *receiver,
                                        struct PortalData *portal)
 {
     /*
-     * M1 reuses the standard PG tuple receiver (printtup).  Delegate to
-     * the standard setup so that the receiver gets portal parameters.
+     * No-op for MySQL DestReceiver.  SetRemoteDestReceiverParams() is
+     * specific to the standard PG printtup DestReceiver (DR_printtup)
+     * and would overwrite our MysDRState fields (ps, ncols, started)
+     * if called here.  MySQL result-set parameters are handled directly
+     * by mysDR_rStartup / mysDR_receiveSlot.
      */
-    SetRemoteDestReceiverParams(receiver, portal);
+    (void) receiver;
+    (void) portal;
 }
 
 /* ----------------------------------------------------------------
@@ -488,9 +549,14 @@ static void
 mysDR_rShutdown(DestReceiver *self)
 {
     MysDRState *dr = (MysDRState *) self;
-    /* Send EOF after all rows. */
-    char eof[5] = {0xFE, 0x00, 0x00, 0x02, 0x00};
-    mysql_packet_write_ok(dr->ps, eof, 5, 0xFE);
+    /*
+     * Do NOT send EOF here.  The protocol-level completion packet
+     * (EOF for SELECT, OK for INSERT/UPDATE/DELETE) is the responsibility
+     * of mysql_end_command(), mirroring openHalo's endCommand.
+     * Sending a packet here would duplicate the end_command packet and
+     * confuse the client's protocol state machine.
+     */
+    (void) dr;
 }
 
 static void
@@ -525,27 +591,25 @@ mysql_end_command(const QueryCompletion *qc,
     if (dest == DestRemote || dest == DestRemoteExecute ||
         dest == DestRemoteSimple)
     {
-        char        completionTag[COMPLETION_TAG_BUFSIZE];
-        Size        len;
-        const char *tag;
-
-        len = BuildQueryCompletionString(completionTag, qc,
-                                          force_undecorated_output);
-        tag = (len > 0) ? completionTag : NULL;
+        CommandTag  tag = qc->commandTag;
 
         /*
-         * Send a MySQL OK packet with the command tag as the info field.
-         * For M1 we use a minimal OK: affected_rows=0, last_insert_id=0,
-         * status=autocommit, warnings=0.
-         *
-         * The protocol expects: <OK header> <affected_rows(lenenc)>
-         * <last_insert_id(lenenc)> <status(2)> <warnings(2)>
-         * [<info(string)> if status & SERVER_SESSION_STATE_CHANGED]
-         *
-         * For simplicity in M1, send a minimal OK.  Proper affected_rows
-         * / last_insert_id / info are deferred to M2.
+         * Mirror openHalo's endCommand: SELECT → EOF, DML → OK.
+         * The DestReceiver (mysDR_rShutdown) does NOT send the final
+         * completion packet; we own it here.
          */
+        if (tag == CMDTAG_SELECT)
         {
+            /* Send EOF to mark end of result set. */
+            char eof[5] = {0xFE, 0x00, 0x00, 0x02, 0x00};
+            mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
+        }
+        else
+        {
+            /*
+             * Send a MySQL OK packet for INSERT/UPDATE/DELETE and other
+             * non-SELECT commands.
+             */
             char ok[256];
             int  pos = 0;
 
@@ -555,20 +619,11 @@ mysql_end_command(const QueryCompletion *qc,
             ok[pos++] = 0x02; ok[pos++] = 0x00;  /* status: autocommit */
             ok[pos++] = 0x00; ok[pos++] = 0x00;  /* warnings: 0 */
 
-            /* If we have a tag, append it as info (lenenc string). */
-            if (tag != NULL && len > 0)
-            {
-                ok[pos++] = (char) (len & 0xFF);  /* length-encoded string */
-                memcpy(ok + pos, tag, len);
-                pos += (int) len;
-            }
-
             mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0x00);
         }
     }
     else
     {
-        /* Non-remote dest: delegate to standard PG behavior. */
         standard_EndCommand(qc, dest, force_undecorated_output);
     }
 }
@@ -602,11 +657,19 @@ mysql_send_ready_for_query(CommandDest dest)
      * MySQL protocol has no explicit "ready for query" packet.  The auth
      * OK (sent by the authenticate callback) and the query-completion OK
      * (sent by end_command) already serve as implicit ready signals.
-     * For non-remote destinations, delegate to the standard PG path.
+     *
+     * We still flush the output buffer to make sure all pending writes
+     * reach the client before the backend blocks on the next read.
      */
-    if (dest != DestRemote && dest != DestRemoteExecute &&
-        dest != DestRemoteSimple)
+    if (dest == DestRemote || dest == DestRemoteExecute ||
+        dest == DestRemoteSimple)
+    {
+        pq_flush();
+    }
+    else
+    {
         standard_ReadyForQuery(dest);
+    }
 }
 
 /* ----------------------------------------------------------------

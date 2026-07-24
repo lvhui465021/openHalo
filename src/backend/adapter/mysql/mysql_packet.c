@@ -14,6 +14,7 @@
 
 #include "adapter/mysql/mysql_packet.h"
 #include "libpq/libpq.h"
+#include "miscadmin.h"
 #include "utils/elog.h"
 
 #include <errno.h>
@@ -69,10 +70,11 @@ mysql_packet_read(MysPacketState *ps, char **payload, size_t *len)
     uint32      payload_len;
     uint8       pkt_seq;
     char       *buf;
+    Port       *port = MyProcPort;
 
     /* read 4-byte header (retry on EINTR/EAGAIN in non-blocking mode) */
     do {
-        nread = secure_read(ps->port, header, MYSQL_PACKET_HEADER_SIZE);
+        nread = secure_read(port, header, MYSQL_PACKET_HEADER_SIZE);
     } while (nread < 0 && (errno == EINTR || errno == EAGAIN));
     if (nread != MYSQL_PACKET_HEADER_SIZE)
     {
@@ -109,7 +111,7 @@ mysql_packet_read(MysPacketState *ps, char **payload, size_t *len)
     if (payload_len > 0)
     {
         do {
-            nread = secure_read(ps->port, buf, payload_len);
+            nread = secure_read(port, buf, payload_len);
         } while (nread < 0 && (errno == EINTR || errno == EAGAIN));
         if (nread != (ssize_t) payload_len)
         {
@@ -137,6 +139,7 @@ mysql_write_raw(MysPacketState *ps, const char *payload, size_t len)
 {
     uint8       header[MYSQL_PACKET_HEADER_SIZE];
     ssize_t     written;
+    Port       *port = MyProcPort;
 
     header[0] = (uint8) (len & 0xFF);
     header[1] = (uint8) ((len >> 8) & 0xFF);
@@ -146,7 +149,7 @@ mysql_write_raw(MysPacketState *ps, const char *payload, size_t len)
     ps->server_seq = (ps->server_seq + 1) & 0xFF;
 
     do {
-        written = secure_write(ps->port, header, MYSQL_PACKET_HEADER_SIZE);
+        written = secure_write(port, header, MYSQL_PACKET_HEADER_SIZE);
     } while (written < 0 && (errno == EINTR || errno == EAGAIN));
     if (written != MYSQL_PACKET_HEADER_SIZE)
         goto write_fail;
@@ -154,7 +157,7 @@ mysql_write_raw(MysPacketState *ps, const char *payload, size_t len)
     if (len > 0)
     {
         do {
-            written = secure_write(ps->port, payload, len);
+            written = secure_write(port, payload, len);
         } while (written < 0 && (errno == EINTR || errno == EAGAIN));
         if (written != (ssize_t) len)
             goto write_fail;
@@ -244,7 +247,10 @@ void
 mysql_packet_reset_seq(MysPacketState *ps)
 {
     if (ps != NULL)
+    {
         ps->seq = 0;
+        ps->server_seq = 0;
+    }
 }
 
 void

@@ -74,16 +74,13 @@ mysql_read_command(MysPacketState *ps, int *command, StringInfo inBuf)
         resetStringInfo(inBuf);
         if (len > 1)
         {
-            /* Rewrite select @@version_comment to prevent the mysql CLI
-             * (8.4.10) from failing its init handshake. */
-            if (len > 25 && strncmp(payload + 1, "select @@version_comment", 24) == 0)
-                appendStringInfoString(inBuf,
-                    "SELECT '8.0.40-openhalo-1.0' AS version_comment");
-            else if (len > 20 && strncmp(payload + 1, "select @@version", 15) == 0)
-                appendStringInfoString(inBuf,
-                    "SELECT '8.0.40-openhalo-1.0' AS version");
-            else
-                appendBinaryStringInfo(inBuf, payload + 1, (int)(len - 1));
+            /*
+             * Pass the SQL text through unchanged.  mysql_process_command()
+             * handles init probes (SELECT 1, @@version_comment) inline with
+             * pre-built MySQL packets.  DestReceiver path will be fixed
+             * separately for arbitrary queries.
+             */
+            appendBinaryStringInfo(inBuf, payload + 1, (int)(len - 1));
         }
         /* Include the trailing NUL in the buffer length. */
         enlargeStringInfo(inBuf, 1);
