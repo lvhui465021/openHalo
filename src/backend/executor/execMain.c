@@ -90,7 +90,6 @@ static void ExecEndPlan(PlanState *planstate, EState *estate);
 						ScanDirection direction,
 						DestReceiver *dest,
 						bool execute_once); */
-static bool ExecCheckRTEPerms(RangeTblEntry *rte);
 static bool ExecCheckRTEPermsModified(Oid relOid, Oid userid,
 									  Bitmapset *modifiedCols,
 									  AclMode requiredPerms);
