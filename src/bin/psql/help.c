@@ -180,6 +180,10 @@ slashUsage(unsigned short int pager)
 	fprintf(output, _("  \\gset [PREFIX]         execute query and store results in psql variables\n"));
 	fprintf(output, _("  \\gx [(OPTIONS)] [FILE] as \\g, but forces expanded output mode\n"));
 	fprintf(output, _("  \\q                     quit psql\n"));
+	fprintf(output, _("  \\restrict RESTRICT_KEY\n"
+					  "                         enter restricted mode with provided key\n"));
+	fprintf(output, _("  \\unrestrict RESTRICT_KEY\n"
+					  "                         exit restricted mode if key matches\n"));
 	fprintf(output, _("  \\watch [SEC]           execute query every SEC seconds\n"));
 	fprintf(output, "\n");
 
@@ -438,6 +442,9 @@ helpVariables(unsigned short int pager)
 					  "    border style (number)\n"));
 	fprintf(output, _("  columns\n"
 					  "    target width for the wrapped format\n"));
+	fprintf(output, _("  csv_fieldsep\n"
+					  "    field separator for CSV output format (default \"%c\")\n"),
+			DEFAULT_CSV_FIELD_SEP);
 	fprintf(output, _("  expanded (or x)\n"
 					  "    expanded output [on, off, auto]\n"));
 	fprintf(output, _("  fieldsep\n"
@@ -695,5 +702,4 @@ print_copyright(void)
 		 "相关权利人依照法律规定应享有的权利除外。未免疑义，本条所指的“知识产权”是指任何及所有基于 Halo 软件产生的：（a）版权、商标、\n"
 		 "商号、域名、与商标和商号相关的商誉、设计和专利；与创新、技术诀窍、商业秘密、保密技术、非技术信息相关的权利；（b）人身权、掩模\n"
 		 "作品权、署名权和发表权；以及（c）在本协议生效之前已存在或此后出现在世界任何地方的其他工业产权、专有权、与“知识产权”相关的权利，\n"
-		 "以及上述权利的所有续期和延长，无论此类权利是否已在相关法域内的相关机构注册。\n\n");
-}
+		 "以及上述权利的所有续期和延长，无论此类权利是否已在相关法域内的相关机构注册。\n\n");}

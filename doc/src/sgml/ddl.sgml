@@ -1641,6 +1641,9 @@ ALTER TABLE <replaceable>table_name</replaceable> OWNER TO <replaceable>new_owne
    Superusers can always do this; ordinary roles can only do it if they are
    both the current owner of the object (or a member of the owning role) and
    a member of the new owning role.
+   All object privileges of the old owner are transferred to the new owner
+   along with the ownership.
+
   </para>
 
   <para>
@@ -1771,7 +1774,11 @@ REVOKE ALL ON accounts FROM PUBLIC;
      <listitem>
       <para>
        Allows creation of a foreign key constraint referencing a
-       table, or specific column(s) of a table.
+       table, or specific column(s) of a table. Great care should be taken when
+       granting this privilege, since a user who creates a foreign key can arrange
+       for enforcement of that foreign key to call an arbitrary function, such as
+       a cast function, and such functions will be called with the privileges of
+       the table owner.
       </para>
      </listitem>
     </varlistentry>
@@ -1780,7 +1787,9 @@ REVOKE ALL ON accounts FROM PUBLIC;
      <term><literal>TRIGGER</literal></term>
      <listitem>
       <para>
-       Allows creation of a trigger on a table, view, etc.
+       Allows creation of a trigger on a table, view, etc. Great care should be
+       taken when granting this privilege, since any triggers added to a table
+       or view will be executed with the privileges of users who modify it.
       </para>
      </listitem>
     </varlistentry>

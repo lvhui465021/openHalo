@@ -2204,13 +2204,15 @@ convert_saop_to_hashed_saop_walker(Node *node, void *context)
 	if (IsA(node, ScalarArrayOpExpr))
 	{
 		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) node;
-		Expr	   *arrayarg = (Expr *) lsecond(saop->args);
+		Node	   *leftarg = (Node *) linitial(saop->args);
+		Node	   *arrayarg = (Node *) lsecond(saop->args);
 		Oid			lefthashfunc;
 		Oid			righthashfunc;
 
 		if (saop->useOr && arrayarg && IsA(arrayarg, Const) &&
 			!((Const *) arrayarg)->constisnull &&
-			get_op_hash_functions(saop->opno, &lefthashfunc, &righthashfunc) &&
+			get_op_hash_functions_ext(saop->opno, exprType(leftarg),
+									  &lefthashfunc, &righthashfunc) &&
 			lefthashfunc == righthashfunc)
 		{
 			Datum		arrdatum = ((Const *) arrayarg)->constvalue;
@@ -4214,7 +4216,7 @@ recheck_cast_function_args(List *args, Oid result_type,
 {
 	Form_pg_proc funcform = (Form_pg_proc) GETSTRUCT(func_tuple);
 	int			nargs;
-	Oid			actual_arg_types[FUNC_MAX_ARGS];
+	Oid			actual_arg_types[FUNC_MAX_ARGS] = {0};
 	Oid			declared_arg_types[FUNC_MAX_ARGS];
 	Oid			rettype;
 	ListCell   *lc;

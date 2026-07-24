@@ -42,6 +42,10 @@ CREATE INDEX six ON shighway USING btree (name text_ops);
 COMMENT ON INDEX six_wrong IS 'bad index';
 COMMENT ON INDEX six IS 'good index';
 COMMENT ON INDEX six IS NULL;
+SELECT obj_description('six'::regclass, 'pg_class') IS NULL AS six_comment_is_null;
+COMMENT ON INDEX six IS 'add the comment back';
+COMMENT ON INDEX six IS ''; -- empty string removes the comment, same as NULL
+SELECT obj_description('six'::regclass, 'pg_class') IS NULL AS six_comment_is_null;
 
 --
 -- BTREE ascending/descending cases
@@ -374,6 +378,9 @@ CREATE INDEX hash_txt_index ON hash_txt_heap USING hash (random text_ops);
 
 CREATE INDEX hash_f8_index ON hash_f8_heap USING hash (random float8_ops) WITH (fillfactor=60);
 
+CREATE INDEX hash_i4_partial_index ON hash_i4_heap USING hash (seqno)
+  WHERE seqno = 9999;
+
 CREATE UNLOGGED TABLE unlogged_hash_table (id int4);
 CREATE INDEX unlogged_hash_index ON unlogged_hash_table USING hash (id int4_ops);
 DROP TABLE unlogged_hash_table;
@@ -610,7 +617,7 @@ DROP TABLE cwi_test;
 CREATE TABLE syscol_table (a INT);
 
 -- System columns cannot be indexed
-CREATE INDEX ON syscolcol_table (ctid);
+CREATE INDEX ON syscol_table (ctid);
 
 -- nor used in expressions
 CREATE INDEX ON syscol_table ((ctid >= '(1000,0)'));

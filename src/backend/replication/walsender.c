@@ -214,6 +214,20 @@ typedef struct
 	int			write_head;
 	int			read_heads[NUM_SYNC_REP_WAIT_MODE];
 	WalTimeSample last_read[NUM_SYNC_REP_WAIT_MODE];
+
+	/*
+	 * Overflow entries for read heads that collide with the write head.
+	 *
+	 * When the cyclic buffer fills (write head is about to collide with a
+	 * read head), we save that read head's current sample here and mark it as
+	 * using overflow (read_heads[i] = -1). This allows the write head to
+	 * continue advancing while the overflowed mode continues lag computation
+	 * using the saved sample.
+	 *
+	 * Once the standby's reported LSN advances past the overflow entry's LSN,
+	 * we transition back to normal buffer-based tracking.
+	 */
+	WalTimeSample overflowed[NUM_SYNC_REP_WAIT_MODE];
 } LagTracker;
 
 static LagTracker *lag_tracker;
@@ -1436,9 +1450,15 @@ WalSndWaitForWal(XLogRecPtr loc)
 		 * If we're shutting down, trigger pending WAL to be written out,
 		 * otherwise we'd possibly end up waiting for WAL that never gets
 		 * written, because walwriter has shut down already.
+		 *
+		 * Note that GetXLogInsertEndRecPtr() is used to obtain the WAL flush
+		 * request location instead of GetXLogInsertRecPtr(). Because if the
+		 * last WAL record ends at a page boundary, GetXLogInsertRecPtr() can
+		 * return an LSN pointing past the page header, which may cause
+		 * XLogFlush() to report an error.
 		 */
-		if (got_STOPPING)
-			XLogBackgroundFlush();
+		if (got_STOPPING && !RecoveryInProgress())
+			XLogFlush(GetXLogInsertEndRecPtr());
 
 		/* Update our idea of the currently flushed position. */
 		if (!RecoveryInProgress())
@@ -1906,6 +1926,10 @@ PhysicalConfirmReceivedLocation(XLogRecPtr lsn)
 	 * be energy wasted - the worst lost information can do here is give us
 	 * wrong information in a statistics view - we'll just potentially be more
 	 * conservative in removing files.
+	 *
+	 * Checkpointer makes special efforts to keep the WAL segments required by
+	 * the restart_lsn written to the disk. See CreateCheckPoint() and
+	 * CreateRestartPoint() for details.
 	 */
 }
 
@@ -1926,7 +1950,9 @@ ProcessStandbyReplyMessage(void)
 	TimestampTz now;
 	TimestampTz replyTime;
 
-	static bool fullyAppliedLastTime = false;
+	static XLogRecPtr prevWritePtr = InvalidXLogRecPtr;
+	static XLogRecPtr prevFlushPtr = InvalidXLogRecPtr;
+	static XLogRecPtr prevApplyPtr = InvalidXLogRecPtr;
 
 	/* the caller already consumed the msgtype byte */
 	writePtr = pq_getmsgint64(&reply_message);
@@ -1959,22 +1985,23 @@ ProcessStandbyReplyMessage(void)
 	applyLag = LagTrackerRead(SYNC_REP_WAIT_APPLY, applyPtr, now);
 
 	/*
-	 * If the standby reports that it has fully replayed the WAL in two
-	 * consecutive reply messages, then the second such message must result
-	 * from wal_receiver_status_interval expiring on the standby.  This is a
-	 * convenient time to forget the lag times measured when it last
-	 * wrote/flushed/applied a WAL record, to avoid displaying stale lag data
-	 * until more WAL traffic arrives.
+	 * If the standby reports that it has fully replayed the WAL, and the
+	 * write/flush/apply positions remain unchanged across two consecutive
+	 * reply messages, forget the lag times measured when it last
+	 * wrote/flushed/applied a WAL record.
+	 *
+	 * The second message with unchanged positions typically results from
+	 * wal_receiver_status_interval expiring on the standby, so lag values are
+	 * usually cleared after that interval when there is no activity. This
+	 * avoids displaying stale lag data until more WAL traffic arrives.
 	 */
-	clearLagTimes = false;
-	if (applyPtr == sentPtr)
-	{
-		if (fullyAppliedLastTime)
-			clearLagTimes = true;
-		fullyAppliedLastTime = true;
-	}
-	else
-		fullyAppliedLastTime = false;
+	clearLagTimes = (applyPtr == sentPtr && flushPtr == sentPtr &&
+					 writePtr == prevWritePtr && flushPtr == prevFlushPtr &&
+					 applyPtr == prevApplyPtr);
+
+	prevWritePtr = writePtr;
+	prevFlushPtr = flushPtr;
+	prevApplyPtr = applyPtr;
 
 	/* Send a reply if the standby requested one. */
 	if (replyRequested)
@@ -3568,7 +3595,6 @@ WalSndKeepaliveIfNecessary(void)
 static void
 LagTrackerWrite(XLogRecPtr lsn, TimestampTz local_flush_time)
 {
-	bool		buffer_full;
 	int			new_write_head;
 	int			i;
 
@@ -3590,25 +3616,19 @@ LagTrackerWrite(XLogRecPtr lsn, TimestampTz local_flush_time)
 	 * of space.
 	 */
 	new_write_head = (lag_tracker->write_head + 1) % LAG_TRACKER_BUFFER_SIZE;
-	buffer_full = false;
 	for (i = 0; i < NUM_SYNC_REP_WAIT_MODE; ++i)
 	{
+		/*
+		 * If the buffer is full, move the slowest reader to a separate
+		 * overflow entry and free its space in the buffer so the write head
+		 * can advance.
+		 */
 		if (new_write_head == lag_tracker->read_heads[i])
-			buffer_full = true;
-	}
-
-	/*
-	 * If the buffer is full, for now we just rewind by one slot and overwrite
-	 * the last sample, as a simple (if somewhat uneven) way to lower the
-	 * sampling rate.  There may be better adaptive compaction algorithms.
-	 */
-	if (buffer_full)
-	{
-		new_write_head = lag_tracker->write_head;
-		if (lag_tracker->write_head > 0)
-			lag_tracker->write_head--;
-		else
-			lag_tracker->write_head = LAG_TRACKER_BUFFER_SIZE - 1;
+		{
+			lag_tracker->overflowed[i] =
+				lag_tracker->buffer[lag_tracker->read_heads[i]];
+			lag_tracker->read_heads[i] = -1;
+		}
 	}
 
 	/* Store a sample at the current write head position. */
@@ -3634,6 +3654,28 @@ static TimeOffset
 LagTrackerRead(int head, XLogRecPtr lsn, TimestampTz now)
 {
 	TimestampTz time = 0;
+
+	/*
+	 * If 'lsn' has not passed the WAL position stored in the overflow entry,
+	 * return the elapsed time (in microseconds) since the saved local flush
+	 * time. If the flush time is in the future (due to clock drift), return
+	 * -1 to treat as no valid sample.
+	 *
+	 * Otherwise, switch back to using the buffer to control the read head and
+	 * compute the elapsed time.  The read head is then reset to point to the
+	 * oldest entry in the buffer.
+	 */
+	if (lag_tracker->read_heads[head] == -1)
+	{
+		if (lag_tracker->overflowed[head].lsn > lsn)
+			return (now >= lag_tracker->overflowed[head].time) ?
+				now - lag_tracker->overflowed[head].time : -1;
+
+		time = lag_tracker->overflowed[head].time;
+		lag_tracker->last_read[head] = lag_tracker->overflowed[head];
+		lag_tracker->read_heads[head] =
+			(lag_tracker->write_head + 1) % LAG_TRACKER_BUFFER_SIZE;
+	}
 
 	/* Read all unread samples up to this LSN or end of buffer. */
 	while (lag_tracker->read_heads[head] != lag_tracker->write_head &&
