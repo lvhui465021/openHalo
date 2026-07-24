@@ -20,6 +20,7 @@
 #include "adapter/mysql/mysql_auth.h"
 #include "adapter/mysql/mysql_command.h"
 #include "adapter/mysql/mysql_packet.h"
+#include "adapter/mysql/mysql_protocol.h"
 #include "libpq/libpq-be.h"
 #include "libpq/libpq.h"
 #include "miscadmin.h"
@@ -309,28 +310,36 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
 
     if (!dr->started)
     {
-        /* Send column count as a length-encoded integer. */
+        uint32 caps = mysql_packet_get_client_caps(dr->ps);
+
+        /*
+         * MySQL 8.0.3+: if the client set CLIENT_OPTIONAL_RESULTSET_METADATA,
+         * the column-count packet is prefixed with a 1-byte metadata_follows
+         * flag (1 = full column metadata follows).
+         */
         {
-            char colcnt[16];
+            char colhdr[20];
             int  pos = 0;
+            if (caps & MYSQL_CAP_OPTIONAL_RESULTSET_METADATA)
+                colhdr[pos++] = 1;    /* RESULTSET_METADATA_FULL */
             if (ncols < 251)
             {
-                colcnt[pos++] = (char) ncols;
+                colhdr[pos++] = (char) ncols;
             }
             else if (ncols < 65536)
             {
-                colcnt[pos++] = (char) 0xFC;
-                colcnt[pos++] = (char) (ncols & 0xFF);
-                colcnt[pos++] = (char) ((ncols >> 8) & 0xFF);
+                colhdr[pos++] = (char) 0xFC;
+                colhdr[pos++] = (char) (ncols & 0xFF);
+                colhdr[pos++] = (char) ((ncols >> 8) & 0xFF);
             }
             else
             {
-                colcnt[pos++] = (char) 0xFD;
-                colcnt[pos++] = (char) (ncols & 0xFF);
-                colcnt[pos++] = (char) ((ncols >> 8) & 0xFF);
-                colcnt[pos++] = (char) ((ncols >> 16) & 0xFF);
+                colhdr[pos++] = (char) 0xFD;
+                colhdr[pos++] = (char) (ncols & 0xFF);
+                colhdr[pos++] = (char) ((ncols >> 8) & 0xFF);
+                colhdr[pos++] = (char) ((ncols >> 16) & 0xFF);
             }
-            mysql_packet_write_ok(dr->ps, colcnt, (size_t) pos, 0x00);
+            mysql_packet_write_ok(dr->ps, colhdr, (size_t) pos, 0x00);
         }
 
         for (i = 0; i < ncols; i++)
@@ -410,7 +419,13 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
             mysql_packet_write_ok(dr->ps, colbuf.data, colbuf.len, 0x00);
             pfree(colbuf.data);
         }
-        /* EOF after column definitions. */
+        /*
+         * After column definitions: send EOF (or skip if DEPRECATE_EOF).
+         * openHalo's sendEOFPacketNoFlush is a no-op when DEPRECATE_EOF
+         * is negotiated -- the client knows the metadata section ends
+         * after the last ColumnDefinition41 packet.
+         */
+        if (!(caps & MYSQL_CAP_DEPRECATE_EOF))
         {
             char eof[5] = {0xFE, 0x00, 0x00, 0x02, 0x00};
             mysql_packet_write_ok(dr->ps, eof, 5, 0xFE);
@@ -530,6 +545,7 @@ mysql_end_command(const QueryCompletion *qc,
         dest == DestRemoteSimple)
     {
         CommandTag  tag = qc->commandTag;
+        uint32      caps = mysql_packet_get_client_caps(mysql_ps());
 
         /*
          * Mirror openHalo's endCommand: SELECT → EOF, DML → OK.
@@ -538,9 +554,28 @@ mysql_end_command(const QueryCompletion *qc,
          */
         if (tag == CMDTAG_SELECT)
         {
-            /* Send EOF to mark end of result set. */
-            char eof[5] = {0xFE, 0x00, 0x00, 0x02, 0x00};
-            mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
+            if (caps & MYSQL_CAP_DEPRECATE_EOF)
+            {
+                /*
+                 * DEPRECATE_EOF OK packet: 0xFE header + lenenc
+                 * affected_rows=0 + last_insert_id=0 + status_flags
+                 * + warning_count=0.
+                 */
+                char ok[16];
+                int  pos = 0;
+                ok[pos++] = 0xFE;                    /* OK packet marker */
+                ok[pos++] = 0x00;                    /* affected_rows (lenenc 0) */
+                ok[pos++] = 0x00;                    /* last_insert_id (lenenc 0) */
+                ok[pos++] = 0x02; ok[pos++] = 0x00;  /* status: autocommit */
+                ok[pos++] = 0x00; ok[pos++] = 0x00;  /* warnings: 0 */
+                mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0xFE);
+            }
+            else
+            {
+                /* Traditional EOF to mark end of result set. */
+                char eof[5] = {0xFE, 0x00, 0x00, 0x02, 0x00};
+                mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
+            }
         }
         else
         {

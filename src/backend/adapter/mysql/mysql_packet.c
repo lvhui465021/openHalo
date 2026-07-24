@@ -31,6 +31,7 @@ struct MysPacketState
     uint8       server_seq;         /* next server sequence number to send     */
     bool        greeting_sent;      /* has the server greeting been emitted?   */
     void       *auth_state;         /* MysAuthState during handshake, else NULL */
+    uint32      client_capabilities; /* client capability flags from login     */
 };
 
 /* ----------------------------------------------------------------
@@ -273,4 +274,19 @@ mysql_packet_get_auth_state(MysPacketState *ps)
     if (ps != NULL)
         return ps->auth_state;
     return NULL;
+}
+
+void
+mysql_packet_set_client_caps(MysPacketState *ps, uint32 caps)
+{
+    if (ps != NULL)
+        ps->client_capabilities = caps;
+}
+
+uint32
+mysql_packet_get_client_caps(MysPacketState *ps)
+{
+    if (ps != NULL)
+        return ps->client_capabilities;
+    return 0;
 }

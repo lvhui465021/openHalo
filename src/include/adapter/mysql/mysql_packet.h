@@ -70,4 +70,25 @@ extern void mysql_packet_set_server_seq(MysPacketState *ps, uint8 seq);
 extern void mysql_packet_set_auth_state(MysPacketState *ps, void *state);
 extern void *mysql_packet_get_auth_state(MysPacketState *ps);
 
+/* Store / retrieve client capability flags (from login packet). */
+extern void mysql_packet_set_client_caps(MysPacketState *ps, uint32 caps);
+extern uint32 mysql_packet_get_client_caps(MysPacketState *ps);
+
+/*
+ * MySQL capability flags (subset relevant to our adapter).
+ * Full list: https://dev.mysql.com/doc/dev/mysql-server/latest/group__group__cs__capabilities__flags.html
+ */
+#define MYSQL_CAP_LONG_PASSWORD              0x00000001
+#define MYSQL_CAP_FOUND_ROWS                 0x00000002
+#define MYSQL_CAP_LONG_FLAG                  0x00000004
+#define MYSQL_CAP_CONNECT_WITH_DB            0x00000008
+#define MYSQL_CAP_PROTOCOL_41                0x00000200
+#define MYSQL_CAP_TRANSACTIONS               0x00002000
+#define MYSQL_CAP_SECURE_CONNECTION          0x00008000
+#define MYSQL_CAP_PLUGIN_AUTH                0x00080000
+#define MYSQL_CAP_PLUGIN_AUTH_LENENC         0x00200000
+#define MYSQL_CAP_OPTIONAL_RESULTSET_METADATA 0x00400000
+#define MYSQL_CAP_SESSION_TRACK              0x00800000
+#define MYSQL_CAP_DEPRECATE_EOF              0x01000000
+
 #endif   /* MYSQL_PACKET_H */

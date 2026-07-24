@@ -45,24 +45,34 @@
  *    Capability flags we advertise
  * ----------------------------------------------------------------
  */
-#define CLIENT_LONG_PASSWORD        0x00000001
-#define CLIENT_FOUND_ROWS           0x00000002
-#define CLIENT_LONG_FLAG            0x00000004
-#define CLIENT_CONNECT_WITH_DB      0x00000008
-#define CLIENT_PROTOCOL_41          0x00000200
-#define CLIENT_TRANSACTIONS         0x00002000
-#define CLIENT_SECURE_CONNECTION    0x00008000
-#define CLIENT_PLUGIN_AUTH          0x00080000
-#define CLIENT_PLUGIN_AUTH_LENENC   0x00200000
+#define CLIENT_LONG_PASSWORD            0x00000001
+#define CLIENT_FOUND_ROWS               0x00000002
+#define CLIENT_LONG_FLAG                0x00000004
+#define CLIENT_CONNECT_WITH_DB          0x00000008
+#define CLIENT_PROTOCOL_41              0x00000200
+#define CLIENT_TRANSACTIONS             0x00002000
+#define CLIENT_SECURE_CONNECTION        0x00008000
+#define CLIENT_PLUGIN_AUTH              0x00080000
+#define CLIENT_PLUGIN_AUTH_LENENC       0x00200000
+#define CLIENT_OPTIONAL_RESULTSET_META  0x00400000
+#define CLIENT_SESSION_TRACK            0x00800000
+#define CLIENT_DEPRECATE_EOF            0x01000000
 
-/* We advertise a modern but conservative set. */
+/*
+ * Advertise protocol-41 with modern extensions.  CLIENT_DEPRECATE_EOF
+ * tells MySQL 8.0+ clients we use OK packets (not EOF) to terminate
+ * result sets.  CLIENT_OPTIONAL_RESULTSET_META is required by the
+ * mysql 8.4 CLI for result-set metadata.
+ */
 #define MYSQL_CAPABILITY_LO   (uint16)(                             \
         CLIENT_LONG_PASSWORD  | CLIENT_FOUND_ROWS    |                 \
         CLIENT_LONG_FLAG      | CLIENT_CONNECT_WITH_DB |               \
         CLIENT_PROTOCOL_41    | CLIENT_TRANSACTIONS   |                \
         CLIENT_SECURE_CONNECTION)
 #define MYSQL_CAPABILITY_HI   (uint16)(                             \
-        (CLIENT_PLUGIN_AUTH >> 16) | (CLIENT_PLUGIN_AUTH_LENENC >> 16))
+        (CLIENT_PLUGIN_AUTH >> 16)           |                          \
+        (CLIENT_PLUGIN_AUTH_LENENC >> 16)    |                          \
+        (CLIENT_DEPRECATE_EOF >> 16))
 
 /* Scramble length: part1 = 8, part2 = 12, total = 20. */
 #define MYSQL_SCRAMBLE_LEN          20
@@ -287,6 +297,10 @@ mysql_verify_login(MysPacketState *ps, Port *port)
         pfree(payload);
         return STATUS_ERROR;
     }
+
+    /* Store client capabilities so DestReceiver / end_command can consult them. */
+    mysql_packet_set_client_caps(ps, client_cap);
+
     pos_ptr += 4;
     remaining -= 4;
 
