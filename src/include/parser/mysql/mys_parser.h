@@ -1,11 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * mys_parser.h
- *    Declarations for the MySQL-compatibility parser entry point.
- *
- * The MySQL parser uses its own scanner (mys_scan.l) and grammar
- * (mys_gram.y), independent of the PG standard base_yyparser.  The
- * ParserRoutine.raw_parse callback points to mys_raw_parser().
+ *    Declarations for the MySQL-compatibility parser.
  *
  * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
  *
@@ -20,4 +16,4 @@
 
 extern List *mys_raw_parser(const char *str, RawParseMode mode);
 
-#endif   /* MYS_PARSER_H */
+#endif							/* MYS_PARSER_H */

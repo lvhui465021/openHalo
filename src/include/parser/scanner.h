@@ -114,6 +114,9 @@ typedef struct core_yy_extra_type
 	/* state variables for literal-lexing warnings */
 	bool		warn_on_first_escape;
 	bool		saw_non_ascii;
+
+	/* MySQL compatibility: track _binary introducer for bit-field literals */
+	bool		saw_underscore_binary;
 } core_yy_extra_type;
 
 /*

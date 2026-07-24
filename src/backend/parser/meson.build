@@ -2,7 +2,6 @@
 
 backend_sources += files(
   'analyze.c',
-  'mysql/mys_parser.c',
   'parse_agg.c',
   'parse_clause.c',
   'parse_coerce.c',
@@ -43,6 +42,29 @@ backend_parser = custom_target('gram',
 generated_sources += backend_parser.to_list()
 parser_sources += backend_parser
 
+# MySQL scanner generation
+mys_backend_scanner = custom_target('mys_scan',
+  input: 'mysql/mys_scan.l',
+  output: 'mys_scan.c',
+  command: [flex_cmd, '--no-backup', '--', '-CF', '-p', '-p'],
+)
+generated_sources += mys_backend_scanner
+
+# MySQL grammar generation
+mys_backend_parser = custom_target('mys_gram',
+  input: 'mysql/mys_gram.y',
+  kwargs: bison_kw,
+)
+generated_sources += mys_backend_parser.to_list()
+
+# MySQL keyword source needs the generated mys_kwlist_d.h header
+parser_sources += files('mysql/mys_keywords.c')
+parser_sources += files('mysql/mys_parser.c')
+parser_sources += mys_backend_scanner
+parser_sources += mys_backend_parser
+
+# MySQL parser runtime stubs (to be replaced with full migration)
+parser_sources += files('mysql/mys_gram_globals.c', 'mysql/mys_namespace_stubs.c')
 parser = static_library('parser',
   parser_sources,
   dependencies: [backend_code],
