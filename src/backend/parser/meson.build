@@ -64,6 +64,7 @@ parser_sources += mys_backend_scanner
 parser_sources += mys_backend_parser
 
 # MySQL parser runtime stubs (to be replaced with full migration)
+parser_sources += files('mysql/mys_expr_transform.c')
 parser_sources += files('mysql/mys_gram_globals.c', 'mysql/mys_namespace_stubs.c')
 parser = static_library('parser',
   parser_sources,

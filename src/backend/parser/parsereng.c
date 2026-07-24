@@ -15,6 +15,7 @@
 #include "parser/parserapi.h"         /* ParserRoutine               */
 #include "parser/parsereng.h"
 #include "parser/mysql/mys_parser.h"  /* mys_raw_parser              */
+#include "parser/mysql/mys_expr_transform.h"  /* mys_transform_expr_node */
 
 /* ----------------------------------------------------------------
  *    StandardParserRoutine  –  PG dialect
@@ -34,7 +35,7 @@ static const ParserRoutine StandardParserRoutine = {
  */
 const ParserRoutine MySQLParserRoutine = {
     .raw_parse = mys_raw_parser,
-    .transform_expr_node = NULL,
+    .transform_expr_node = mys_transform_expr_node,
 };
 
 const ParserRoutine *

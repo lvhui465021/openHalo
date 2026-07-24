@@ -26,6 +26,7 @@
 #include "commands/defrem.h"
 #include "commands/trigger.h"
 #include "nodes/makefuncs.h"
+#include "nodes/makefuncs.h"
 #include "nodes/mysql/mys_alttable_enums.h"
 extern bool isIgnoreStmt;
 #include "nodes/nodeFuncs.h"
@@ -19755,9 +19756,9 @@ c_expr:		columnref								{ $$ = $1; }
                 }
             | MysSysVarName
                 {
-                    SysVarRef *n = makeNode(SysVarRef);
-                    n->sysVarName = $1;
-                    n->location = @1;
+                    A_Const *n;
+                    n = (A_Const *) makeStringConst($1, @1);
+                    
                     $$ = (Node *)n;
                 }
 			| PARAM opt_indirection
