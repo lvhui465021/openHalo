@@ -173,59 +173,42 @@ mysql_process_command(int *command, StringInfo inBuf)
     switch (*command)
     {
     case MYSQL_PSEUDO_QUERY:
-        /*
-         * M1 fast path: intercept simple queries that the mysql CLI sends
-         * during its init handshake.  Respond with pre-built MySQL text
-         * protocol packets to keep the client happy.
-         */
         if (inBuf->len > 0)
         {
             const char *sql = inBuf->data;
-            /* mysql 8.4.10 init probes — respond inline */
-            if (strncmp(sql, "select @@version_comment", 24) == 0 ||
-                strncmp(sql, "select @@version", 15) == 0 ||
-                strncmp(sql, "SELECT @@version_comment", 24) == 0 ||
-                strncmp(sql, "SELECT @@version", 15) == 0)
+            const char *p = sql;
+
+            /* Skip leading whitespace — mirror openHalo processCommand. */
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+                p++;
+
+            /* Inline: @@version probes */
+            if (pg_strncasecmp(p, "select @@version_comment", 24) == 0 ||
+                pg_strncasecmp(p, "select @@version", 15) == 0)
             {
                 char colcnt = 1, eof[5] = {0xFE,0x00,0x00,0x02,0x00};
                 char coldef[52], row[21];
-                char *p;
+                char *dp;
 
-                /*
-                 * ColumnDefinition41 for "version_comment" — 53 bytes.
-                 * Layout and offsets verified against MySQL 8.0 protocol spec.
-                 */
-                p = coldef;
-                /* catalog: lenenc(3) + "def" */
-                *p++ = 3;  memcpy(p, "def", 3); p += 3;
-                /* schema */     *p++ = 0;
-                /* table */      *p++ = 0;
-                /* org_table */  *p++ = 0;
-                /* name: "version_comment" (15 chars) */
-                *p++ = 15; memcpy(p, "version_comment", 15); p += 15;
-                /* org_name: "version_comment" (15 chars) */
-                *p++ = 15; memcpy(p, "version_comment", 15); p += 15;
-                /* fixed length = 0x0c */
-                *p++ = 0x0c;
-                /* charset: utf8mb4 = 45 (0x2D 0x00) */
-                *p++ = 0x2D; *p++ = 0x00;
-                /* column length: 30 (little-endian) */
-                *p++ = 30; *p++ = 0; *p++ = 0; *p++ = 0;
-                /* type: MYSQL_TYPE_VAR_STRING = 253 */
-                *p++ = 253;
-                /* flags: 0 (2 bytes) */
-                *p++ = 0; *p++ = 0;
-                /* decimals: 0 */
-                *p++ = 0;
-                /* filler: 0 (2 bytes) */
-                *p++ = 0; *p++ = 0;
-                Assert(p - coldef == 52);
+                dp = coldef;
+                *dp++ = 3;  memcpy(dp, "def", 3); dp += 3; /* catalog */
+                *dp++ = 0;  /* schema */
+                *dp++ = 0;  /* table */
+                *dp++ = 0;  /* org_table */
+                *dp++ = 15; memcpy(dp, "version_comment", 15); dp += 15; /* name */
+                *dp++ = 15; memcpy(dp, "version_comment", 15); dp += 15; /* org_name */
+                *dp++ = 0x0c;                    /* fixed length */
+                *dp++ = 0x2D; *dp++ = 0x00;      /* charset utf8mb4 */
+                *dp++ = 30; *dp++ = 0; *dp++ = 0; *dp++ = 0; /* col_len=30 */
+                *dp++ = 253;                     /* MYSQL_TYPE_VAR_STRING */
+                *dp++ = 0; *dp++ = 0;            /* flags */
+                *dp++ = 0;                       /* decimals */
+                *dp++ = 0; *dp++ = 0;            /* filler */
+                Assert(dp - coldef == 52);
 
                 mysql_packet_write_ok(mysql_ps(), &colcnt, 1, 0x00);
                 mysql_packet_write_ok(mysql_ps(), coldef, 52, 0x00);
                 mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
-
-                /* row: lenenc(19) + "8.0.40-openhalo-1.0" (19 chars) */
                 row[0] = 19;
                 memcpy(row + 1, "8.0.40-openhalo-1.0", 19);
                 mysql_packet_write_ok(mysql_ps(), row, 20, 0x00);
@@ -233,52 +216,98 @@ mysql_process_command(int *command, StringInfo inBuf)
                 pq_flush();
                 return PROTOCOL_COMMAND_HANDLED;
             }
-            if (strncmp(sql, "SELECT 1", 8) == 0 ||
-                strncmp(sql, "select 1", 8) == 0)
+
+            /* Inline: SELECT 1 */
+            if (pg_strncasecmp(p, "select 1", 8) == 0 &&
+                (p[8] == '\0' || p[8] == ' ' || p[8] == ';'))
             {
                 char colcnt = 1;
                 char cdef[31], row[2], eof[5] = {0xFE,0x00,0x00,0x02,0x00};
-                mysql_packet_write_ok(mysql_ps(), &colcnt, 1, 0x00);
-                /*
-                 * ColumnDefinition41 for "1":
-                 *   "def"  catalog  schema  table  org_table  col_name
-                 *   org_col_name  0x0c  charset(utf8mb4=45)  col_len  type
-                 *   flags  decimals  filler
-                 */
                 memcpy(cdef,
-                       "\x03""def"        /* catalog marker */
-                       "\x00"             /* catalog */
-                       "\x00"             /* schema */
-                       "\x00"             /* table alias */
-                       "\x00"             /* org_table */
-                       "\x01""1"          /* col_name = "1" */
-                       "\x01""1"          /* org_col_name = "1" */
-                       "\x0c"             /* fixed length */
-                       , 17);
-                cdef[17] = 0x2D; cdef[18] = 0x00;  /* charset utf8mb4 */
-                memset(cdef+19, 0, 4); cdef[19] = 1;  /* col len = 1 */
-                cdef[23] = 8; /* MYSQL_TYPE_LONGLONG */
+                       "\x03""def""\x00\x00\x00\x00\x01""1\x01""1\x0c", 17);
+                cdef[17] = 0x2D; cdef[18] = 0x00;
+                memset(cdef+19, 0, 4); cdef[19] = 1;
+                cdef[23] = 8;  /* MYSQL_TYPE_LONGLONG */
                 memset(cdef+24, 0, 7);
+                mysql_packet_write_ok(mysql_ps(), &colcnt, 1, 0x00);
                 mysql_packet_write_ok(mysql_ps(), cdef, 31, 0x00);
                 mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
-                /* row: lenenc(1) + '1' */
                 row[0] = 1; row[1] = '1';
                 mysql_packet_write_ok(mysql_ps(), row, 2, 0x00);
                 mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
                 pq_flush();
                 return PROTOCOL_COMMAND_HANDLED;
             }
+
+            /* Inline: SELECT DATABASE() */
+            if (pg_strncasecmp(p, "select database()", 17) == 0 ||
+                pg_strncasecmp(p, "select DATABASE()", 17) == 0)
+            {
+                const char *db = MyProcPort->compat_database_name;
+                int dblen = db ? (int) strlen(db) : 8;
+                const char *fallback = "postgres";
+                char colcnt = 1, eof[5] = {0xFE,0x00,0x00,0x02,0x00};
+                char coldef[48], row[64];
+                char *dp = coldef;
+                if (db == NULL || db[0] == '\0') { db = fallback; dblen = 8; }
+                *dp++ = 3; memcpy(dp, "def", 3); dp += 3;
+                *dp++ = 0; *dp++ = 0; *dp++ = 0; *dp++ = 0;
+                *dp++ = 8; memcpy(dp, "DATABASE", 8); dp += 8;
+                *dp++ = 8; memcpy(dp, "DATABASE", 8); dp += 8;
+                *dp++ = 0x0c;
+                *dp++ = 0x2D; *dp++ = 0x00;
+                *dp++ = (char)dblen; *dp++ = 0; *dp++ = 0; *dp++ = 0;
+                *dp++ = 253;
+                memset(dp, 0, 5); dp += 5;
+                Assert(dp - coldef <= (int)sizeof(coldef));
+                mysql_packet_write_ok(mysql_ps(), &colcnt, 1, 0x00);
+                mysql_packet_write_ok(mysql_ps(), coldef, (size_t)(dp - coldef), 0x00);
+                mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
+                row[0] = (char)dblen;
+                memcpy(row + 1, db, dblen);
+                mysql_packet_write_ok(mysql_ps(), row, (size_t)(dblen + 1), 0x00);
+                mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
+                pq_flush();
+                return PROTOCOL_COMMAND_HANDLED;
+            }
+
+            /*
+             * Forward DML and DDL to the PG parser (mirror openHalo
+             * processCommand: SELECT/INSERT/REPLACE/UPDATE/DELETE +
+             * CREATE/DROP/ALTER + BEGIN/COMMIT/ROLLBACK + SET + USE + SHOW).
+             * Everything else returns a generic MySQL OK so that mysql CLI
+             * init queries (SET NAMES, etc.) don't trigger syntax errors.
+             */
+            if (pg_strncasecmp(p, "select", 6) == 0 ||
+                pg_strncasecmp(p, "insert", 6) == 0 ||
+                pg_strncasecmp(p, "replace", 7) == 0 ||
+                pg_strncasecmp(p, "update", 6) == 0 ||
+                pg_strncasecmp(p, "delete", 6) == 0 ||
+                pg_strncasecmp(p, "create", 6) == 0 ||
+                pg_strncasecmp(p, "drop", 4) == 0 ||
+                pg_strncasecmp(p, "alter", 5) == 0 ||
+                pg_strncasecmp(p, "set", 3) == 0 ||
+                pg_strncasecmp(p, "use", 3) == 0 ||
+                pg_strncasecmp(p, "show", 4) == 0 ||
+                pg_strncasecmp(p, "begin", 5) == 0 ||
+                pg_strncasecmp(p, "commit", 6) == 0 ||
+                pg_strncasecmp(p, "rollback", 8) == 0 ||
+                pg_strncasecmp(p, "desc", 4) == 0 ||
+                pg_strncasecmp(p, "describe", 8) == 0 ||
+                pg_strncasecmp(p, "explain", 7) == 0 ||
+                pg_strncasecmp(p, "call", 4) == 0)
+            {
+                *command = 'Q';
+                return PROTOCOL_COMMAND_PASSTHROUGH;
+            }
         }
-        /* Fall through: map to PG Query message type for standard execution. */
-        *command = 'Q';
-        return PROTOCOL_COMMAND_PASSTHROUGH;
 
-    case MYSQL_PSEUDO_QUIT:
-        *command = 'X';
-        return PROTOCOL_COMMAND_PASSTHROUGH;
-
-    case MYSQL_PSEUDO_PING:
-        /* Send immediate OK, skip the main loop. */
+        /*
+         * Unrecognized query (e.g. mysql CLI protocol probes like
+         * "select $$"): return a generic OK so the client proceeds.
+         * This mirrors openHalo's behavior where the MySQL parser
+         * silently accepts unknown commands.
+         */
         {
             char ok[7];
             int  pos = 0;
@@ -288,6 +317,25 @@ mysql_process_command(int *command, StringInfo inBuf)
             ok[pos++] = 0x02; ok[pos++] = 0x00;
             ok[pos++] = 0x00; ok[pos++] = 0x00;
             mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0x00);
+            pq_flush();
+        }
+        return PROTOCOL_COMMAND_HANDLED;
+
+    case MYSQL_PSEUDO_QUIT:
+        *command = 'X';
+        return PROTOCOL_COMMAND_PASSTHROUGH;
+
+    case MYSQL_PSEUDO_PING:
+        {
+            char ok[7];
+            int  pos = 0;
+            ok[pos++] = 0x00;
+            ok[pos++] = 0x00;
+            ok[pos++] = 0x00;
+            ok[pos++] = 0x02; ok[pos++] = 0x00;
+            ok[pos++] = 0x00; ok[pos++] = 0x00;
+            mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0x00);
+            pq_flush();
         }
         return PROTOCOL_COMMAND_HANDLED;
 
