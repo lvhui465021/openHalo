@@ -89,16 +89,17 @@ mysql_startup_exchange(Port *port)
 {
     MysPacketState *ps = (MysPacketState *) port->protocol_state;
     int            status;
-    bool           saved_noblock;
 
     ereport(LOG, (errmsg("MySQL: startup_exchange begin")));
     Assert(ps != NULL);
 
     /*
-     * Set the socket to blocking mode for the handshake.  pq_init() made it
-     * non-blocking, but our raw packet I/O does not use the FeBeWaitSet.
+     * Set the socket to blocking mode for the handshake and keep it that
+     * way for the lifetime of the MySQL session.  Our packet I/O callbacks
+     * use direct secure_read/secure_write with EAGAIN retry, bypassing the
+     * PG FeBeWaitSet.  A non-blocking socket causes spurious ENOTSOCK
+     * failures during result-set writing.
      */
-    saved_noblock = port->noblock;
     port->noblock = false;
 
     /* Phase A1: Send the MySQL handshake greeting. */
@@ -107,8 +108,14 @@ mysql_startup_exchange(Port *port)
     /* Phase A2: Read and verify the login response. */
     status = mysql_verify_login(ps, port);
 
-    /* Restore non-blocking mode for the PostgresMain event loop. */
-    port->noblock = saved_noblock;
+    /*
+     * Keep the socket blocking for MySQL connections.  Our packet I/O
+     * callbacks (mysql_read_command_cb, mysql_packet_write, …) use direct
+     * secure_read/secure_write with EAGAIN retry, bypassing the PG
+     * FeBeWaitSet.  A non-blocking socket causes spurious ENOTSOCK
+     * failures during result-set writing.
+     */
+    port->noblock = false;
 
     return status;
 }
@@ -172,20 +179,21 @@ mysql_process_command(int *command, StringInfo inBuf)
                 strncmp(sql, "SELECT @@version_comment", 24) == 0 ||
                 strncmp(sql, "SELECT @@version", 15) == 0)
             {
-                char colcnt[16], coldef[256], row[64], eof[5] = {0xFE,0x00,0x00,0x02,0x00};
-                int clen;
-                /* column count */
-                snprintf(colcnt, sizeof(colcnt), "1");
-                mysql_packet_write_ok(mysql_ps(), colcnt, 1, 0x00);
-                /* column definition: 'def', catalog, schema, table, org_table, name, org_name, lenenc(12), charset(2), length(4), type(1), flags(2), decimals(1), filler(2) */
-                memcpy(coldef, "def\0\0result\0\0version_comment\0version_comment\0\014\x2D\0", 41);
-                memset(coldef+41, 0, 4); coldef[41] = 64; /* col len = 64 */
-                coldef[45] = 253; /* MYSQL_TYPE_VAR_STRING */
-                memset(coldef+46, 0, 6); /* flags(2)=0, decimals(1)=0, filler(2)=0 */
+                char colcnt, coldef[52], row[32], eof[5] = {0xFE,0x00,0x00,0x02,0x00};
+                /* column count: lenenc(1) */
+                colcnt = 1;
+                mysql_packet_write_ok(mysql_ps(), &colcnt, 1, 0x00);
+                /* column definition (lenenc_str for all string fields) */
+                memcpy(coldef, "\x03""def\0\0\0\x0f""version_comment\x0f""version_comment\x0c\x2D\0", 40);
+                memset(coldef+40, 0, 4); coldef[40] = 30; /* col len = 30 */
+                coldef[44] = 253; /* MYSQL_TYPE_VAR_STRING */
+                memset(coldef+45, 0, 7); /* flags(2)=0, decimals(1)=0, filler(2)=0 */
                 mysql_packet_write_ok(mysql_ps(), coldef, 52, 0x00);
                 mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
                 /* row: lenenc(30) + '8.0.40-openhalo-1.0' */
-                snprintf(row, sizeof(row), "%c%s", 30, "8.0.40-openhalo-1.0");
+                memset(row, 0, sizeof(row));
+                row[0] = 30;
+                memcpy(row + 1, "8.0.40-openhalo-1.0", 22);
                 mysql_packet_write_ok(mysql_ps(), row, 31, 0x00);
                 mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
                 return PROTOCOL_COMMAND_HANDLED;
@@ -193,24 +201,20 @@ mysql_process_command(int *command, StringInfo inBuf)
             if (strncmp(sql, "SELECT 1", 8) == 0 ||
                 strncmp(sql, "select 1", 8) == 0)
             {
-                char colcnt[16];
-                snprintf(colcnt, sizeof(colcnt), "1");
-                mysql_packet_write_ok(mysql_ps(), colcnt, 1, 0x00);
-                /* column definition for "1" */
-                {
-                    char cdef[64];
-                    memcpy(cdef, "def\0\0\0\0\01\01\0\x0c\x2d\0", 18);
-                    memset(cdef+18, 0, 4); cdef[18] = 11; /* col len */
-                    cdef[22] = 8; /* MYSQL_TYPE_LONGLONG */
-                    memset(cdef+23, 0, 5);
-                    mysql_packet_write_ok(mysql_ps(), cdef, 28, 0x00);
-                }
-                /* EOF */
-                { char eof[5] = {0xFE,0x00,0x00,0x02,0x00}; mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE); }
-                /* row: "1" */
-                { char row[3] = {1, '1'}; mysql_packet_write_ok(mysql_ps(), row, 2, 0x00); }
-                /* EOF */
-                { char eof[5] = {0xFE,0x00,0x00,0x02,0x00}; mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE); }
+                char colcnt = 1;
+                char cdef[28], row[3], eof[5] = {0xFE,0x00,0x00,0x02,0x00};
+                mysql_packet_write_ok(mysql_ps(), &colcnt, 1, 0x00);
+                /* column definition for "1": lenenc_str "def", catalog, schema, table, org_table, col_name, org_col_name, then fixed fields */
+                memcpy(cdef, "\x03""def\0\0\0\x01""1\x01""1\x0c\x2d\0", 17);
+                memset(cdef+17, 0, 4); cdef[17] = 1; /* col len */
+                cdef[21] = 8; /* MYSQL_TYPE_LONGLONG */
+                memset(cdef+22, 0, 6);
+                mysql_packet_write_ok(mysql_ps(), cdef, 28, 0x00);
+                mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
+                /* row: lenenc(1) + '1' */
+                row[0] = 1; row[1] = '1';
+                mysql_packet_write_ok(mysql_ps(), row, 2, 0x00);
+                mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
                 return PROTOCOL_COMMAND_HANDLED;
             }
         }
@@ -282,10 +286,10 @@ mysql_set_remote_dest_receiver_params(DestReceiver *receiver,
  * ----------------------------------------------------------------
  */
 /*
- * Minimal MySQL text-protocol DestReceiver.
+ * MySQL text-protocol DestReceiver.
  *
- * For M1 we only support simple scalar results (SELECT 1, SELECT DATABASE(), …).
- * Multi-column and multi-row results will be extended in M2.
+ * Sends MySQL text protocol result sets: column-count → column definitions
+ * → EOF → row data → EOF.  Type mapping covers common scalar types.
  */
 typedef struct MysDRState
 {
@@ -306,11 +310,29 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
 
     if (!dr->started)
     {
-        /* Send column count + column definitions on first row. */
-        char colcnt[16];
-        /* Column count as a length-encoded integer (text protocol). */
-        snprintf(colcnt, sizeof(colcnt), "%d", ncols);
-        mysql_packet_write_ok(dr->ps, colcnt, strlen(colcnt), 0x00);
+        /* Send column count as a length-encoded integer. */
+        {
+            char colcnt[16];
+            int  pos = 0;
+            if (ncols < 251)
+            {
+                colcnt[pos++] = (char) ncols;
+            }
+            else if (ncols < 65536)
+            {
+                colcnt[pos++] = (char) 0xFC;
+                colcnt[pos++] = (char) (ncols & 0xFF);
+                colcnt[pos++] = (char) ((ncols >> 8) & 0xFF);
+            }
+            else
+            {
+                colcnt[pos++] = (char) 0xFD;
+                colcnt[pos++] = (char) (ncols & 0xFF);
+                colcnt[pos++] = (char) ((ncols >> 8) & 0xFF);
+                colcnt[pos++] = (char) ((ncols >> 16) & 0xFF);
+            }
+            mysql_packet_write_ok(dr->ps, colcnt, (size_t) pos, 0x00);
+        }
 
         for (i = 0; i < ncols; i++)
         {
@@ -318,33 +340,67 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
             StringInfoData colbuf;
             initStringInfo(&colbuf);
 
-            /* MySQL column-definition packet for text protocol:
-             *   "def" catalog db table org_table col_name org_col_name
-             *   charset(2) col_length(4) type(1) flags(2) decimals(1) filler(2)
-             * For M1, send a minimal definition. */
-            appendStringInfoString(&colbuf, "def");          /* "def" marker */
-            appendStringInfoChar(&colbuf, '\0');              /* catalog = "" */
-            appendStringInfoChar(&colbuf, '\0');              /* schema = "" */
-            appendStringInfoString(&colbuf, "result");        /* table alias */
-            appendStringInfoChar(&colbuf, '\0');
-            appendStringInfoString(&colbuf, "");              /* org_table */
-            appendStringInfoChar(&colbuf, '\0');
-            appendStringInfoString(&colbuf, NameStr(attr->attname)); /* col_name */
-            appendStringInfoChar(&colbuf, '\0');
-            appendStringInfoString(&colbuf, NameStr(attr->attname)); /* org_name */
-            appendStringInfoChar(&colbuf, '\0');
-            /* Length of fixed fields */
-            appendStringInfoChar(&colbuf, 0x0c);             /* 12 bytes follow */
-            /* charset: utf8mb4 = 45 (0x2D) */
+            /*
+             * MySQL ColumnDefinition41 packet (text protocol).
+             * All string fields are length-encoded.
+             */
+            /* "def" marker */
+            appendStringInfoChar(&colbuf, 3);
+            appendStringInfoString(&colbuf, "def");
+            /* catalog = "" */
+            appendStringInfoChar(&colbuf, 0);
+            /* schema = "" */
+            appendStringInfoChar(&colbuf, 0);
+            /* table alias (use empty for computed columns) */
+            appendStringInfoChar(&colbuf, 0);
+            /* org_table = "" */
+            appendStringInfoChar(&colbuf, 0);
+            /* col_name */
+            {
+                const char *cname = NameStr(attr->attname);
+                int         clen = (int) strlen(cname);
+                appendStringInfoChar(&colbuf, (char) clen);
+                appendBinaryStringInfo(&colbuf, cname, clen);
+            }
+            /* org_col_name */
+            {
+                const char *cname = NameStr(attr->attname);
+                int         clen = (int) strlen(cname);
+                appendStringInfoChar(&colbuf, (char) clen);
+                appendBinaryStringInfo(&colbuf, cname, clen);
+            }
+            /* length of fixed fields (always 0x0c = 12) */
+            appendStringInfoChar(&colbuf, 0x0c);
+            /* charset: utf8mb4 = 45 */
             appendStringInfoChar(&colbuf, 0x2D); appendStringInfoChar(&colbuf, 0x00);
             /* column length */
             {
-                uint32 collen = (uint32) attr->atttypmod;     /* approximate */
-                if (collen <= 0) collen = 256;
+                int32 collen = attr->atttypmod > 0 ? attr->atttypmod : 256;
                 appendBinaryStringInfo(&colbuf, (char *)&collen, 4);
             }
-            /* type: MYSQL_TYPE_VAR_STRING = 253 */
-            appendStringInfoChar(&colbuf, 253);
+            /* type: map PG type → MySQL type */
+            {
+                Oid  typid = attr->atttypid;
+                char mysql_type;
+
+                switch (typid)
+                {
+                    case INT2OID:
+                    case INT4OID:
+                    case INT8OID:
+                        mysql_type = 8;     /* MYSQL_TYPE_LONGLONG */
+                        break;
+                    case FLOAT4OID:
+                    case FLOAT8OID:
+                    case NUMERICOID:
+                        mysql_type = 246;   /* MYSQL_TYPE_NEWDECIMAL */
+                        break;
+                    default:
+                        mysql_type = 253;   /* MYSQL_TYPE_VAR_STRING */
+                        break;
+                }
+                appendStringInfoChar(&colbuf, mysql_type);
+            }
             /* flags */
             appendStringInfoChar(&colbuf, 0x00); appendStringInfoChar(&colbuf, 0x00);
             /* decimals */
@@ -355,9 +411,9 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
             mysql_packet_write_ok(dr->ps, colbuf.data, colbuf.len, 0x00);
             pfree(colbuf.data);
         }
-        /* EOF after column definitions (CLIENT_DEPRECATE_EOF not set). */
+        /* EOF after column definitions. */
         {
-            char eof[5] = {0xFE, 0x00, 0x00, 0x02, 0x00}; /* EOF + warnings(2) + status(2) */
+            char eof[5] = {0xFE, 0x00, 0x00, 0x02, 0x00};
             mysql_packet_write_ok(dr->ps, eof, 5, 0xFE);
         }
         dr->started = true;
@@ -395,12 +451,18 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
                 {
                     appendStringInfoChar(&rowbuf, (char) slen);
                 }
-                else
+                else if (slen < 65536)
                 {
-                    /* M1 simplification: assume < 64K */
                     appendStringInfoChar(&rowbuf, 0xFC);
                     appendStringInfoChar(&rowbuf, (char)(slen & 0xFF));
                     appendStringInfoChar(&rowbuf, (char)((slen >> 8) & 0xFF));
+                }
+                else
+                {
+                    appendStringInfoChar(&rowbuf, 0xFD);
+                    appendStringInfoChar(&rowbuf, (char)(slen & 0xFF));
+                    appendStringInfoChar(&rowbuf, (char)((slen >> 8) & 0xFF));
+                    appendStringInfoChar(&rowbuf, (char)((slen >> 16) & 0xFF));
                 }
                 appendBinaryStringInfo(&rowbuf, str, slen);
                 pfree(str);
