@@ -106,6 +106,21 @@ typedef struct ClientConnectionInfo
 } ClientConnectionInfo;
 
 /*
+ * This identifies the wire protocol selected by the listener.  Zero is the
+ * standard PostgreSQL protocol so that zero-initialized ClientSocket values
+ * retain the current behavior until a listener chooses another protocol.
+ */
+typedef enum CompatibilityProtocolKind
+{
+	COMPAT_PROTOCOL_POSTGRES = 0,
+	COMPAT_PROTOCOL_MYSQL,
+	COMPAT_PROTOCOL_TDS,
+	COMPAT_PROTOCOL_KIND_MAX
+} CompatibilityProtocolKind;
+
+struct ProtocolRoutine;
+
+/*
  * The Port structure holds state information about a client connection in a
  * backend process.  It is available in the global variable MyProcPort.  The
  * struct and all the data it points are kept in TopMemoryContext.
@@ -130,6 +145,8 @@ typedef struct Port
 	pgsocket	sock;			/* File descriptor */
 	bool		noblock;		/* is the socket in non-blocking mode? */
 	ProtocolVersion proto;		/* FE/BE protocol version */
+	CompatibilityProtocolKind protocol_kind; /* listener-selected wire protocol */
+	const struct ProtocolRoutine *protocol_routine; /* child-local routine */
 	SockAddr	laddr;			/* local addr (postmaster) */
 	SockAddr	raddr;			/* remote addr (client) */
 	char	   *remote_host;	/* name (or ip addr) of remote host */
@@ -147,7 +164,14 @@ typedef struct Port
 	 * into backend execution.  "char *" fields are NULL if not set.
 	 * guc_options points to a List of alternating option names and values.
 	 */
+	/* Physical PostgreSQL database selected before InitPostgres(). */
 	char	   *database_name;
+	/*
+	 * Logical database name requested by a compatibility protocol.  For the
+	 * MySQL protocol this is the selected schema, not database_name above.
+	 * It remains NULL for the standard PostgreSQL protocol.
+	 */
+	char	   *compat_database_name;
 	char	   *user_name;
 	char	   *cmdline_options;
 	List	   *guc_options;
@@ -163,6 +187,9 @@ typedef struct Port
 	 * Information that needs to be held during the authentication cycle.
 	 */
 	HbaLine    *hba;
+
+	/* Child-local state owned by protocol_routine. */
+	void	   *protocol_state;
 
 	/*
 	 * TCP keepalive and user timeout settings.
@@ -249,6 +276,7 @@ typedef struct ClientSocket
 {
 	pgsocket	sock;			/* File descriptor */
 	SockAddr	raddr;			/* remote addr (client) */
+	CompatibilityProtocolKind protocol_kind; /* copied to the child */
 } ClientSocket;
 
 #ifdef USE_SSL

@@ -57,6 +57,7 @@
 #include "gramparse.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/mysql/mys_parsenodes.h"
 #include "parser/parser.h"
 #include "utils/datetime.h"
 #include "utils/xml.h"
@@ -581,7 +582,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <str>		NonReservedWord NonReservedWord_or_Sconst
 %type <str>		var_name type_function_name param_name
 %type <str>		createdb_opt_name plassign_target
-%type <node>	var_value zone_value
+%type <node>	var_value zone_value opt_mysql_assignment
 %type <rolespec> auth_ident RoleSpec opt_granted_by
 %type <publicationobjectspec> PublicationObjSpec
 
@@ -819,6 +820,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %token		MODE_PLPGSQL_ASSIGN1
 %token		MODE_PLPGSQL_ASSIGN2
 %token		MODE_PLPGSQL_ASSIGN3
+%token <str>	MYSQL_USER_VARIABLE
 
 
 /* Precedence: lowest to highest */
@@ -15519,6 +15521,26 @@ b_expr:		c_expr
  * ambiguity to the b_expr syntax.
  */
 c_expr:		columnref								{ $$ = $1; }
+			| MYSQL_USER_VARIABLE opt_mysql_assignment
+				{
+					if ($2 != NULL)
+					{
+						UserVarAssign *n = makeNode(UserVarAssign);
+
+						n->userVarName = $1;
+						n->expr = $2;
+						n->location = @1;
+						$$ = (Node *) n;
+					}
+					else
+					{
+						UserVarRef *n = makeNode(UserVarRef);
+
+						n->userVarName = $1;
+						n->location = @1;
+						$$ = (Node *) n;
+					}
+				}
 			| AexprConst							{ $$ = $1; }
 			| PARAM opt_indirection
 				{
@@ -17615,6 +17637,16 @@ plassign_equals: COLON_EQUALS
 			| '='
 		;
 
+opt_mysql_assignment:
+			COLON_EQUALS c_expr
+				{
+					$$ = $2;
+				}
+			| /* empty */
+				{
+					$$ = NULL;
+				}
+		;
 
 /*
  * Name classification hierarchy.

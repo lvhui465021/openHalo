@@ -529,4 +529,8 @@ extern void write_jsonlog(ErrorData *edata);
 extern void write_stderr(const char *fmt,...) pg_attribute_printf(1, 2);
 extern void vwrite_stderr(const char *fmt, va_list ap) pg_attribute_printf(1, 0);
 
+/* Standard PostgreSQL error-message encoder, callable from compat error paths. */
+struct ErrorData;
+extern void standard_send_message_to_frontend(struct ErrorData *edata);
+
 #endif							/* ELOG_H */

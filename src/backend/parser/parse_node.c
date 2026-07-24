@@ -43,6 +43,8 @@ make_parsestate(ParseState *parentParseState)
 	pstate = palloc0(sizeof(ParseState));
 
 	pstate->parentParseState = parentParseState;
+	pstate->p_parser_routine = parentParseState ?
+		parentParseState->p_parser_routine : NULL;
 
 	/* Fill in fields that don't start at null/false/zero */
 	pstate->p_next_resno = 1;

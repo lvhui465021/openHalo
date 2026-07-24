@@ -20,6 +20,8 @@
 #include "utils/guc.h"
 #include "utils/queryenvironment.h"
 
+struct ParserRoutine;
+
 
 extern PGDLLIMPORT CommandDest whereToSendOutput;
 extern PGDLLIMPORT const char *debug_query_string;
@@ -46,11 +48,19 @@ extern PGDLLIMPORT int log_statement;
 extern PGDLLIMPORT int restrict_nonsystem_relation_kind;
 
 extern List *pg_parse_query(const char *query_string);
+extern List *pg_parse_query_with_routine(const char *query_string,
+										 const struct ParserRoutine *parser_routine);
 extern List *pg_rewrite_query(Query *query);
 extern List *pg_analyze_and_rewrite_fixedparams(RawStmt *parsetree,
 												const char *query_string,
 												const Oid *paramTypes, int numParams,
 												QueryEnvironment *queryEnv);
+extern List *pg_analyze_and_rewrite_fixedparams_with_routine(RawStmt *parsetree,
+															 const char *query_string,
+															 const Oid *paramTypes,
+															 int numParams,
+															 QueryEnvironment *queryEnv,
+															 const struct ParserRoutine *parser_routine);
 extern List *pg_analyze_and_rewrite_varparams(RawStmt *parsetree,
 											  const char *query_string,
 											  Oid **paramTypes,

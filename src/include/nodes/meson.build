@@ -7,6 +7,7 @@ node_support_input_i = [
   'nodes/pathnodes.h',
   'nodes/plannodes.h',
   'nodes/execnodes.h',
+  'nodes/mysql/mys_parsenodes.h',
   'access/amapi.h',
   'access/cmptype.h',
   'access/sdir.h',

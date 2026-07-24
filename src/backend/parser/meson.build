@@ -25,7 +25,7 @@ backend_sources += files(
 # Build a small utility static lib for the parser. The generation of the
 # parser is slow, and building this separately avoids other parts of the
 # backend having to wait till gram.h is generated.
-parser_sources = files('parser.c')
+parser_sources = files('parser.c', 'parsereng.c')
 
 backend_scanner = custom_target('scan',
   input: 'scan.l',

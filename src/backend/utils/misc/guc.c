@@ -38,6 +38,7 @@
 #include "libpq/pqformat.h"
 #include "libpq/protocol.h"
 #include "miscadmin.h"
+#include "postmaster/protocol_routine.h"
 #include "parser/scansup.h"
 #include "port/pg_bitutils.h"
 #include "storage/fd.h"
@@ -241,6 +242,8 @@ static void set_guc_source(struct config_generic *gconf, GucSource newsource);
 static void pg_timezone_abbrev_initialize(void);
 static void push_old_value(struct config_generic *gconf, GucAction action);
 static void ReportGUCOption(struct config_generic *record);
+void standard_ReportParameterStatus(const char *name,
+											const char *value);
 static void set_config_sourcefile(const char *name, char *sourcefile,
 								  int sourceline);
 static void reapply_stacked_values(struct config_generic *variable,
@@ -2638,12 +2641,20 @@ ReportGUCOption(struct config_generic *record)
 	if (record->last_reported == NULL ||
 		strcmp(val, record->last_reported) != 0)
 	{
-		StringInfoData msgbuf;
+		const ProtocolRoutine *routine = GetCurrentProtocolRoutine();
 
-		pq_beginmessage(&msgbuf, PqMsg_ParameterStatus);
-		pq_sendstring(&msgbuf, record->name);
-		pq_sendstring(&msgbuf, val);
-		pq_endmessage(&msgbuf);
+		/*
+		 * ParameterStatus is PostgreSQL framing.  A compatibility routine must
+		 * explicitly encode it or intentionally ignore it; it must never leak
+		 * a PG 'S' packet onto another protocol's socket.
+		 */
+		if (routine != NULL && routine->kind != COMPAT_PROTOCOL_POSTGRES)
+		{
+			if (routine->report_parameter_status != NULL)
+				routine->report_parameter_status(record->name, val);
+		}
+		else
+			standard_ReportParameterStatus(record->name, val);
 
 		/*
 		 * We need a long-lifespan copy.  If guc_strdup() fails due to OOM,
@@ -2655,6 +2666,18 @@ ReportGUCOption(struct config_generic *record)
 	}
 
 	pfree(val);
+}
+
+/* Standard PostgreSQL ParameterStatus encoder. */
+void
+standard_ReportParameterStatus(const char *name, const char *value)
+{
+	StringInfoData msgbuf;
+
+	pq_beginmessage(&msgbuf, PqMsg_ParameterStatus);
+	pq_sendstring(&msgbuf, name);
+	pq_sendstring(&msgbuf, value);
+	pq_endmessage(&msgbuf);
 }
 
 /*

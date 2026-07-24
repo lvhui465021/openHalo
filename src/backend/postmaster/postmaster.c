@@ -104,6 +104,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/protocol_routine.h"
 #include "postmaster/syslogger.h"
 #include "postmaster/walsummarizer.h"
 #include "replication/logicallauncher.h"
@@ -122,6 +123,7 @@
 #include "utils/pidfile.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
+#include "adapter/mysql/mysql_protocol.h"
 
 #ifdef EXEC_BACKEND
 #include "common/file_utils.h"
@@ -233,6 +235,7 @@ int			ReservedConnections;
 #define MAXLISTEN	64
 static int	NumListenSockets = 0;
 static pgsocket *ListenSockets = NULL;
+static CompatibilityProtocolKind *ListenSocketProtocolKinds = NULL;
 
 /* still more option variables */
 bool		EnableSSL = false;
@@ -453,6 +456,10 @@ static void StartSysLogger(void);
 static void StartAutovacuumWorker(void);
 static bool StartBackgroundWorker(RegisteredBgWorker *rw);
 static void InitPostmasterDeathWatchHandle(void);
+static int  ListenProtocolServerPort(CompatibilityProtocolKind kind, int family,
+                                      const char *hostName, unsigned short portNumber,
+                                      const char *unixSocketName);
+static void InitializeProtocolListeners(void);
 
 #ifdef WIN32
 #define WNOHANG 0				/* ignored, so any integer value will do */
@@ -1109,6 +1116,9 @@ PostmasterMain(int argc, char *argv[])
 	 * sockets again at postmaster shutdown.
 	 */
 	ListenSockets = palloc(MAXLISTEN * sizeof(pgsocket));
+	/* Zero is COMPAT_PROTOCOL_POSTGRES; set each slot explicitly on append. */
+	ListenSocketProtocolKinds = palloc0(MAXLISTEN *
+										 sizeof(CompatibilityProtocolKind));
 	on_proc_exit(CloseServerPorts, 0);
 
 	if (ListenAddresses)
@@ -1136,19 +1146,15 @@ PostmasterMain(int argc, char *argv[])
 			char	   *curhost = (char *) lfirst(l);
 
 			if (strcmp(curhost, "*") == 0)
-				status = ListenServerPort(AF_UNSPEC, NULL,
+				status = ListenProtocolServerPort(COMPAT_PROTOCOL_POSTGRES,
+											  AF_UNSPEC, NULL,
 										  (unsigned short) PostPortNumber,
-										  NULL,
-										  ListenSockets,
-										  &NumListenSockets,
-										  MAXLISTEN);
+										  NULL);
 			else
-				status = ListenServerPort(AF_UNSPEC, curhost,
+				status = ListenProtocolServerPort(COMPAT_PROTOCOL_POSTGRES,
+											  AF_UNSPEC, curhost,
 										  (unsigned short) PostPortNumber,
-										  NULL,
-										  ListenSockets,
-										  &NumListenSockets,
-										  MAXLISTEN);
+										  NULL);
 
 			if (status == STATUS_OK)
 			{
@@ -1237,12 +1243,10 @@ PostmasterMain(int argc, char *argv[])
 		{
 			char	   *socketdir = (char *) lfirst(l);
 
-			status = ListenServerPort(AF_UNIX, NULL,
+			status = ListenProtocolServerPort(COMPAT_PROTOCOL_POSTGRES,
+										  AF_UNIX, NULL,
 									  (unsigned short) PostPortNumber,
-									  socketdir,
-									  ListenSockets,
-									  &NumListenSockets,
-									  MAXLISTEN);
+									  socketdir);
 
 			if (status == STATUS_OK)
 			{
@@ -1264,6 +1268,9 @@ PostmasterMain(int argc, char *argv[])
 		list_free_deep(elemlist);
 		pfree(rawstring);
 	}
+
+	/* Add opt-in compatibility listeners after the standard PG sockets. */
+	InitializeProtocolListeners();
 
 	/*
 	 * check that we have some socket to listen on
@@ -1407,6 +1414,87 @@ PostmasterMain(int argc, char *argv[])
 	abort();					/* not reached */
 }
 
+/*
+ * ListenProtocolServerPort -- create listener socket(s) for one wire protocol
+ *
+ * ListenServerPort() can append more than one socket for a single requested
+ * address (for example, IPv4 and IPv6).  Keep the protocol-kind array in
+ * lockstep with the dynamic socket array, rather than relying on an FD value
+ * or a function pointer that would not survive an EXEC_BACKEND launch.
+ */
+int
+ListenProtocolServerPort(CompatibilityProtocolKind kind, int family,
+						 const char *host_name, unsigned short port_number,
+						 const char *unix_socket_dir)
+{
+	int			first_socket;
+	int			status;
+
+	if (!CompatibilityProtocolKindIsValid(kind))
+		ereport(FATAL,
+				(errmsg("invalid listener protocol kind %d", (int) kind)));
+
+	if (GetProtocolRoutine(kind) == NULL)
+		ereport(FATAL,
+				(errmsg("listener protocol kind %d has no registered routine",
+						(int) kind)));
+
+	Assert(ListenSockets != NULL);
+	Assert(ListenSocketProtocolKinds != NULL);
+	first_socket = NumListenSockets;
+
+	status = ListenServerPort(family, host_name, port_number, unix_socket_dir,
+						  ListenSockets, &NumListenSockets, MAXLISTEN);
+
+	Assert(NumListenSockets >= first_socket);
+	for (int i = first_socket; i < NumListenSockets; i++)
+		ListenSocketProtocolKinds[i] = kind;
+
+	return status;
+}
+
+/*
+ * InitializeProtocolListeners -- called once during postmaster startup
+ * to initialize the protocol-routine registry.
+ * The standard PG routine is registered by _PG_init() in protocol_routine.c.
+ */
+static void
+InitializeProtocolListeners(void)
+{
+	/* Register MySQL protocol routine so COMPAT_PROTOCOL_MYSQL can resolve. */
+	InitMySQLProtocolRoutine();
+
+	/* Open the MySQL TCP listener when enabled.  (Unix socket deferred.) */
+	if (mysql_listener_on)
+	{
+		char	   *addresses;
+		List	   *elemlist;
+		ListCell   *l;
+		bool		success = false;
+
+		addresses = pstrdup(GetConfigOption("listen_addresses", false, false));
+		if (!SplitIdentifierString(pstrdup(addresses), ',', &elemlist))
+			ereport(FATAL,
+					(errmsg("invalid list syntax for \"listen_addresses\"")));
+
+		foreach(l, elemlist)
+		{
+			char   *curhost = (char *) lfirst(l);
+
+			if (ListenProtocolServerPort(COMPAT_PROTOCOL_MYSQL, AF_UNSPEC,
+									 curhost, (unsigned short) mysql_port,
+									 NULL) == STATUS_OK)
+				success = true;
+		}
+
+		list_free_deep(elemlist);
+		pfree(addresses);
+
+		if (!success)
+			ereport(LOG,
+					(errmsg("could not create MySQL listener on any address")));
+	}
+}
 
 /*
  * on_proc_exit callback to close server's listen sockets
@@ -1428,6 +1516,9 @@ CloseServerPorts(int status, Datum arg)
 			elog(LOG, "could not close listen socket: %m");
 	}
 	NumListenSockets = 0;
+	if (ListenSocketProtocolKinds != NULL)
+		MemSet(ListenSocketProtocolKinds, 0,
+				   MAXLISTEN * sizeof(CompatibilityProtocolKind));
 
 	/*
 	 * Next, remove any filesystem entries for Unix sockets.  To avoid race
@@ -1641,7 +1732,7 @@ ConfigurePostmasterWaitSet(bool accept_connections)
 	{
 		for (int i = 0; i < NumListenSockets; i++)
 			AddWaitEventToSet(pm_wait_set, WL_SOCKET_ACCEPT, ListenSockets[i],
-							  NULL, NULL);
+							  NULL, &ListenSocketProtocolKinds[i]);
 	}
 }
 
@@ -1696,10 +1787,18 @@ ServerLoop(void)
 
 			if (events[i].events & WL_SOCKET_ACCEPT)
 			{
-				ClientSocket s;
+				CompatibilityProtocolKind *kind = events[i].user_data;
+				ClientSocket s = {.sock = PGINVALID_SOCKET};
+
+				if (kind == NULL || !CompatibilityProtocolKindIsValid(*kind))
+					elog(PANIC, "listener has no valid protocol kind");
 
 				if (AcceptConnection(events[i].fd, &s) == STATUS_OK)
+				{
+					/* AcceptConnection initializes a failed socket as PostgreSQL. */
+					s.protocol_kind = *kind;
 					BackendStartup(&s);
+				}
 
 				/* We no longer need the open socket in this process */
 				if (s.sock != PGINVALID_SOCKET)
@@ -1894,8 +1993,11 @@ ClosePostmasterPorts(bool am_syslogger)
 		}
 		pfree(ListenSockets);
 	}
+	if (ListenSocketProtocolKinds)
+		pfree(ListenSocketProtocolKinds);
 	NumListenSockets = 0;
 	ListenSockets = NULL;
+	ListenSocketProtocolKinds = NULL;
 #endif
 
 	/*
@@ -3627,6 +3729,14 @@ report_fork_failure_to_client(ClientSocket *client_sock, int errnum)
 {
 	char		buffer[1000];
 	int			rc;
+
+	/*
+	 * This postmaster-only fallback knows only PostgreSQL v2 error framing.
+	 * A compatibility client has not received its greeting yet, so a clean
+	 * disconnect is safer than corrupting its stream with a PG packet.
+	 */
+	if (client_sock->protocol_kind != COMPAT_PROTOCOL_POSTGRES)
+		return;
 
 	/* Format the error message packet (always V2 protocol) */
 	snprintf(buffer, sizeof(buffer), "E%s%s\n",

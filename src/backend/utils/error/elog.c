@@ -76,6 +76,7 @@
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/protocol_routine.h"
 #include "postmaster/syslogger.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
@@ -187,6 +188,7 @@ static const char *process_log_prefix_padding(const char *p, int *ppadding);
 static void log_line_prefix(StringInfo buf, ErrorData *edata);
 static void send_message_to_server_log(ErrorData *edata);
 static void send_message_to_frontend(ErrorData *edata);
+void standard_send_message_to_frontend(ErrorData *edata);
 static void append_with_tabs(StringInfo buf, const char *str);
 
 
@@ -3531,6 +3533,28 @@ err_sendstring(StringInfo buf, const char *str)
  */
 static void
 send_message_to_frontend(ErrorData *edata)
+{
+	const ProtocolRoutine *routine = GetCurrentProtocolRoutine();
+
+	/*
+	 * Never fall through to PostgreSQL ErrorResponse framing for a
+	 * compatibility socket.  During error reporting it is safer to close a
+	 * broken compatibility session without a client packet than to corrupt its
+	 * protocol stream with a PG 'E' or 'N' message.
+	 */
+	if (routine != NULL && routine->kind != COMPAT_PROTOCOL_POSTGRES)
+	{
+		if (routine->send_error != NULL)
+			routine->send_error(edata);
+		return;
+	}
+
+	standard_send_message_to_frontend(edata);
+}
+
+/* Standard PostgreSQL ErrorResponse/NoticeResponse encoder. */
+void
+standard_send_message_to_frontend(ErrorData *edata)
 {
 	StringInfoData msgbuf;
 

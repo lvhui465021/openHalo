@@ -561,6 +561,11 @@ int			temp_file_limit = -1;
 int			num_temp_buffers = 1024;
 
 char	   *cluster_name = "";
+char	   *mysql_backend_database = "postgres";
+bool		mysql_listener_on = false;
+int			mysql_port = 3306;
+int			mysql_max_allowed_packet = 64 * 1024 * 1024;
+char	   *mysql_server_version = "5.7.32-log";
 char	   *ConfigFileName;
 char	   *HbaFileName;
 char	   *IdentFileName;
@@ -1094,6 +1099,16 @@ struct config_bool ConfigureNamesBool[] =
 		&enable_bonjour,
 		false,
 		check_bonjour, NULL, NULL
+	},
+	{
+		{"mysql.listener_on", PGC_POSTMASTER, CONN_AUTH_SETTINGS,
+			gettext_noop("Enables the MySQL compatibility listener."),
+			gettext_noop("The listener uses listen_addresses and mysql.port."),
+			GUC_SUPERUSER_ONLY
+		},
+		&mysql_listener_on,
+		false,
+		NULL, NULL, NULL
 	},
 	{
 		{"track_commit_timestamp", PGC_POSTMASTER, REPLICATION_SENDING,
@@ -2524,6 +2539,28 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&PostPortNumber,
 		DEF_PGPORT, 1, 65535,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"mysql.port", PGC_POSTMASTER, CONN_AUTH_SETTINGS,
+			gettext_noop("Sets the TCP port for the MySQL compatibility listener."),
+			NULL,
+			GUC_SUPERUSER_ONLY
+		},
+		&mysql_port,
+		3306, 1, 65535,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"mysql.max_allowed_packet", PGC_SIGHUP, CONN_AUTH_SETTINGS,
+			gettext_noop("Sets the maximum MySQL packet payload accepted by a backend."),
+			NULL,
+			GUC_UNIT_BYTE | GUC_SUPERUSER_ONLY
+		},
+		&mysql_max_allowed_packet,
+		64 * 1024 * 1024, 1024, MaxAllocSize - 1,
 		NULL, NULL, NULL
 	},
 
@@ -4669,6 +4706,28 @@ struct config_string ConfigureNamesString[] =
 		},
 		&ListenAddresses,
 		"localhost",
+		NULL, NULL, NULL
+	},
+
+	{
+		{"mysql.backend_database", PGC_POSTMASTER, CONN_AUTH_SETTINGS,
+			gettext_noop("Sets the physical PostgreSQL database used by MySQL sessions."),
+			gettext_noop("The MySQL protocol database name selects a schema and does not override this setting."),
+			GUC_SUPERUSER_ONLY
+		},
+		&mysql_backend_database,
+		"postgres",
+		NULL, NULL, NULL
+	},
+
+	{
+		{"mysql.server_version", PGC_SIGHUP, CONN_AUTH_SETTINGS,
+			gettext_noop("Sets the server version advertised by the MySQL listener."),
+			NULL,
+			GUC_SUPERUSER_ONLY
+		},
+		&mysql_server_version,
+		"5.7.32-log",
 		NULL, NULL, NULL
 	},
 

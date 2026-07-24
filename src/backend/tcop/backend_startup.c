@@ -27,6 +27,7 @@
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/protocol_routine.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -58,6 +59,12 @@ char	   *log_connections_string = NULL;
 ConnectionTiming conn_timing = {.ready_for_use = TIMESTAMP_MINUS_INFINITY};
 
 static void BackendInitialize(ClientSocket *client_sock, CAC_state cac);
+static void ProtocolInitialize(Port *port);
+static int	ProtocolStartupExchange(Port *port);
+pg_noreturn static void ProtocolMain(Port *port);
+static void standard_ProtocolInitialize(Port *port);
+static int	standard_StartupExchange(Port *port);
+pg_noreturn static void standard_PostgresMain(Port *port);
 static int	ProcessSSLStartup(Port *port);
 static int	ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done);
 static void ProcessCancelRequestPacket(Port *port, void *pkt, int pktlen);
@@ -121,7 +128,102 @@ BackendMain(const void *startup_data, size_t startup_data_len)
 	 */
 	MemoryContextSwitchTo(TopMemoryContext);
 
-	PostgresMain(MyProcPort->database_name, MyProcPort->user_name);
+	ProtocolMain(MyProcPort);
+}
+
+/*
+ * ProtocolInitialize -- run compatibility-specific setup after pq_init()
+ *
+ * pq_init() owns the common Port, socket, wait-set, and on-exit setup.  A
+ * compatibility routine can add only its codec-specific state here; it must
+ * not recreate those common resources.
+ */
+static void
+ProtocolInitialize(Port *port)
+{
+	const ProtocolRoutine *routine = port->protocol_routine;
+
+	Assert(routine != NULL);
+
+	if (routine->init != NULL)
+		routine->init(port);
+	else
+		standard_ProtocolInitialize(port);
+}
+
+/*
+ * ProtocolStartupExchange -- obtain database and user before PostgresMain
+ *
+ * A non-PostgreSQL listener must provide its own exchange.  Falling through
+ * to the PostgreSQL startup parser would consume the first compatibility
+ * packet using the wrong framing and make any later error unrecoverable.
+ */
+static int
+ProtocolStartupExchange(Port *port)
+{
+	const ProtocolRoutine *routine = port->protocol_routine;
+
+	Assert(routine != NULL);
+
+	if (routine->startup_exchange != NULL)
+		return routine->startup_exchange(port);
+
+	if (port->protocol_kind != COMPAT_PROTOCOL_POSTGRES)
+	{
+		ereport(FATAL,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("protocol kind %d has no startup exchange",
+						(int) port->protocol_kind)));
+		pg_unreachable();
+	}
+
+	return standard_StartupExchange(port);
+}
+
+/*
+ * ProtocolMain -- enter the shared SQL/transaction loop for this protocol
+ *
+ * Most compatibility protocols will use the PG18 PostgresMain() loop after
+ * installing their command/output dispatchers, so leaving mainfunc NULL is a
+ * deliberate request for the standard fallback.
+ */
+pg_noreturn static void
+ProtocolMain(Port *port)
+{
+	const ProtocolRoutine *routine = port->protocol_routine;
+
+	Assert(routine != NULL);
+
+	if (routine->mainfunc != NULL)
+		routine->mainfunc(port);
+
+	standard_PostgresMain(port);
+}
+
+/* Standard fallback implementations used by the protocol dispatcher. */
+static void
+standard_ProtocolInitialize(Port *port)
+{
+	Assert(port->protocol_kind == COMPAT_PROTOCOL_POSTGRES);
+}
+
+static int
+standard_StartupExchange(Port *port)
+{
+	int			status;
+
+	/* Handle direct SSL handshake before the normal PostgreSQL startup packet. */
+	status = ProcessSSLStartup(port);
+	if (status == STATUS_OK)
+		status = ProcessStartupPacket(port, false, false);
+
+	return status;
+}
+
+pg_noreturn static void
+standard_PostgresMain(Port *port)
+{
+	PostgresMain(port->database_name, port->user_name);
 }
 
 
@@ -175,6 +277,7 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 	 */
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 	port = MyProcPort = pq_init(client_sock);
+	ProtocolInitialize(port);
 	MemoryContextSwitchTo(oldcontext);
 
 	whereToSendOutput = DestRemote; /* now safe to ereport to client */
@@ -284,15 +387,8 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 	RegisterTimeout(STARTUP_PACKET_TIMEOUT, StartupPacketTimeoutHandler);
 	enable_timeout_after(STARTUP_PACKET_TIMEOUT, AuthenticationTimeout * 1000);
 
-	/* Handle direct SSL handshake */
-	status = ProcessSSLStartup(port);
-
-	/*
-	 * Receive the startup packet (which might turn out to be a cancel request
-	 * packet).
-	 */
-	if (status == STATUS_OK)
-		status = ProcessStartupPacket(port, false, false);
+	/* Obtain the protocol-specific startup identity before entering PostgresMain. */
+	status = ProtocolStartupExchange(port);
 
 	/*
 	 * If we're going to reject the connection due to database state, say so

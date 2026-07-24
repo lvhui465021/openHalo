@@ -57,6 +57,7 @@ my @all_input_files = qw(
   nodes/pathnodes.h
   nodes/plannodes.h
   nodes/execnodes.h
+  nodes/mysql/mys_parsenodes.h
   access/amapi.h
   access/cmptype.h
   access/sdir.h
@@ -108,7 +109,7 @@ my @nodetag_only_files = qw(
 # ABI stability during development.
 
 my $last_nodetag = 'WindowObjectData';
-my $last_nodetag_no = 479;
+my $last_nodetag_no = 484;
 
 # output file names
 my @output_files;

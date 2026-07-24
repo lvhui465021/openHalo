@@ -285,6 +285,11 @@ extern PGDLLIMPORT int temp_file_limit;
 extern PGDLLIMPORT int num_temp_buffers;
 
 extern PGDLLIMPORT char *cluster_name;
+extern PGDLLIMPORT char *mysql_backend_database;
+extern PGDLLIMPORT bool mysql_listener_on;
+extern PGDLLIMPORT int mysql_port;
+extern PGDLLIMPORT int mysql_max_allowed_packet;
+extern PGDLLIMPORT char *mysql_server_version;
 extern PGDLLIMPORT char *ConfigFileName;
 extern PGDLLIMPORT char *HbaFileName;
 extern PGDLLIMPORT char *IdentFileName;
@@ -485,5 +490,8 @@ extern void GUC_check_errcode(int sqlerrcode);
 #define GUC_check_errhint \
 	pre_format_elog_string(errno, TEXTDOMAIN), \
 	GUC_check_errhint_string = format_elog_string
+
+/* Standard PostgreSQL ParameterStatus encoder, callable from compat GUC paths. */
+extern void standard_ReportParameterStatus(const char *name, const char *value);
 
 #endif							/* GUC_H */

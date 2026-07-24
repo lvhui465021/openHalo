@@ -8,6 +8,7 @@ generated_backend_sources = []
 post_export_backend_sources = []
 
 subdir('access')
+subdir('adapter')
 subdir('archive')
 subdir('backup')
 subdir('bootstrap')

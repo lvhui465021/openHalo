@@ -74,7 +74,6 @@
 					# (change requires restart)
 #bonjour_name = ''			# defaults to the computer name
 					# (change requires restart)
-
 # - TCP settings -
 # see "man tcp" for details
 
@@ -98,6 +97,15 @@
 #scram_iterations = 4096
 #md5_password_warnings = on		# display md5 deprecation warnings?
 #oauth_validator_libraries = ''	# comma-separated list of trusted validator modules
+
+# - MySQL compatibility listener -
+
+#mysql.listener_on = off		# requires restart; uses listen_addresses
+#mysql.port = 3306			# requires restart
+#mysql.backend_database = 'postgres' # physical PostgreSQL database for MySQL sessions;
+					# MySQL USE selects a schema instead
+#mysql.server_version = '5.7.32-log'
+#mysql.max_allowed_packet = 64MB
 
 # GSSAPI using Kerberos
 #krb_server_keyfile = 'FILE:${sysconfdir}/krb5.keytab'
