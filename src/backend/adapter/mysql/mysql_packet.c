@@ -220,10 +220,23 @@ mysql_packet_write_err(MysPacketState *ps,
     msglen = vsnprintf(msgbuf, sizeof(msgbuf), fmt, args);
     va_end(args);
 
-    /* payload = errcode(2) + '#'(1) + sqlstate(5) + message */
-    payload_len = 2 + 1 + 5 + (size_t) msglen;
-    payload = (char *) palloc(payload_len + 1);   /* header handled by caller */
+    /*
+     * MySQL ERR packet payload:
+     *   1 byte  header (0xFF)
+     *   2 bytes error code (little-endian)
+     *   1 byte  SQLSTATE marker '#'
+     *   5 bytes SQLSTATE string (e.g. "28000")
+     *   N bytes human-readable message (no trailing NUL)
+     *
+     * Note: mysql_packet_write_ok() ignores its header_byte parameter,
+     * so the 0xFF marker MUST be embedded in the payload here.  EOF (0xFE)
+     * and OK (0x00) packets follow the same convention — the caller bakes
+     * the header into the payload.
+     */
+    payload_len = 1 + 2 + 1 + 5 + (size_t) msglen;
+    payload = (char *) palloc(payload_len);
 
+    payload[pos++] = (char) 0xFF;   /* ERR marker */
     payload[pos++] = (char) (errcode & 0xFF);
     payload[pos++] = (char) ((errcode >> 8) & 0xFF);
     payload[pos++] = '#';
