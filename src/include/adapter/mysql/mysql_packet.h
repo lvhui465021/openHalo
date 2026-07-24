@@ -91,4 +91,31 @@ extern uint32 mysql_packet_get_client_caps(MysPacketState *ps);
 #define MYSQL_CAP_SESSION_TRACK              0x00800000
 #define MYSQL_CAP_DEPRECATE_EOF              0x01000000
 
+/*
+ * Server advertised capabilities — the feature set our server promises to
+ * support.  Protocol decisions (DeprecateEOF, OptionalResultsetMetadata,
+ * SessionTrack, etc.) MUST use negotiated_caps = server_caps & client_caps,
+ * never the raw client capability flags.
+ *
+ * Kept in sync with the greeting built by mysql_auth.c.
+ * See MYSQL_CAPABILITY_LO / MYSQL_CAPABILITY_HI in mysql_auth.c.
+ */
+#define MYSQL_SERVER_CAPABILITY \
+	((uint32)(                                                             \
+         MYSQL_CAP_LONG_PASSWORD       | MYSQL_CAP_FOUND_ROWS         |      \
+         MYSQL_CAP_LONG_FLAG           | MYSQL_CAP_CONNECT_WITH_DB    |      \
+         MYSQL_CAP_PROTOCOL_41         | MYSQL_CAP_TRANSACTIONS       |      \
+         MYSQL_CAP_SECURE_CONNECTION   |                                      \
+         MYSQL_CAP_PLUGIN_AUTH         | MYSQL_CAP_PLUGIN_AUTH_LENENC |      \
+         MYSQL_CAP_DEPRECATE_EOF))
+
+/*
+ * Return the negotiated capability set (server-advertised & client-requested).
+ */
+static inline uint32
+mysql_negotiated_caps(MysPacketState *ps)
+{
+	return mysql_packet_get_client_caps(ps) & MYSQL_SERVER_CAPABILITY;
+}
+
 #endif   /* MYSQL_PACKET_H */

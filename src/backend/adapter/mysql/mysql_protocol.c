@@ -310,7 +310,7 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
 
     if (!dr->started)
     {
-        uint32 caps = mysql_packet_get_client_caps(dr->ps);
+        uint32 caps = mysql_negotiated_caps(dr->ps);
 
         /*
          * MySQL 8.0.3+: if the client set CLIENT_OPTIONAL_RESULTSET_METADATA,
@@ -545,7 +545,7 @@ mysql_end_command(const QueryCompletion *qc,
         dest == DestRemoteSimple)
     {
         CommandTag  tag = qc->commandTag;
-        uint32      caps = mysql_packet_get_client_caps(mysql_ps());
+        uint32      caps = mysql_negotiated_caps(mysql_ps());
 
         /*
          * Mirror openHalo's endCommand: SELECT → EOF, DML → OK.
@@ -559,7 +559,10 @@ mysql_end_command(const QueryCompletion *qc,
                 /*
                  * DEPRECATE_EOF OK packet: 0xFE header + lenenc
                  * affected_rows=0 + last_insert_id=0 + status_flags
-                 * + warning_count=0.
+                 * + warning_count=0 + optional info string.
+                 * MUST be >= 9 bytes payload so that mysql CLI 8.4
+                 * distinguishes it from a size-8 lenenc integer (the
+                 * common is_eof_packet() check is "len < 9").
                  */
                 char ok[16];
                 int  pos = 0;
@@ -568,6 +571,7 @@ mysql_end_command(const QueryCompletion *qc,
                 ok[pos++] = 0x00;                    /* last_insert_id (lenenc 0) */
                 ok[pos++] = 0x02; ok[pos++] = 0x00;  /* status: autocommit */
                 ok[pos++] = 0x00; ok[pos++] = 0x00;  /* warnings: 0 */
+                ok[pos++] = 0x01; ok[pos++] = 0x20;  /* info: lenenc " " string (2 bytes to reach 9) */
                 mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0xFE);
             }
             else

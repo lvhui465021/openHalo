@@ -1,0 +1,5 @@
+# mysql_adapter extension
+comment = 'MySQL compatibility adapter for openHalo'
+default_version = '1.0'
+relocatable = false
+superuser = true

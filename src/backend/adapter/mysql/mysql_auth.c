@@ -52,6 +52,9 @@
 #define CLIENT_PROTOCOL_41              0x00000200
 #define CLIENT_TRANSACTIONS             0x00002000
 #define CLIENT_SECURE_CONNECTION        0x00008000
+#define CLIENT_MULTI_STATEMENTS         0x00010000
+#define CLIENT_MULTI_RESULTS            0x00040000
+#define CLIENT_PS_MULTI_RESULTS         0x00080000
 #define CLIENT_PLUGIN_AUTH              0x00080000
 #define CLIENT_PLUGIN_AUTH_LENENC       0x00200000
 #define CLIENT_OPTIONAL_RESULTSET_META  0x00400000
@@ -59,11 +62,16 @@
 #define CLIENT_DEPRECATE_EOF            0x01000000
 
 /*
- * Advertise protocol-41 with modern extensions.  CLIENT_DEPRECATE_EOF
- * tells MySQL 8.0+ clients we use OK packets (not EOF) to terminate
- * result sets.  CLIENT_OPTIONAL_RESULTSET_META is required by the
- * mysql 8.4 CLI for result-set metadata.
+ * Advertise protocol-41 with modern extensions.  We intentionally
+ * keep this minimal (DEPRECATE_EOF only in HI word) so that protocol
+ * decisions are driven by the server's own advertised set.  Client
+ * capabilities are masked against this set in the DestReceiver and
+ * end_command callbacks.
  */
+#define MYSQL_SERVER_CAPABILITY                                        \
+        ((uint32)MYSQL_CAPABILITY_LO |                                  \
+         ((uint32)MYSQL_CAPABILITY_HI << 16))
+
 #define MYSQL_CAPABILITY_LO   (uint16)(                             \
         CLIENT_LONG_PASSWORD  | CLIENT_FOUND_ROWS    |                 \
         CLIENT_LONG_FLAG      | CLIENT_CONNECT_WITH_DB |               \
