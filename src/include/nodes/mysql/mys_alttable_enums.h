@@ -30,8 +30,17 @@
 #define CONSTR_AUTOINC      CONSTR_DEFAULT     /* temporary mapping */
 #define CONSTR_KEY          CONSTR_DEFAULT     /* temporary mapping */
 
-/* MySQL ON CONFLICT extension */
-#define ONCONFLICT_REPLACE  ONCONFLICT_UPDATE  /* temporary mapping */
+/*
+ * M3 WARNING: ONCONFLICT_REPLACE is currently mapped to ONCONFLICT_UPDATE
+ * as a preprocessor define.  This is a temporary placeholder — the REPLACE
+ * semantics (DELETE conflicting row + INSERT new row) differ from standard
+ * ON CONFLICT DO UPDATE, and the code in mys_nodeModifyTable.c detects the
+ * MySQL REPLACE intent through a separate path, not through this define.
+ *
+ * DO NOT use this define in new code.  Use explicit runtime checks instead.
+ * See mys_nodeModifyTable.c:897-919 for the actual REPLACE implementation.
+ */
+#define ONCONFLICT_REPLACE  ONCONFLICT_UPDATE  /* M3 placeholder */
 
 /* MySQL ignore statement flag */
 extern bool isIgnoreStmt;

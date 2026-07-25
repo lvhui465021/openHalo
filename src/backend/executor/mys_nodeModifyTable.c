@@ -2791,7 +2791,7 @@ ExecMergeNotMatched(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	 * XXX does this mean that we can avoid creating copies of actionStates on
 	 * partitioned tables, for not-matched actions?
 	 */
-	actionStates = resultRelInfo->ri_MergeActions[MERGE_WHEN_NOT_MATCHED_BY_SOURCE];
+	actionStates = resultRelInfo->ri_MergeActions[MERGE_WHEN_NOT_MATCHED_BY_TARGET];
 
 	/*
 	 * Make source tuple available to ExecQual and ExecProject. We don't need
