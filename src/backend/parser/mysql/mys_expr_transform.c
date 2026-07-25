@@ -35,7 +35,8 @@ mys_transform_expr_node(ParseState *pstate, Node *expr, Node **result)
             else
                 val = sv->sysVarName;
 
-            *result = makeStringConst(pstrdup(val), sv->location);
+            *result = (Node *) make_const(pstate,
+                         (A_Const *) makeStringConst(pstrdup(val), sv->location));
             return true;
         }
 

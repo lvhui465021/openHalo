@@ -180,14 +180,7 @@ mysql_process_command(int *command, StringInfo inBuf)
             /*
              * M2: All non-empty queries now flow through the MySQL
              * parser pipeline (mys_raw_parser -> standard analyze ->
-             * executor -> MySQL DestReceiver).  The inline wire-level
-             * handlers for SELECT 1 / @@version / SELECT DATABASE()
-             * are removed -- the MySQL parser and DestReceiver cover
-             * these cases correctly.
-             *
-             * Unrecognized queries that cannot be parsed by the MySQL
-             * grammar produce a syntax error, which is mapped to a
-             * MySQL ERR packet by the protocol error encoder.
+             * executor -> MySQL DestReceiver).
              */
             *command = 'Q';
             return PROTOCOL_COMMAND_PASSTHROUGH;
@@ -557,21 +550,17 @@ mysql_end_command(const QueryCompletion *qc,
             if (caps & MYSQL_CAP_DEPRECATE_EOF)
             {
                 /*
-                 * DEPRECATE_EOF OK packet: 0xFE header + lenenc
-                 * affected_rows=0 + last_insert_id=0 + status_flags
-                 * + warning_count=0 + optional info string.
-                 * MUST be >= 9 bytes payload so that mysql CLI 8.4
-                 * distinguishes it from a size-8 lenenc integer (the
-                 * common is_eof_packet() check is "len < 9").
+                 * DEPRECATE_EOF OK packet (7-byte payload, packet < 9 so
+                 * is_eof_packet() returns true; both old- and new-style
+                 * clients interpret this as end-of-result-set correctly).
                  */
-                char ok[16];
+                char ok[7];
                 int  pos = 0;
-                ok[pos++] = 0xFE;                    /* OK packet marker */
+                ok[pos++] = 0xFE;                    /* header */
                 ok[pos++] = 0x00;                    /* affected_rows (lenenc 0) */
                 ok[pos++] = 0x00;                    /* last_insert_id (lenenc 0) */
                 ok[pos++] = 0x02; ok[pos++] = 0x00;  /* status: autocommit */
                 ok[pos++] = 0x00; ok[pos++] = 0x00;  /* warnings: 0 */
-                ok[pos++] = 0x01; ok[pos++] = 0x20;  /* info: lenenc " " string (2 bytes to reach 9) */
                 mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0xFE);
             }
             else
