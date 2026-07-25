@@ -2479,6 +2479,13 @@ typedef enum AlterTableType
 	AT_ReAddStatistics,			/* internal to commands/tablecmds.c */
 	AT_ModifyColumn,			/* MySQL: modify column */
 	AT_ChangeColumn,			/* MySQL: change column */
+	AT_TableOption,				/* MySQL: alter table option */
+	AT_CheckNotNull,			/* check column is already marked not null */
+	AT_DropPrimaryKey,			/* drop primary key */
+	AT_DropIndex,				/* drop index */
+	AT_DropForeignKey,			/* drop foreign key */
+	AT_DropCheck,				/* drop check */
+	AT_DropCheckRecurse,		/* internal to commands/tablecmds.c */
 } AlterTableType;
 
 typedef struct AlterTableCmd	/* one subcommand of an ALTER TABLE */
