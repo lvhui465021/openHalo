@@ -1,0 +1,6 @@
+# mysql_adapter extension
+comment = 'MySQL compatibility adapter for openHalo'
+default_version = '1.1'
+relocatable = false
+superuser = true
+requires = 'pgcrypto'

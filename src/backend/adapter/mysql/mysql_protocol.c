@@ -178,6 +178,34 @@ mysql_process_command(int *command, StringInfo inBuf)
         if (inBuf->len > 0)
         {
             /*
+             * Intercept MySQL SET NAMES / SET CHARACTER SET commands.
+             * These are sent by most MySQL drivers during connection
+             * initialisation.  Our MySQL parser produces a
+             * MysVariableSetStmt which the PG18 utility path does not
+             * handle, so respond with a clean MySQL OK instead of
+             * letting the query pipeline fail with "unrecognized node
+             * type: 441".
+             */
+            elog(LOG, "MYSQL_QUERY: [%.*s]",
+                 inBuf->len > 1 ? inBuf->len - 1 : 0, inBuf->data);
+
+            if (inBuf->len >= 4 && pg_strncasecmp(inBuf->data, "SET ", 4) == 0)
+            {
+                char ok[7];
+                int  pos = 0;
+                ok[pos++] = 0x00;
+                ok[pos++] = 0x00;
+                ok[pos++] = 0x00;
+                ok[pos++] = 0x02; ok[pos++] = 0x00;
+                ok[pos++] = 0x00; ok[pos++] = 0x00;
+                mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0x00);
+                pq_flush();
+                mysql_packet_reset_seq(mysql_ps());
+                mysql_packet_set_server_seq(mysql_ps(), 1);
+                return PROTOCOL_COMMAND_HANDLED;
+            }
+
+            /*
              * M2: All non-empty queries now flow through the MySQL
              * parser pipeline (mys_raw_parser -> standard analyze ->
              * executor -> MySQL DestReceiver).
@@ -201,6 +229,8 @@ mysql_process_command(int *command, StringInfo inBuf)
             ok[pos++] = 0x00; ok[pos++] = 0x00;
             mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0x00);
             pq_flush();
+            mysql_packet_reset_seq(mysql_ps());
+            mysql_packet_set_server_seq(mysql_ps(), 1);
         }
         return PROTOCOL_COMMAND_HANDLED;
 
@@ -220,6 +250,8 @@ mysql_process_command(int *command, StringInfo inBuf)
             ok[pos++] = 0x00; ok[pos++] = 0x00;
             mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0x00);
             pq_flush();
+            mysql_packet_reset_seq(mysql_ps());
+            mysql_packet_set_server_seq(mysql_ps(), 1);
         }
         return PROTOCOL_COMMAND_HANDLED;
 
