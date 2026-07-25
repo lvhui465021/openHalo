@@ -233,6 +233,13 @@ mysql_send_greeting(MysPacketState *ps, Port *port)
     }
 
     mysql_packet_write(ps, payload, (size_t) pos);
+
+    /*
+     * After sending the greeting (seq 0), the client will respond at
+     * seq 1.  Set ps->seq to 1 so mysql_packet_read accepts the login
+     * packet without a sequence-number mismatch error.
+     */
+    mysql_packet_set_seq(ps, 1);
 }
 
 /* ----------------------------------------------------------------
@@ -515,10 +522,12 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
     pq_flush();
 
     /*
-     * The handshake is complete.  Reset both sequence counters to 0 for
-     * the command phase (MySQL protocol resets after auth).
+     * The handshake is complete.  Reset both sequence counters for the
+     * command phase.  The client will send commands at seq 0 and the
+     * server responds starting at seq 1 (shared sequence space).
      */
     mysql_packet_reset_seq(ps);
+    mysql_packet_set_server_seq(ps, 1);
 
     /*
      * The MysPacketState (port->protocol_state) stays alive for the

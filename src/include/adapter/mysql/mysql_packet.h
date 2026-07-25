@@ -63,6 +63,9 @@ extern void mysql_packet_write_err(MysPacketState *ps,
 /* Reset client sequence-number tracking (called on error recovery). */
 extern void mysql_packet_reset_seq(MysPacketState *ps);
 
+/* Set the expected client sequence number (used after greeting). */
+extern void mysql_packet_set_seq(MysPacketState *ps, uint8 seq);
+
 /* Set the server sequence number for the next outgoing packet. */
 extern void mysql_packet_set_server_seq(MysPacketState *ps, uint8 seq);
 

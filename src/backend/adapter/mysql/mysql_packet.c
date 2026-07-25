@@ -268,6 +268,13 @@ mysql_packet_reset_seq(MysPacketState *ps)
 }
 
 void
+mysql_packet_set_seq(MysPacketState *ps, uint8 seq)
+{
+	if (ps != NULL)
+		ps->seq = seq;
+}
+
+void
 mysql_packet_set_server_seq(MysPacketState *ps, uint8 seq)
 {
     if (ps != NULL)

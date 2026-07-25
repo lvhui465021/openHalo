@@ -424,6 +424,17 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
             mysql_packet_write_ok(dr->ps, eof, 5, 0xFE);
         }
         dr->started = true;
+
+        /*
+         * Flush column metadata before sending row data.  MySQL CLI 8.4.10
+         * pipelines the dollar-quote probe (select $$) immediately after
+         * receiving column metadata for @@version_comment.  Without an
+         * explicit flush here, the metadata and first row may travel in
+         * the same TCP segment, and the CLI sends its probe before the
+         * server has finished processing the probe — causing a mixed
+         * sequence-number stream that confuses libmysqlclient.
+         */
+        pq_flush();
     }
 
     /* Send a data row. */
@@ -587,6 +598,13 @@ mysql_end_command(const QueryCompletion *qc,
 
             mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0x00);
         }
+
+        /*
+         * Reset sequence numbers for the next command.
+         * MySQL protocol resets seq after each command completes.
+         */
+        mysql_packet_reset_seq(mysql_ps());
+        mysql_packet_set_server_seq(mysql_ps(), 1);
     }
     else
     {
@@ -679,6 +697,13 @@ mysql_send_error(ErrorData *edata)
 
     mysql_packet_write_err(mysql_ps(), errcode, sqlstate,
                            "%s", edata->message);
+
+    /*
+     * Reset sequence numbers for the next command, just like
+     * mysql_end_command does after a successful query.
+     */
+    mysql_packet_reset_seq(mysql_ps());
+    mysql_packet_set_server_seq(mysql_ps(), 1);
 }
 
 static void

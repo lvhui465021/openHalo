@@ -20,6 +20,7 @@
 #define MYS_PARSENODES_H
 
 #include "nodes/nodes.h"
+#include "nodes/pg_list.h"
 
 /* ----------------------------------------------------------------
  *    MySQL user-variable reference:  @name  (read)
