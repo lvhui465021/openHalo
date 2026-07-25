@@ -19756,8 +19756,9 @@ c_expr:		columnref								{ $$ = $1; }
                 }
             | MysSysVarName
                 {
-                    SysVarRef *n = makeNode(SysVarRef);
-                    n->sysVarName = $1;
+                    A_Const *n;
+                    n = (A_Const *) makeStringConst($1, @1);
+                    $$ = (Node *)n;
                     n->location = @1;
                     $$ = (Node *) n;
                 }
