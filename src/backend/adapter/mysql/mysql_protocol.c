@@ -418,15 +418,55 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
 
                 switch (typid)
                 {
-                    case INT2OID:
-                    case INT4OID:
-                    case INT8OID:
+                    case BOOLOID:       /* 16 */
+                        mysql_type = 1;     /* MYSQL_TYPE_TINY */
+                        break;
+                    case INT2OID:       /* 21 */
+                        mysql_type = 2;     /* MYSQL_TYPE_SHORT */
+                        break;
+                    case INT4OID:       /* 23 */
+                        mysql_type = 3;     /* MYSQL_TYPE_LONG */
+                        break;
+                    case INT8OID:       /* 20 */
                         mysql_type = 8;     /* MYSQL_TYPE_LONGLONG */
                         break;
-                    case FLOAT4OID:
-                    case FLOAT8OID:
-                    case NUMERICOID:
+                    case FLOAT4OID:     /* 700 */
+                        mysql_type = 4;     /* MYSQL_TYPE_FLOAT */
+                        break;
+                    case FLOAT8OID:     /* 701 */
+                        mysql_type = 5;     /* MYSQL_TYPE_DOUBLE */
+                        break;
+                    case NUMERICOID:    /* 1700 */
                         mysql_type = 246;   /* MYSQL_TYPE_NEWDECIMAL */
+                        break;
+                    case BPCHAROID:     /* 1042 */
+                        mysql_type = 254;   /* MYSQL_TYPE_STRING */
+                        break;
+                    case VARCHAROID:    /* 1043 */
+                        mysql_type = 253;   /* MYSQL_TYPE_VAR_STRING */
+                        break;
+                    case TEXTOID:       /* 25 */
+                    case BYTEAOID:      /* 17 */
+                        mysql_type = 252;   /* MYSQL_TYPE_BLOB */
+                        break;
+                    case TIMESTAMPOID:  /* 1114 */
+                        mysql_type = 12;    /* MYSQL_TYPE_DATETIME */
+                        break;
+                    case TIMESTAMPTZOID:/* 1184 */
+                        mysql_type = 7;     /* MYSQL_TYPE_TIMESTAMP */
+                        break;
+                    case DATEOID:       /* 1082 */
+                        mysql_type = 10;    /* MYSQL_TYPE_DATE */
+                        break;
+                    case TIMEOID:       /* 1083 */
+                        mysql_type = 11;    /* MYSQL_TYPE_TIME */
+                        break;
+                    case JSONOID:       /* 114 */
+                        mysql_type = 245;   /* MYSQL_TYPE_JSON */
+                        break;
+                    case BITOID:        /* 1560 */
+                    case VARBITOID:     /* 1562 */
+                        mysql_type = 16;    /* MYSQL_TYPE_BIT */
                         break;
                     default:
                         mysql_type = 253;   /* MYSQL_TYPE_VAR_STRING */

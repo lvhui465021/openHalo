@@ -303,6 +303,15 @@ mysql_verify_login(MysPacketState *ps, Port *port)
         return STATUS_ERROR;
     }
 
+    /*
+     * The handshake sequence is shared: greeting=0, login=1, response=2.
+     * After mysql_packet_read consumed the login packet (client seq 1),
+     * set server_seq to 2 so that any ERR/OK packet written from this
+     * function or from mysql_perform_authentication carries the correct
+     * sequence number.
+     */
+    mysql_packet_set_server_seq(ps, 2);
+
     pos_ptr = payload;
     remaining = len;
 
@@ -423,7 +432,22 @@ mysql_verify_login(MysPacketState *ps, Port *port)
         memcpy(switch_pkt + sw_pos, auth->auth_plugin_data, MYSQL_AUTH_PLUGIN_DATA_LEN);
         sw_pos += MYSQL_AUTH_PLUGIN_DATA_LEN;
 
+        /*
+         * The handshake sequence is shared: greeting=0, login=1,
+         * auth-switch=2.  Set server_seq to 2 before writing the
+         * Auth Switch Request so the client receives it at the
+         * sequence number it expects after sending the login at seq 1.
+         */
+        mysql_packet_set_server_seq(ps, 2);
+
         mysql_packet_write(ps, switch_pkt, (size_t) sw_pos);
+
+        /*
+         * After the Auth Switch Request (server seq 2), the client
+         * responds with its native-password auth at seq 3.
+         * Set ps->seq to 3 so mysql_packet_read accepts it.
+         */
+        mysql_packet_set_seq(ps, 3);
 
         /* Read the client's native-password response to our switch request */
         {
@@ -472,6 +496,13 @@ mysql_verify_login(MysPacketState *ps, Port *port)
 
             pfree(sw_payload);
         }
+
+        /*
+         * After the auth switch: client sent at seq 3, server must
+         * respond with OK at seq 4.  Position server_seq for
+         * mysql_perform_authentication.
+         */
+        mysql_packet_set_server_seq(ps, 4);
     }
     else if (auth_plugin_name != NULL &&
              strcmp(auth_plugin_name, "mysql_native_password") != 0)
@@ -574,9 +605,9 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
      * handshake response.
      *
      * Sequence numbers during handshake are shared: greeting=0, login=1,
-     * OK=2.  Explicitly set the server sequence to 2 before writing.
+     * OK=2 (or greeting=0, login=1, auth-switch=2, client=3, OK=4).
+     * server_seq is already positioned correctly by mysql_verify_login.
      */
-    mysql_packet_set_server_seq(ps, 2);
     {
         char ok[7];
         int  okpos = 0;

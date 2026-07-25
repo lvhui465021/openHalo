@@ -66,6 +66,14 @@
    don't. */
 #define HAVE_DECL_F_FULLFSYNC 0
 
+/* Define to 1 if you have the declaration of `LLVMCreateGDBRegistrationListener', and to 0 if you
+   don't. */
+#define HAVE_DECL_LLVMCREATEGDBREGISTRATIONLISTENER 1
+
+/* Define to 1 if you have the declaration of `LLVMCreatePerfJITEventListener', and to 0 if you
+   don't. */
+#define HAVE_DECL_LLVMCREATEPERFJITEVENTLISTENER 1
+
 /* Define to 1 if you have the declaration of `memset_s', and to 0 if you
    don't. */
 #define HAVE_DECL_MEMSET_S 0
@@ -383,6 +391,8 @@
 
 #define PACKAGE_VERSION "18.3"
 
+#define PG_CXX_PRINTF_ATTRIBUTE gnu_printf
+
 #define PG_C_PRINTF_ATTRIBUTE gnu_printf
 
 #define PG_INT128_TYPE __int128
@@ -436,6 +446,8 @@
 #define USE_LIBXML 1
 
 #define USE_LIBXSLT 1
+
+#define USE_LLVM 1
 
 #define USE_LZ4 1
 
