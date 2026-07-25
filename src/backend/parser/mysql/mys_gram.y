@@ -19758,7 +19758,6 @@ c_expr:		columnref								{ $$ = $1; }
                 {
                     A_Const *n;
                     n = (A_Const *) makeStringConst($1, @1);
-                    
                     $$ = (Node *)n;
                 }
 			| PARAM opt_indirection
