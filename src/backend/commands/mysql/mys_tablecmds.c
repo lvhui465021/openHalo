@@ -5226,8 +5226,8 @@ ATExecSetStatistics(Relation rel, const char *colName, int16 colNum, Node *newVa
 	else if (newtarget > 10000)
 	{
 		newtarget = 10000;
-		elog(DEBUG1, "lowering statistics target to %d",
-			 newtarget); /* M3: ereport(WARNING) pollutes MySQL wire */
+		elog(LOG, "lowering statistics target to %d",
+			 newtarget); /* M3: ereport→elog avoids MySQL wire pollution */
 	}
 
 	attrelation = table_open(AttributeRelationId, RowExclusiveLock);

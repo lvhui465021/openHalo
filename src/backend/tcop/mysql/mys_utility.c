@@ -1895,7 +1895,7 @@ MysExecSelectIntoStmt(ParseState *pstate, MysSelectIntoStmt *parsetree, ParamLis
     }
     else if (tuplestore_tuple_count(tupleStore) == 0)
     {
-        elog(DEBUG1, "No data - zero rows fetched, selected, or processed"); /* M3: ereport(WARNING) pollutes MySQL wire, use elog until protocol gating is added */
+        elog(LOG, "No data - zero rows fetched, selected, or processed"); /* M3: ereport→elog avoids MySQL wire pollution */
     }
     else
     {
