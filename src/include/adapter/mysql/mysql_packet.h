@@ -110,7 +110,7 @@ extern uint32 mysql_packet_get_client_caps(MysPacketState *ps);
          MYSQL_CAP_PROTOCOL_41         | MYSQL_CAP_TRANSACTIONS       |      \
          MYSQL_CAP_SECURE_CONNECTION   |                                      \
          MYSQL_CAP_PLUGIN_AUTH         | MYSQL_CAP_PLUGIN_AUTH_LENENC |      \
-         MYSQL_CAP_DEPRECATE_EOF))
+         MYSQL_CAP_DEPRECATE_EOF | MYSQL_CAP_SESSION_TRACK))
 
 /*
  * Return the negotiated capability set (server-advertised & client-requested).

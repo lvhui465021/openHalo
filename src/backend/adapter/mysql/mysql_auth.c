@@ -80,7 +80,7 @@
 #define MYSQL_CAPABILITY_HI   (uint16)(                             \
         (CLIENT_PLUGIN_AUTH >> 16)           |                          \
         (CLIENT_PLUGIN_AUTH_LENENC >> 16)    |                          \
-        (CLIENT_DEPRECATE_EOF >> 16))
+        (CLIENT_DEPRECATE_EOF >> 16) | (CLIENT_SESSION_TRACK >> 16))
 
 /* Scramble length: part1 = 8, part2 = 12, total = 20. */
 #define MYSQL_SCRAMBLE_LEN          20
