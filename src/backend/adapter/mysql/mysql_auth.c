@@ -105,6 +105,7 @@ typedef struct MysAuthState
     /* Saved login-packet fields — verified in authenticate(). */
     uint8       auth_response[MYSQL_SCRAMBLE_LEN]; /* client's scramble response */
     size_t      auth_response_len;
+    bool        switched_from_sha2; /* true if auth-switch happened */
     /* port->user_name and port->compat_database_name already set. */
 } MysAuthState;
 
@@ -417,6 +418,8 @@ mysql_verify_login(MysPacketState *ps, Port *port)
     if (auth_plugin_name != NULL &&
         strcmp(auth_plugin_name, "caching_sha2_password") == 0)
     {
+        auth->switched_from_sha2 = true;
+
         /*
          * Build Auth Switch Request:
          *   0xFE marker + plugin_name(NUL) + plugin_data(20-byte scramble + NUL)
@@ -448,6 +451,12 @@ mysql_verify_login(MysPacketState *ps, Port *port)
         mysql_packet_set_server_seq(ps, 2);
 
         mysql_packet_write(ps, switch_pkt, (size_t) sw_pos);
+
+        /*
+         * caching_sha2_password sends initial auth at seq 1, native
+         * response at seq 3 after auth-switch.  Sync ps->seq.
+         */
+        mysql_packet_set_seq(ps, 3);
 
         /*
          * After the Auth Switch Request (server seq 2), the client
@@ -587,12 +596,22 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
     }
 
     /*
-     * The auth-switch flow sends a 21-byte auth_plugin_data (greeting
-     * format: part1 + NUL + part2).  The client extracts the 20-byte
-     * scramble by taking part1[0:8] + part2[0:12], skipping the NUL at
-     * position 8.  We construct the same 20-byte scramble for verification.
+     * For auth-switch: the client uses auth_plugin_data[0:20] as scramble
+     * (includes the NUL separator for 21-byte greeting format).
+     * For direct native auth: the client uses auth->scramble (20 bytes
+     * without NUL, as sent in the greeting).
+     *
+     * Distinguish by checking if auth_switch was triggered (auth_plugin_name
+     * was set during the switch flow, indicating we redirected from SHA2).
      */
+    if (auth->switched_from_sha2)
     {
+        /*
+         * The client's native-password plugin receives the 21-byte
+         * auth_plugin_data and extracts the 20-byte scramble by
+         * concatenating part1[0:8] + part2[0:12], skipping the NUL
+         * separator byte at position 8.
+         */
         uint8 client_scramble[MYSQL_SCRAMBLE_LEN];
         memcpy(client_scramble, auth->auth_plugin_data, MYSQL_SCRAMBLE_PART1_LEN);
         memcpy(client_scramble + MYSQL_SCRAMBLE_PART1_LEN,
@@ -602,6 +621,15 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
                                                     auth->auth_response,
                                                     auth->auth_response_len,
                                                     client_scramble,
+                                                    MYSQL_SCRAMBLE_LEN,
+                                                    &logdetail);
+    }
+    else
+    {
+        auth_result = mysql_native_password_verify(port->user_name, shadow_pass,
+                                                    auth->auth_response,
+                                                    auth->auth_response_len,
+                                                    auth->scramble,
                                                     MYSQL_SCRAMBLE_LEN,
                                                     &logdetail);
     }
