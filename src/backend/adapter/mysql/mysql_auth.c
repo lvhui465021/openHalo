@@ -76,7 +76,7 @@
         CLIENT_LONG_PASSWORD  | CLIENT_FOUND_ROWS    |                 \
         CLIENT_LONG_FLAG      | CLIENT_CONNECT_WITH_DB |               \
         CLIENT_PROTOCOL_41    | CLIENT_TRANSACTIONS   |                \
-        CLIENT_SECURE_CONNECTION)
+        CLIENT_SECURE_CONNECTION | CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS)
 #define MYSQL_CAPABILITY_HI   (uint16)(                             \
         (CLIENT_PLUGIN_AUTH >> 16)           |                          \
         (CLIENT_PLUGIN_AUTH_LENENC >> 16)    |                          \
