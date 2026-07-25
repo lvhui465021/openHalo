@@ -31,7 +31,7 @@ mys_transform_expr_node(ParseState *pstate, Node *expr, Node **result)
             if (pg_strcasecmp(sv->sysVarName, "version_comment") == 0)
                 val = "8.0.40-openhalo-1.0";
             else if (pg_strcasecmp(sv->sysVarName, "version") == 0)
-                val = "8.0.40-openhalo-1.0";
+                val = "8.0.40";
             else
                 val = sv->sysVarName;
 

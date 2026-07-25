@@ -209,7 +209,7 @@ mys_construct_returningList(ParseState *pstate, InsertStmt *stmt)
     char *auto_increment_column;
     //int i = 0;
 
-    Assert(stmt->returningList == NULL);
+    Assert(stmt->returningClause == NULL);
 
     resultRelation = pstate->p_target_relation;
     tupledesc = resultRelation->rd_att;
@@ -282,19 +282,24 @@ mys_construct_returningList(ParseState *pstate, InsertStmt *stmt)
 
             if (isAutoIncrement)
             {
-                FormData_pg_attribute attr = tupledesc->attrs[attrdefault.adnum - 1];
+                Form_pg_attribute attr = TupleDescAttr(tupledesc, attrdefault.adnum - 1);
                 ResTarget *restarget = makeNode(ResTarget);
                 ColumnRef *columnref = makeNode(ColumnRef);
                 List *returning = list_make1(restarget);
 
-                auto_increment_column = pstrdup(NameStr(attr.attname));
+                auto_increment_column = pstrdup(NameStr(attr->attname));
 
                 columnref->fields = lcons(makeString(auto_increment_column), NULL);
                 restarget->name = NULL;
                 restarget->indirection = NIL;
                 restarget->val = (Node *)columnref;
 
-                stmt->returningList = returning;
+                {
+                    ReturningClause *rc = makeNode(ReturningClause);
+                    rc->options = NIL;
+                    rc->exprs = returning;
+                    stmt->returningClause = rc;
+                }
 
                 break;
             }
@@ -718,6 +723,14 @@ mys_transformCallStmt(ParseState *pstate, CallStmt *stmt)
 }
 
 
+/* M3: FindFirstType uses pstate->targettypelist which was a UDB-TX
+ * ParseState extension not present in PG18.  Needs PG18 API review:
+ * the standard PG18 transformSetOperationStmt handles type resolution
+ * via select_common_type / transformSetOperationTree.  This function
+ * should be re-implemented using PG18's internal APIs when the
+ * mys_transformSetOperationStmt stub is expanded.
+ */
+#if 0
 static void
 FindFirstType(ParseState *pstate, SelectStmt *stmt,
 						  bool isTopLevel, List **targetlist)
@@ -914,6 +927,7 @@ FindFirstType(ParseState *pstate, SelectStmt *stmt,
 
     return;
 }
+#endif /* 0 - FindFirstType */
 
 Query *
 mys_transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)

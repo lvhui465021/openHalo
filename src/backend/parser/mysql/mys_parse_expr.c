@@ -523,14 +523,13 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 		case EXPR_KIND_COPY_WHERE:
 		case EXPR_KIND_GENERATED_COLUMN:
 		case EXPR_KIND_CYCLE_MARK:
-		
-		case EXPR_KIND_FUNCTION_DEFAULT:
-		
+
 			/* okay */
 			break;
 
 		case EXPR_KIND_MERGE_WHEN:
-		
+		case EXPR_KIND_MERGE_RETURNING:
+
 			/* okay */
 			break;
 
@@ -902,6 +901,27 @@ transformUserVarRef(ParseState *pstate, UserVarRef *userVarRef)
     return transformExprRecurse(pstate, funcCall);
 }
 
+static Node *
+transformSysVarRef(ParseState *pstate, SysVarRef *sysVarRef)
+{
+    const char *val;
+    A_Const *n;
+
+    if (pg_strcasecmp(sysVarRef->sysVarName, "version_comment") == 0)
+        val = "8.0.40-openhalo-1.0";
+    else if (pg_strcasecmp(sysVarRef->sysVarName, "version") == 0)
+        val = "8.0.40";
+    else
+        val = sysVarRef->sysVarName;
+
+    n = makeNode(A_Const);
+    n->val.node.type = T_String;
+    n->val.sval = *makeString(pstrdup(val));
+    n->location = sysVarRef->location;
+
+    return (Node *) mys_make_const(pstate, n, n->location);
+}
+
 
 static Node *
 transformUserVarAssign(ParseState *pstate, UserVarAssign *userVarAssign)
@@ -925,42 +945,7 @@ transformUserVarAssign(ParseState *pstate, UserVarAssign *userVarAssign)
 	
 	result = transformExprRecurse(pstate, funcCall);
 
-	/* M3: p_pre_funccall_hook removed (not in PG18 ParseState) */pstate->p_pre_funccall_hook)
-	{
-		retn = pstate->p_pre_funccall_hook(pstate, fn, targs);
-		if (retn)
-			return retn;
-	}
-	
-
-	/*
-	 * When WITHIN GROUP is used, we treat its ORDER BY expressions as
-	 * additional arguments to the function, for purposes of function lookup
-	 * and argument type coercion.  So, transform each such expression and add
-	 * them to the targs list.  We don't explicitly mark where each argument
-	 * came from, but ParseFuncOrColumn can tell what's what by reference to
-	 * list_length(fn->agg_order).
-	 */
-	if (fn->agg_within_group)
-	{
-		Assert(fn->agg_order != NIL);
-		foreach(args, fn->agg_order)
-		{
-			SortBy	   *arg = (SortBy *) lfirst(args);
-
-			targs = lappend(targs, transformExpr(pstate, arg->node,
-												 EXPR_KIND_ORDER_BY));
-		}
-	}
-
-	/* ... and hand off to ParseFuncOrColumn */
-	return ParseFuncOrColumn(pstate,
-							fn->funcname,
-							targs,
-							last_srf,
-							fn,
-							false,
-							fn->location);
+	return result;
 }
 
 static Node *
@@ -1692,11 +1677,7 @@ transformSubLink(ParseState *pstate, SubLink *sublink)
 		case EXPR_KIND_FUNCTION_DEFAULT:
 			err = _("cannot use subquery in DEFAULT expression");
 			break;
-		
-		case EXPR_KIND_FUNCTION_DEFAULT:
-			err = _("cannot use subquery in DEFAULT expression");
-			break;
-		
+
 		case EXPR_KIND_INDEX_EXPRESSION:
 			err = _("cannot use subquery in index expression");
 			break;
@@ -2738,7 +2719,8 @@ transformWholeRowRef(ParseState *pstate, ParseNamespaceItem *nsitem,
 		 * access, as the common columns are surely so marked already.
 		 */
 		expandRTE(nsitem->p_rte, nsitem->p_rtindex,
-				  sublevels_up, location, false,
+				  sublevels_up, VAR_RETURNING_DEFAULT,
+				  location, false,
 				  NULL, &fields);
 		rowexpr = makeNode(RowExpr);
 		rowexpr->args = list_truncate(fields,
@@ -3033,7 +3015,7 @@ make_row_comparison_op(ParseState *pstate, List *opname,
 		{
 			OpIndexInterpretation *opinfo = lfirst(j);
 
-			if (opinfo->cmptype == rctype)
+			if (opinfo->cmptype == cmptype)
 			{
 				opfamily = opinfo->opfamily_id;
 				break;
@@ -3304,10 +3286,6 @@ mys_make_const(ParseState *pstate, A_Const *aconst, int location)
 			typelen = -1;
 			typebyval = false;
 			break;
-
-		/* M3: T_ByteaString case removed (not in PG18) */
-			break;
-            }
 
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(&aconst->val));

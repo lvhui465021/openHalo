@@ -58,7 +58,7 @@
 #include "parser/parse_utilcmd.h"
 #include "parser/parser.h"
 #include "parser/mysql/mys_parse_utilcmd.h"
-/* M3: unvdb_ext.h not needed */
+#include "parser/mysql/mys_compat.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -395,7 +395,6 @@ mys_expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
     //                 createFuncStmt->parameters = NULL;
     //                 createFuncStmt->returnType = makeTypeName(pstrdup("trigger"));
     //                 createFuncStmt->sql_body = NULL;
-	//                 createFuncStmt->proaccess = NON_PACKAGE_MEMBER;
     //                 snprintf(funcOpts, 
     //                          funcOptsSize, 
     //                          "BEGIN /
@@ -755,8 +754,8 @@ mys_expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
     namespaceName = get_namespace_name(namespaceID);
     for (int i = 0; i < tupleDesc->natts; i++)
     {
-        if (!tupleDesc->attrs[i].attisdropped && 
-            existAutoUpdateTrigOnThisAtt(relation, &(tupleDesc->attrs[i])))
+        if (!TupleDescAttr(tupleDesc, i)->attisdropped &&
+            existAutoUpdateTrigOnThisAtt(relation, TupleDescAttr(tupleDesc, i)))
         {
             CreateFunctionStmt *createFuncStmt;
             CreateTrigStmt *createTrigStmt;
@@ -766,7 +765,7 @@ mys_expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
             char *colName;
 
             relName = RelationGetRelationName(childrel);
-            colName = NameStr(tupleDesc->attrs[i].attname);
+            colName = NameStr(TupleDescAttr(tupleDesc, i)->attname);
 
             createFuncStmt = createAutoUpdateTimeStampTriggerFunc(namespaceName, 
                                                                   relName, 
@@ -822,7 +821,6 @@ createTriggerFunc(char *namespace, char *funcName, char *funcBody)
     createFuncStmt->parameters = NULL;
     createFuncStmt->returnType = makeTypeName(pstrdup("trigger"));
     createFuncStmt->sql_body = NULL;
-	createFuncStmt->proaccess = NON_PACKAGE_MEMBER;
     createFuncStmt->options = lappend(createFuncStmt->options, 
                                       makeDefElem("as", 
                                                   (Node *)list_make1(makeString(pstrdup(funcBody))), 
@@ -2150,11 +2148,6 @@ bindTriggerToSeq(RangeVar *relation, char *trigName,
     alterDependStmt->objectType = OBJECT_TRIGGER;
     alterDependStmt->relation = copyObject(relation);
     alterDependStmt->object = (Node *)list_make1(makeString(trigName));
-	alterDependStmt->refObjectType = OBJECT_SEQUENCE;
-    alterDependStmt->refRelation = NULL;
-    alterDependStmt->refObject = (Node *)list_make2(makeString(nameSpace),
-                                                    makeString(seqName));
-    alterDependStmt->deptype = DEPENDENCY_INTERNAL;
     alterDependStmt->extname = NULL;
     alterDependStmt->remove = false;
     
@@ -2176,10 +2169,6 @@ bindTriggerFunctionToTrigger(List *funcName, RangeVar *relation, char *trigName)
     alterDependStmt->objectType = OBJECT_FUNCTION;
     alterDependStmt->relation = NULL;
     alterDependStmt->object = (Node *)objectOfAlterDependStmt;
-	alterDependStmt->refObjectType = OBJECT_TRIGGER;
-    alterDependStmt->refRelation = copyObject(relation);
-    alterDependStmt->refObject = (Node *)list_make1(makeString(pstrdup(trigName)));
-    alterDependStmt->deptype = DEPENDENCY_AUTO;
     alterDependStmt->extname = NULL;
     alterDependStmt->remove = false;
     
@@ -2196,10 +2185,6 @@ bindTriggerToColumn(RangeVar *relation, char *trigName, char *colName)
     altObjDepStmt->objectType = OBJECT_TRIGGER;
     altObjDepStmt->relation = copyObject(relation);
     altObjDepStmt->object = (Node *)list_make1(makeString(trigName));
-	altObjDepStmt->refObjectType = OBJECT_COLUMN;
-    altObjDepStmt->refRelation = copyObject(relation);
-    altObjDepStmt->refObject = (Node *)list_make1(makeString(pstrdup(colName)));
-    altObjDepStmt->deptype = DEPENDENCY_INTERNAL;
     altObjDepStmt->extname = NULL;
     altObjDepStmt->remove = false;
 
@@ -2935,7 +2920,7 @@ transformTableLikeClause(CreateStmtContext *cxt, TableLikeClause *table_like_cla
 			 * find sequence owned by old column; extract sequence parameters;
 			 * build new create sequence command
 			 */
-			seq_relid = getIdentitySequence(RelationGetRelid(relation), attribute->attnum, false);
+			seq_relid = getIdentitySequence(relation, attribute->attnum, false);
 			seq_options = sequence_options(seq_relid);
 			generateSerialExtraStmts(cxt, def,
 									 InvalidOid, seq_options,
@@ -4331,7 +4316,7 @@ mysGetTableAutoIncColNum(Relation rel)
     for (i = 0; i < columnsDesc->constr->num_defval; i++)
     {
         AttrDefault attrDef = columnsDesc->constr->defval[i];
-        Form_pg_attribute attrForm = &(columnsDesc->attrs[attrDef.adnum - 1]);
+        Form_pg_attribute attrForm = TupleDescAttr(columnsDesc, attrDef.adnum - 1);
         
         if (getColumnDefaultSeq(rel, NameStr(attrForm->attname)))
         {
@@ -4918,7 +4903,7 @@ mys_transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 					if (attnum > 0 &&
 						TupleDescAttr(tupdesc, attnum - 1)->attidentity)
 					{
-						Oid			seq_relid = getIdentitySequence(relid, attnum, false);
+						Oid			seq_relid = getIdentitySequence(rel, attnum, false);
 						Oid			typeOid = typenameTypeId(pstate, def->typeName);
 						AlterSeqStmt *altseqstmt = makeNode(AlterSeqStmt);
 
@@ -4993,7 +4978,7 @@ mys_transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 								 errmsg("column \"%s\" of relation \"%s\" does not exist",
 										cmd->name, RelationGetRelationName(rel))));
 
-					seq_relid = getIdentitySequence(relid, attnum, true);
+					seq_relid = getIdentitySequence(rel, attnum, true);
 
 					if (seq_relid)
 					{

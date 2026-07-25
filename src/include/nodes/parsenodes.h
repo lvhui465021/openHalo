@@ -2477,6 +2477,8 @@ typedef enum AlterTableType
 	AT_SetIdentity,				/* SET identity column options */
 	AT_DropIdentity,			/* DROP IDENTITY */
 	AT_ReAddStatistics,			/* internal to commands/tablecmds.c */
+	AT_ModifyColumn,			/* MySQL: modify column */
+	AT_ChangeColumn,			/* MySQL: change column */
 } AlterTableType;
 
 typedef struct AlterTableCmd	/* one subcommand of an ALTER TABLE */
@@ -2807,6 +2809,8 @@ typedef enum ConstrType			/* types of constraints */
 	CONSTR_ATTR_IMMEDIATE,
 	CONSTR_ATTR_ENFORCED,
 	CONSTR_ATTR_NOT_ENFORCED,
+	CONSTR_AUTOINC,				/* MySQL: auto_increment */
+	CONSTR_KEY,					/* MySQL: key/index */
 } ConstrType;
 
 /* Foreign key action codes */

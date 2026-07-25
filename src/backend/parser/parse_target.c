@@ -27,6 +27,7 @@
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
 #include "parser/parsetree.h"
+#include "nodes/mysql/mys_parsenodes.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -2034,6 +2035,12 @@ FigureColnameInternal(Node *node, char **name)
 						 (int) ((JsonFuncExpr *) node)->op);
 			}
 			break;
+		case T_SysVarRef:
+			{
+				SysVarRef *sv = (SysVarRef *) node;
+				*name = psprintf("@@%s", sv->sysVarName);
+				return 2;
+			}
 		default:
 			break;
 	}
