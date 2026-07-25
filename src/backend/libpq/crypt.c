@@ -505,3 +505,65 @@ done:
 	explicit_bzero(candidate_stage2, sizeof(candidate_stage2));
 	return result;
 }
+
+
+/*
+ * mysql_caching_sha2_password_verify
+ *
+ * MySQL 8.0+ default auth: stored = SHA256(SHA256(password)).
+ * Client sends XOR(SHA256(password), SHA256(scramble + stored)).
+ * Verify: SHA256(XOR(resp, SHA256(scramble + stored))) == stored.
+ */
+int
+mysql_caching_sha2_password_verify(const char *role, const char *hex_hash,
+                                    const uint8 *client_response,
+                                    size_t client_response_len,
+                                    const uint8 *salt, size_t salt_len,
+                                    const char **logdetail)
+{
+    uint8       stored_hash[32];
+    uint8       scramble_hash[32];
+    uint8       recovered[32];
+    uint8       candidate[32];
+    int         i;
+    int         result = STATUS_ERROR;
+
+    if (hex_hash == NULL || strlen(hex_hash) != 64)
+    {
+        *logdetail = "Invalid caching_sha2_password hash";
+        return STATUS_ERROR;
+    }
+    for (i = 0; i < 32; i++)
+    {
+        char hx[3] = {hex_hash[i*2], hex_hash[i*2+1], 0};
+        stored_hash[i] = (uint8) strtol(hx, NULL, 16);
+    }
+
+    if (client_response_len != 32) { *logdetail = "Bad SHA256 response length"; goto done; }
+
+    /* scramble_hash = SHA256(salt || stored_hash) */
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, salt, salt_len);
+    SHA256_Update(&ctx, stored_hash, sizeof(stored_hash));
+    SHA256_Final(scramble_hash, &ctx);
+
+    /* recovered = client_resp XOR scramble_hash */
+    for (i = 0; i < 32; i++) recovered[i] = client_response[i] ^ scramble_hash[i];
+
+    /* candidate = SHA256(recovered); compare with stored */
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, recovered, sizeof(recovered));
+    SHA256_Final(candidate, &ctx);
+
+    result = (timingsafe_bcmp(stored_hash, candidate, 32) == 0) ? STATUS_OK : STATUS_ERROR;
+    if (result != STATUS_OK)
+        *logdetail = "Password does not match";
+
+done:
+    explicit_bzero(stored_hash, 32);
+    explicit_bzero(scramble_hash, 32);
+    explicit_bzero(recovered, 32);
+    explicit_bzero(candidate, 32);
+    return result;
+}

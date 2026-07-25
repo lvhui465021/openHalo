@@ -38,6 +38,8 @@
 
 #include "utils/elog.h"
 
+#include <openssl/sha.h>
+
 #include <string.h>
 #include <stdlib.h>
 
@@ -428,7 +430,12 @@ mysql_verify_login(MysPacketState *ps, Port *port)
         memcpy(switch_pkt + sw_pos, target_plugin, target_plugin_len);
         sw_pos += target_plugin_len;
         switch_pkt[sw_pos++] = '\0';
-        /* Append 21 bytes of auth-plugin-data: 20-byte scramble + NUL */
+        /*
+         * Auth plugin data for mysql_native_password: 21-byte greeting
+         * format (part1 + NUL + part2).  The client extracts the 20-byte
+         * scramble by taking part1[0:8] + part2[0:12], skipping the NUL.
+         * Must send 21 bytes to match the greeting's auth_plugin_data_len.
+         */
         memcpy(switch_pkt + sw_pos, auth->auth_plugin_data, MYSQL_AUTH_PLUGIN_DATA_LEN);
         sw_pos += MYSQL_AUTH_PLUGIN_DATA_LEN;
 
@@ -554,7 +561,7 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
 {
     MysAuthState *auth = (MysAuthState *) mysql_packet_get_auth_state(ps);
     char         *shadow_pass;
-    const char   *logdetail;
+    const char   *logdetail = NULL;
     int           auth_result;
 
 
@@ -579,12 +586,25 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
                         port->user_name)));
     }
 
-    auth_result = mysql_native_password_verify(port->user_name, shadow_pass,
-                                                auth->auth_response,
-                                                auth->auth_response_len,
-                                                auth->scramble,
-                                                MYSQL_SCRAMBLE_LEN,
-                                                &logdetail);
+    /*
+     * The auth-switch flow sends a 21-byte auth_plugin_data (greeting
+     * format: part1 + NUL + part2).  The client extracts the 20-byte
+     * scramble by taking part1[0:8] + part2[0:12], skipping the NUL at
+     * position 8.  We construct the same 20-byte scramble for verification.
+     */
+    {
+        uint8 client_scramble[MYSQL_SCRAMBLE_LEN];
+        memcpy(client_scramble, auth->auth_plugin_data, MYSQL_SCRAMBLE_PART1_LEN);
+        memcpy(client_scramble + MYSQL_SCRAMBLE_PART1_LEN,
+               auth->auth_plugin_data + MYSQL_SCRAMBLE_PART1_LEN + 1,
+               MYSQL_SCRAMBLE_PART2_LEN);
+        auth_result = mysql_native_password_verify(port->user_name, shadow_pass,
+                                                    auth->auth_response,
+                                                    auth->auth_response_len,
+                                                    client_scramble,
+                                                    MYSQL_SCRAMBLE_LEN,
+                                                    &logdetail);
+    }
     pfree(shadow_pass);
 
     if (auth_result != STATUS_OK)

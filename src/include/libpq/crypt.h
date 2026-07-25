@@ -33,7 +33,8 @@
  * formats.
  */
 #define MYSQL_NATIVE_PASSWORD_PREFIX "mysql_native_password:"
-#define MYSQL_NATIVE_PASSWORD_DIGEST_LENGTH 20
+#define MYSQL_NATIVE_PASSWORD_DIGEST_LENGTH    20
+#define MYSQL_CACHING_SHA2_DIGEST_LENGTH       32
 #define MYSQL_NATIVE_PASSWORD_SECRET_LEN \
 	(sizeof(MYSQL_NATIVE_PASSWORD_PREFIX) - 1 + \
 	 MYSQL_NATIVE_PASSWORD_DIGEST_LENGTH * 2)
@@ -58,6 +59,7 @@ typedef enum PasswordType
 	PASSWORD_TYPE_MD5,
 	PASSWORD_TYPE_SCRAM_SHA_256,
 	PASSWORD_TYPE_MYSQL_NATIVE_PASSWORD,
+	PASSWORD_TYPE_MYSQL_CACHING_SHA2_PASSWORD,
 } PasswordType;
 
 extern PasswordType get_password_type(const char *shadow_pass);
@@ -82,3 +84,4 @@ extern int	mysql_native_password_verify(const char *role,
 									 const char **logdetail);
 
 #endif
+extern int mysql_caching_sha2_password_verify(const char *role, const char *hex_hash, const uint8 *client_response, size_t client_response_len, const uint8 *salt, size_t salt_len, const char **logdetail);
