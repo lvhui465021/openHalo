@@ -144,7 +144,7 @@ mysql_send_greeting(MysPacketState *ps, Port *port)
     uint16      cap_hi = MYSQL_CAPABILITY_HI;
     uint32      capability;
     const char *server_version = "8.0.40-openhalo-1.0";
-    const char *auth_plugin_name = "mysql_native_password";
+    const char *auth_plugin_name = "caching_sha2_password";
     int         auth_plugin_name_len;
     uint8       charset = MYSQL_CHARSET_UTF8MB4;
     uint16      status_flags = 0x0002;   /* SERVER_STATUS_AUTOCOMMIT */
@@ -396,9 +396,85 @@ mysql_verify_login(MysPacketState *ps, Port *port)
         return STATUS_ERROR;
     }
 
-    /* Reject non-native plugins early (before catalog access). */
+    /*
+     * MySQL 8.0+ clients default to caching_sha2_password.  We implement
+     * the auth-switch protocol: route SHA2 requests to mysql_native_password
+     * via an Auth Switch Request packet (0xFE header).  This triggers the
+     * client's auth-switch state machine, matching the real MySQL 8.0 flow
+     * where the server lacks a cached SHA2 hash and redirects to native.
+     */
     if (auth_plugin_name != NULL &&
-        strcmp(auth_plugin_name, "mysql_native_password") != 0)
+        strcmp(auth_plugin_name, "caching_sha2_password") == 0)
+    {
+        /*
+         * Build Auth Switch Request:
+         *   0xFE marker + plugin_name(NUL) + plugin_data(20-byte scramble + NUL)
+         */
+        char switch_pkt[64];
+        int  sw_pos = 0;
+        const char *target_plugin = "mysql_native_password";
+        int  target_plugin_len = (int) strlen(target_plugin);
+
+        switch_pkt[sw_pos++] = (char) 0xFE;    /* auth-switch marker */
+        memcpy(switch_pkt + sw_pos, target_plugin, target_plugin_len);
+        sw_pos += target_plugin_len;
+        switch_pkt[sw_pos++] = '\0';
+        /* Append 21 bytes of auth-plugin-data: 20-byte scramble + NUL */
+        memcpy(switch_pkt + sw_pos, auth->auth_plugin_data, MYSQL_AUTH_PLUGIN_DATA_LEN);
+        sw_pos += MYSQL_AUTH_PLUGIN_DATA_LEN;
+
+        mysql_packet_write(ps, switch_pkt, (size_t) sw_pos);
+
+        /* Read the client's native-password response to our switch request */
+        {
+            char       *sw_payload;
+            size_t      sw_len;
+            const char *sw_auth = NULL;
+            size_t      sw_auth_len = 0;
+            const char *sw_pos_ptr;
+            size_t      sw_rem;
+
+            if (!mysql_packet_read(ps, &sw_payload, &sw_len))
+            {
+                pfree(payload);
+                return STATUS_ERROR;
+            }
+
+            /* Parse auth response: skip capabilities(4) + max_pkt(4) + charset(1) + reserved(23) + username(NUL) */
+            if (sw_len < 32) { pfree(sw_payload); pfree(payload); return STATUS_ERROR; }
+            sw_pos_ptr = sw_payload + 32;
+            sw_rem = sw_len - 32;
+
+            /* Skip username (NUL-terminated) */
+            {
+                size_t ulen = strnlen(sw_pos_ptr, sw_rem);
+                if (ulen >= sw_rem) { pfree(sw_payload); pfree(payload); return STATUS_ERROR; }
+                sw_pos_ptr += ulen + 1;
+                sw_rem -= ulen + 1;
+            }
+
+            /* Auth response (length-encoded) */
+            if (sw_rem < 1) { pfree(sw_payload); pfree(payload); return STATUS_ERROR; }
+            {
+                uint8 sw_auth_len_byte = (uint8) *sw_pos_ptr;
+                sw_pos_ptr += 1;
+                sw_rem -= 1;
+                if (sw_rem < sw_auth_len_byte) { pfree(sw_payload); pfree(payload); return STATUS_ERROR; }
+                sw_auth = sw_pos_ptr;
+                sw_auth_len = sw_auth_len_byte;
+            }
+
+            /* Save the native-password auth response */
+            if (sw_auth_len > MYSQL_SCRAMBLE_LEN)
+                sw_auth_len = MYSQL_SCRAMBLE_LEN;
+            memcpy(auth->auth_response, sw_auth, sw_auth_len);
+            auth->auth_response_len = sw_auth_len;
+
+            pfree(sw_payload);
+        }
+    }
+    else if (auth_plugin_name != NULL &&
+             strcmp(auth_plugin_name, "mysql_native_password") != 0)
     {
         mysql_packet_write_err(ps, 1045, "28000",
                                "Authentication plugin '%s' is not supported",
