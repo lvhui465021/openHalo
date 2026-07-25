@@ -79,7 +79,8 @@
         CLIENT_SECURE_CONNECTION)
 #define MYSQL_CAPABILITY_HI   (uint16)(                             \
         (CLIENT_PLUGIN_AUTH >> 16)           |                          \
-        (CLIENT_PLUGIN_AUTH_LENENC >> 16))
+        (CLIENT_PLUGIN_AUTH_LENENC >> 16)    |                          \
+        (CLIENT_DEPRECATE_EOF >> 16))
 
 /* Scramble length: part1 = 8, part2 = 12, total = 20. */
 #define MYSQL_SCRAMBLE_LEN          20
@@ -142,7 +143,7 @@ mysql_send_greeting(MysPacketState *ps, Port *port)
     uint16      cap_lo = MYSQL_CAPABILITY_LO;
     uint16      cap_hi = MYSQL_CAPABILITY_HI;
     uint32      capability;
-    const char *server_version = "5.7.42";
+    const char *server_version = "8.0.40-openhalo-1.0";
     const char *auth_plugin_name = "mysql_native_password";
     int         auth_plugin_name_len;
     uint8       charset = MYSQL_CHARSET_UTF8MB4;
