@@ -1,4 +1,4 @@
--- \echo mysql_adapter extension loading 1.0
+-- \echo mysql_adapter extension loading 1.1
 
 -- -----------------------------------------------------------------------------
 -- Schemas

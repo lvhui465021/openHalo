@@ -3,7 +3,7 @@
 backend_sources += files(
   'mys_tablecmds.c',
   'mys_uservar.c',
-  #  'mys_prepare.c',
+  'mys_prepare.c',
 # TODO: pending PG18 migration:
 #  'mys_sequence.c',
 )

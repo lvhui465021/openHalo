@@ -1934,4 +1934,3 @@ MysExecSelectIntoStmt(ParseState *pstate, MysSelectIntoStmt *parsetree, ParamLis
 
     PopActiveSnapshot();
 }
-void mys_PrepareQuery(ParseState *p, PrepareStmt *s, int c, int l) {}

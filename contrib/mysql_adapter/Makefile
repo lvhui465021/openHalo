@@ -1,7 +1,7 @@
 # contrib/mysql_adapter/Makefile
 
 EXTENSION = mysql_adapter
-DATA = mysql_adapter--1.0.sql
+DATA = mysql_adapter--1.0.sql mysql_adapter--1.0--1.1.sql mysql_adapter--1.1.sql
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

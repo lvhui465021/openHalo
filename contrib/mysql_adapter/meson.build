@@ -7,5 +7,7 @@ install_data(
 
 install_data(
   'sql/mysql_adapter--1.0.sql',
+  'sql/mysql_adapter--1.0--1.1.sql',
+  'sql/mysql_adapter--1.1.sql',
   install_dir: dir_data_extension,
 )
