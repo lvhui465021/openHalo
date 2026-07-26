@@ -434,13 +434,17 @@ mysql_verify_login(MysPacketState *ps, Port *port)
         sw_pos += target_plugin_len;
         switch_pkt[sw_pos++] = '\0';
         /*
-         * Auth plugin data for mysql_native_password: 21-byte greeting
-         * format (part1 + NUL + part2).  The client extracts the 20-byte
-         * scramble by taking part1[0:8] + part2[0:12], skipping the NUL.
-         * Must send 21 bytes to match the greeting's auth_plugin_data_len.
+         * Auth plugin data for mysql_native_password: 20 bytes of
+         * random scramble + trailing NUL = 21 bytes (SCRAMBLE_LENGTH+1).
+         * MySQL server plugin sends scramble[20] followed by NUL[1],
+         * and the client takes the first 20 bytes as the scramble.
+         * Verified in mysql-server 8.4.10 source:
+         *   sql/auth/mysql_native_password.cc:222-223
+         *   write_packet(mpvio, mpvio->scramble, SCRAMBLE_LENGTH + 1)
          */
-        memcpy(switch_pkt + sw_pos, auth->auth_plugin_data, MYSQL_AUTH_PLUGIN_DATA_LEN);
-        sw_pos += MYSQL_AUTH_PLUGIN_DATA_LEN;
+        memcpy(switch_pkt + sw_pos, auth->scramble, MYSQL_SCRAMBLE_LEN);
+        sw_pos += MYSQL_SCRAMBLE_LEN;
+        switch_pkt[sw_pos++] = '\0';
 
         /*
          * The handshake sequence is shared: greeting=0, login=1,
@@ -604,35 +608,17 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
      * Distinguish by checking if auth_switch was triggered (auth_plugin_name
      * was set during the switch flow, indicating we redirected from SHA2).
      */
-    if (auth->switched_from_sha2)
-    {
-        /*
-         * The client's native-password plugin receives the 21-byte
-         * auth_plugin_data and extracts the 20-byte scramble by
-         * concatenating part1[0:8] + part2[0:12], skipping the NUL
-         * separator byte at position 8.
-         */
-        uint8 client_scramble[MYSQL_SCRAMBLE_LEN];
-        memcpy(client_scramble, auth->auth_plugin_data, MYSQL_SCRAMBLE_PART1_LEN);
-        memcpy(client_scramble + MYSQL_SCRAMBLE_PART1_LEN,
-               auth->auth_plugin_data + MYSQL_SCRAMBLE_PART1_LEN + 1,
-               MYSQL_SCRAMBLE_PART2_LEN);
-        auth_result = mysql_native_password_verify(port->user_name, shadow_pass,
-                                                    auth->auth_response,
-                                                    auth->auth_response_len,
-                                                    client_scramble,
-                                                    MYSQL_SCRAMBLE_LEN,
-                                                    &logdetail);
-    }
-    else
-    {
-        auth_result = mysql_native_password_verify(port->user_name, shadow_pass,
-                                                    auth->auth_response,
-                                                    auth->auth_response_len,
-                                                    auth->scramble,
-                                                    MYSQL_SCRAMBLE_LEN,
-                                                    &logdetail);
-    }
+    /*
+     * Both direct and auth-switch paths use the same 20-byte scramble.
+     * The auth switch sends it as scramble(20) + NUL(1) = 21 bytes;
+     * the client takes the first 20 bytes (identical to auth->scramble).
+     */
+    auth_result = mysql_native_password_verify(port->user_name, shadow_pass,
+                                                auth->auth_response,
+                                                auth->auth_response_len,
+                                                auth->scramble,
+                                                MYSQL_SCRAMBLE_LEN,
+                                                &logdetail);
     pfree(shadow_pass);
 
     if (auth_result != STATUS_OK)
