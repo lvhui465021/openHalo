@@ -8,6 +8,18 @@ install_data(
 install_data(
   'sql/mysql_adapter--1.0.sql',
   'sql/mysql_adapter--1.0--1.1.sql',
+  'sql/mysql_adapter--1.1--1.0.sql',
   'sql/mysql_adapter--1.1.sql',
   install_dir: dir_data_extension,
 )
+
+tests += {
+  'name': 'mysql_adapter',
+  'sd': meson.current_source_dir(),
+  'bd': meson.current_build_dir(),
+  'regress': {
+    'sql': [
+      'versioning',
+    ],
+  },
+}
