@@ -634,6 +634,82 @@ is_deeply([map { mysql_column_default($_) } @alter_default_defs],
           [undef, undef, '0', '0'],
           'COM_FIELD_LIST preserves default provenance across ALTER/MODIFY/CHANGE');
 
+# Extended COM_FIELD_LIST default-record type matrix.
+# Cover the literal and expression (aka DEFAULT (<expr>)) paths for
+# numeric, temporal, and string types that map to native PostgreSQL
+# type OIDs (no mysql.tinyint1 / mysql.double domain dependencies).
+# The wire metadata is verified against the mapped MySQL type constant
+# and its reset value.  MySQL 8.4.10 wraps the NOT NULL reset value
+# for each type in a length-encoded string; nullable expression
+# defaults are 0xfb (NULL).
+#
+# Type→OID→MySQL mapping used here:
+#   INT→int8→8 (LONGLONG), SMALLINT→int2→2 (SHORT),
+#   DECIMAL→numeric→246 (NEWDECIMAL), DATE→10, TIME→11, TIMESTAMP→12,
+#   VARCHAR→253, CHAR→254, TEXT→253
+
+# -- Literal defaults across numeric, temporal and string types ----------
+mysql_send_seq($sock,
+    "\x03CREATE TABLE mysql_field_type_defaults ("
+    . "dt DATE DEFAULT '2025-07-27',"
+    . "tm TIME DEFAULT '18:30:00',"
+    . "ts TIMESTAMP DEFAULT '2025-06-15 12:00:00',"
+    . "iv INT DEFAULT 42,"
+    . "bv BIGINT DEFAULT -3,"
+    . "dv DECIMAL DEFAULT 3.14,"
+    . "vc VARCHAR(32) DEFAULT 'hello',"
+    . "ch CHAR(8) DEFAULT 'fixed',"
+    . "tx TEXT DEFAULT 'lorem ipsum'"
+    . ")",
+    0);
+my ($type_create_seq, $type_create_ok) = mysql_recv_packet($sock);
+is($type_create_seq, 1,
+   'COM_FIELD_LIST type-matrix fixture CREATE uses sequence 1');
+is(ord(substr($type_create_ok, 0, 1)), 0x00,
+   'COM_FIELD_LIST type-matrix fixture CREATE succeeds');
+mysql_send_seq($sock, "\x04mysql_field_type_defaults\0", 0);
+my @type_default_defs = map { scalar mysql_recv_packet($sock) } 1 .. 9;
+mysql_recv_packet($sock);  # COM_FIELD_LIST terminator
+is_deeply([map { mysql_column_name($_) } @type_default_defs],
+          [qw(dt tm ts iv bv dv vc ch tx)],
+          'COM_FIELD_LIST type-matrix fixture returns each real column');
+is_deeply([map { mysql_column_type($_) } @type_default_defs],
+          [10, 11, 12, 3, 8, 246, 253, 254, 253],
+          'COM_FIELD_LIST maps types to MySQL wire type constants');
+is_deeply([map { mysql_column_default($_) } @type_default_defs],
+          ['2025-07-27', '18:30:00', '2025-06-15 12:00:00',
+           '42', '-3', '3.14', 'hello', 'fixed', 'lorem ipsum'],
+          'COM_FIELD_LIST literal defaults are the folded constant text');
+
+# -- Expression (DEFAULT (...)) reset-value oracle -----------------------
+# nullable expression default → 0xfb, NOT NULL expression default → type
+# reset value.  NUMERIC/NOT NULL INT already covered by the expression-
+# default fixture above; this adds temporal, varchar, and decimal reset
+# values.
+mysql_send_seq($sock,
+    "\x03CREATE TABLE mysql_field_expr_type_defaults ("
+    . "dt_nn DATE NOT NULL DEFAULT ('2025-07-27'),"
+    . "tm_nn TIME NOT NULL DEFAULT ('18:30:00'),"
+    . "ts_nn TIMESTAMP NOT NULL DEFAULT ('2025-06-15 12:00:00'),"
+    . "vc_null VARCHAR(16) DEFAULT ('hello'),"
+    . "vc_nn VARCHAR(16) NOT NULL DEFAULT ('world'),"
+    . "dv_null DECIMAL DEFAULT (3.14),"
+    . "dv_nn DECIMAL NOT NULL DEFAULT (2.72)"
+    . ")",
+    0);
+my ($expr_type_create_seq, $expr_type_create_ok) = mysql_recv_packet($sock);
+is($expr_type_create_seq, 1,
+   'COM_FIELD_LIST expression-type fixture CREATE uses sequence 1');
+is(ord(substr($expr_type_create_ok, 0, 1)), 0x00,
+   'COM_FIELD_LIST expression-type fixture CREATE succeeds');
+mysql_send_seq($sock, "\x04mysql_field_expr_type_defaults\0", 0);
+my @expr_type_defs = map { scalar mysql_recv_packet($sock) } 1 .. 7;
+mysql_recv_packet($sock);  # COM_FIELD_LIST terminator
+is_deeply([map { mysql_column_default($_) } @expr_type_defs],
+          ['0000-00-00', '00:00:00', '0000-00-00 00:00:00',
+           undef, '', undef, '0'],
+          'COM_FIELD_LIST expression defaults use MySQL reset values per type');
+
 # COM_FIELD_LIST predates CLIENT_DEPRECATE_EOF.  The response has no column
 # count in either mode, but a client that did not negotiate the capability
 # must receive the legacy five-byte EOF terminator.

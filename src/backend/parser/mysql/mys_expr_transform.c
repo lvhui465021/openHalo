@@ -8,6 +8,7 @@
 #include "parser/parse_expr.h"
 #include "parser/parse_node.h"
 #include "parser/mysql/mys_expr_transform.h"
+#include "adapter/mysql/systemVar.h"
 
 static Node *
 mys_transform_user_var_call(ParseState *pstate, const char *function_name,
@@ -126,6 +127,25 @@ mys_transform_expr_node(ParseState *pstate, Node *expr, Node **result)
 													sv->location);
 				return true;
 			}
+			else if (pg_strcasecmp(sv->sysVarName, "autocommit") == 0 ||
+					 pg_strcasecmp(sv->sysVarName, "session.autocommit") == 0 ||
+					 pg_strcasecmp(sv->sysVarName, "local.autocommit") == 0)
+				val = MysAutocommitEnabled() ? "1" : "0";
+			else if (pg_strcasecmp(sv->sysVarName, "character_set_client") == 0 ||
+					 pg_strcasecmp(sv->sysVarName, "character_set_connection") == 0 ||
+					 pg_strcasecmp(sv->sysVarName, "character_set_results") == 0 ||
+					 pg_strcasecmp(sv->sysVarName, "character_set_server") == 0)
+				val = "utf8mb4";
+			else if (pg_strcasecmp(sv->sysVarName, "max_allowed_packet") == 0)
+				val = "16777216";
+			else if (pg_strcasecmp(sv->sysVarName, "sql_mode") == 0 ||
+					 pg_strcasecmp(sv->sysVarName, "session.sql_mode") == 0)
+				val = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,"
+					  "NO_ZERO_IN_DATE,NO_ZERO_DATE,"
+					  "ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
+			else if (pg_strcasecmp(sv->sysVarName, "wait_timeout") == 0 ||
+					 pg_strcasecmp(sv->sysVarName, "interactive_timeout") == 0)
+				val = "28800";
             else if (pg_strcasecmp(sv->sysVarName, "version_comment") == 0)
                 val = "8.0.40-openhalo-1.0";
             else if (pg_strcasecmp(sv->sysVarName, "version") == 0)
