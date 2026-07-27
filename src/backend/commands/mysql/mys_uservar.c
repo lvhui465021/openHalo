@@ -17,6 +17,7 @@
 
 #include "access/htup_details.h"
 #include "catalog/pg_type.h"
+#include "adapter/mysql/systemVar.h"
 #include "utils/builtins.h"
 #include "commands/mysql/mys_uservar.h"
 #include "utils/builtins.h"
@@ -43,12 +44,73 @@ static Datum boolstring2bytea(char *boolstring, bool isDigit);
 static Datum cstring2bytea(char *cstring, bool isDigit);
 static bytea *copyUserVarValue(bytea *varValue);
 
+PG_FUNCTION_INFO_V1(mys_get_user_var);
+PG_FUNCTION_INFO_V1(mys_set_user_var);
+PG_FUNCTION_INFO_V1(mys_get_session_time_zone);
+PG_FUNCTION_INFO_V1(mys_get_global_time_zone);
+
 
 void 
 clearUserVars(void)
 {
     hash_destroy(mysql_user_variables);
     mysql_user_variables = NULL;
+}
+
+Datum
+mys_get_user_var(PG_FUNCTION_ARGS)
+{
+	char	   *user_var_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	bytea	   *value = mysGetUserVarValueInternal(user_var_name);
+	int			value_len;
+
+	if (value == NULL)
+		PG_RETURN_NULL();
+
+	value_len = VARSIZE_ANY_EXHDR(value);
+	PG_RETURN_TEXT_P(cstring_to_text_with_len(VARDATA_ANY(value), value_len));
+}
+
+/*
+ * This is intentionally a volatile SQL function.  A MySQL SQL PREPARE can
+ * contain @@session.time_zone, and its value must be read when EXECUTE runs,
+ * rather than being folded into the prepared query's parse tree.
+ */
+Datum
+mys_get_session_time_zone(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TEXT_P(cstring_to_text(MysGetSessionTimeZone()));
+}
+
+Datum
+mys_get_global_time_zone(PG_FUNCTION_ARGS)
+{
+	char	   *value = MysGetGlobalTimeZone();
+	text	   *result = cstring_to_text(value);
+
+	pfree(value);
+	PG_RETURN_TEXT_P(result);
+}
+
+Datum
+mys_set_user_var(PG_FUNCTION_ARGS)
+{
+	char	   *user_var_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	Oid			value_type = get_fn_expr_argtype(fcinfo->flinfo, 1);
+	Datum		value;
+
+	if (!OidIsValid(value_type))
+		elog(ERROR, "could not determine MySQL user variable value type");
+
+	if (PG_ARGISNULL(1))
+	{
+		mysSetUserVarForPl(user_var_name, (Datum) 0, value_type, true);
+		PG_RETURN_NULL();
+	}
+
+	value = PG_GETARG_DATUM(1);
+	mysSetUserVarForPl(user_var_name, value, value_type, false);
+	PG_RETURN_DATUM(value);
 }
 
 
@@ -438,5 +500,3 @@ copyUserVarValue(bytea *varValue)
 
     return result;
 }
-
-

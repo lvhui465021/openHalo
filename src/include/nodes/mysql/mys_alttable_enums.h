@@ -3,8 +3,10 @@
  * mys_alttable_enums.h
  *    MySQL-specific AlterTableType and ConstraintType enum extensions.
  *
- * These extend PG18's standard enums with MySQL-specific values.
- * Defined as preprocessor constants to avoid modifying PG's enum definitions.
+ * PG18's AlterTableType enum includes the MySQL-specific values used by this
+ * parser.  Keep this header for MySQL DDL declarations, but do not remap
+ * those values: collapsing MODIFY/CHANGE into AT_AddColumn loses the
+ * operation's lifecycle semantics before utility execution.
  *
  * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
  *
@@ -17,18 +19,11 @@
 
 #include "nodes/parsenodes.h"
 
-/* MySQL DDL extensions to AlterTableType */
-#define AT_TableOption      AT_SetRelOptions   /* temporary mapping */
-#define AT_ModifyColumn     AT_AddColumn       /* temporary mapping */
-#define AT_ChangeColumn     AT_AddColumn       /* temporary mapping */
-#define AT_DropPrimaryKey   AT_DropConstraint  /* temporary mapping */
-#define AT_DropIndex        AT_DropInherit     /* temporary mapping */
-#define AT_DropForeignKey   AT_DropConstraint  /* temporary mapping */
-#define AT_DropCheck        AT_DropConstraint  /* temporary mapping */
-
-/* MySQL constraint type extensions */
-#define CONSTR_AUTOINC      CONSTR_DEFAULT     /* temporary mapping */
-#define CONSTR_KEY          CONSTR_DEFAULT     /* temporary mapping */
+/*
+ * CONSTR_AUTOINC and CONSTR_KEY are native ConstrType values in PG18's
+ * parsenodes.h.  Do not alias them to CONSTR_DEFAULT: doing so erases the
+ * MySQL grammar's AUTO_INCREMENT marker before utility transformation.
+ */
 
 /*
  * M3 WARNING: ONCONFLICT_REPLACE is currently mapped to ONCONFLICT_UPDATE

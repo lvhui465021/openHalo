@@ -71,7 +71,7 @@ parser_sources += files('mysql/mys_parse_agg.c')
 parser_sources += files('mysql/mys_parse_clause.c')
 parser_sources += files('mysql/mys_parse_func.c')
 parser_sources += files('mysql/mys_parse_expr.c')
-parser_sources += files('mysql/mys_parse_utilcmd.c', 'mysql/mys_utilcmd_stubs.c')
+parser_sources += files('mysql/mys_parse_utilcmd.c')
 parser_sources += files('mysql/mys_analyze.c')
 parser = static_library('parser',
   parser_sources,

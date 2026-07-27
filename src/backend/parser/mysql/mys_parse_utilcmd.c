@@ -39,6 +39,8 @@
 #include "catalog/pg_type.h"
 #include "commands/comment.h"
 #include "commands/defrem.h"
+#include "commands/mysql/mys_set.h"
+#include "commands/mysql/mys_tablecmds.h"
 #include "commands/sequence.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
@@ -58,7 +60,6 @@
 #include "parser/parse_utilcmd.h"
 #include "parser/parser.h"
 #include "parser/mysql/mys_parse_utilcmd.h"
-#include "parser/mysql/mys_compat.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -82,6 +83,7 @@ typedef struct
 {
     Node *auto_increment;
     char *comment;
+    char *collation;
 } MysTableOption;
 
 /* State shared by transformCreateStmt and its subroutines */
@@ -105,6 +107,7 @@ typedef struct
 								 * creating the table */
 	List	   *alist;			/* "after list" of things to do after creating
 								 * the table */
+	List	   *mys_pre_alter_cmds; /* MySQL commands scheduled in ALTER passes */
 	IndexStmt  *pkey;			/* PRIMARY KEY index, if any */
 	bool		ispartitioned;	/* true if table is partitioned */
 	PartitionBoundSpec *partbound;	/* transformed FOR VALUES */
@@ -168,6 +171,14 @@ static void rectifySpecifiedColumnCollate(ColumnDef *columnDef);
 static void rectifyColumnCollate(List *tabOptions, ColumnDef *columnDef);
 static void rectifyColumnsCollate(CreateStmt *stmt);
 static void rectifyColumnCollateForAlter(ColumnDef *columnDef);
+static const char *mysEnumSetProfile(CreateStmtContext *cxt,
+                                     const ColumnDef *column);
+static void mysEnsureEnumSetProfileCollation(CreateStmtContext *cxt,
+                                              const char *profile,
+                                              int location);
+static CollateClause *mysEnumSetProfileCollate(const char *namespace_name,
+												 const char *profile,
+                                                int location);
 
 
 List *
@@ -879,7 +890,7 @@ createAutoIncrementTriggerFunc(char *namespaceName, char *relName, char *colName
             "BEGIN "\
                 "if New.%s is not null then "\
                     "if 0 < New.%s then "\
-                        "PERFORM mysql.setval('%s.%s'::regclass, New.%s, true);"\
+                        "PERFORM setval('%s.%s'::regclass, New.%s, true);"\
                     "elsif 0 = New.%s then "\
                         "New.%s = (select nextval('%s.%s'::regclass)); "\
                     "end if; "\
@@ -1270,6 +1281,7 @@ mys_transformCreateStmt(CreateStmt *stmt, const char *queryString)
     cxt.AutoIncrement = NIL;
     cxt.AutoIncrementIsIndex = false;
     cxt.mysTableOption = NULL;
+    cxt.mys_pre_alter_cmds = NIL;
 
 	Assert(!stmt->ofTypename || !stmt->inhRelations);	/* grammar enforces */
 
@@ -1407,6 +1419,117 @@ isStrTypeColumn(ColumnDef *columnDef)
     {
         return false;
     }
+}
+
+/*
+ * Map the intentionally small MySQL collation surface that the backing
+ * representation can preserve.  The raw parser retains a column COLLATE
+ * spelling for ENUM/SET; CREATE also supplies the table default through
+ * cxt->mysTableOption.  MySQL 8.4 defaults utf8mb4 ENUM/SET to ai_ci.
+ */
+static const char *
+mysEnumSetProfile(CreateStmtContext *cxt, const ColumnDef *column)
+{
+	const char *name = NULL;
+
+	if (column->collClause != NULL && column->collClause->collname != NIL)
+		name = strVal(linitial(column->collClause->collname));
+	else if (cxt != NULL && cxt->mysTableOption != NULL)
+		name = cxt->mysTableOption->collation;
+
+	if (name == NULL || pg_strcasecmp(name, "utf8mb4_0900_ai_ci") == 0)
+		return MYS_LABEL_PROFILE_AI;
+	if (pg_strcasecmp(name, "binary") == 0)
+		return MYS_LABEL_PROFILE_BINARY;
+	if (pg_strcasecmp(name, "utf8mb4_bin") == 0 ||
+		pg_strcasecmp(name, "utf8mb4_0900_bin") == 0 ||
+		pg_strcasecmp(name, "utf8mb4_0900_as_cs") == 0)
+		return MYS_LABEL_PROFILE_AS_CS;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("unsupported MySQL ENUM/SET collation \"%s\"", name),
+			 errdetail("supported profiles are utf8mb4_0900_ai_ci, utf8mb4_0900_as_cs, utf8mb4_bin, and binary")));
+	pg_unreachable();
+}
+
+static void
+mysEnsureEnumSetProfileCollation(CreateStmtContext *cxt, const char *profile,
+										  int location)
+{
+	DefineStmt *stmt;
+	Oid			namespaceid;
+	List	   *collname;
+	const char *name;
+	const char *locale;
+
+	if (strcmp(profile, MYS_LABEL_PROFILE_BINARY) == 0)
+		return;
+	if (strcmp(profile, MYS_LABEL_PROFILE_AI) == 0)
+	{
+		name = "unvdb_mysql_utf8mb4_ai_ci";
+		locale = "und-u-ks-level1";
+	}
+	else
+	{
+		name = "unvdb_mysql_utf8mb4_as_cs";
+		locale = "und-u-ks-level3";
+	}
+
+	/*
+	 * Do not rely on bootstrap catalog additions: a MySQL-compatible table
+	 * must work in an existing PG18 database as well as one created by initdb.
+	 * Avoid CREATE ... IF NOT EXISTS when the object is already present: its
+	 * NOTICE is a separate frontend response in the MySQL protocol path.
+	 */
+	namespaceid = RangeVarGetCreationNamespace(cxt->relation);
+	collname = list_make2(makeString(pstrdup(get_namespace_name(namespaceid))),
+			makeString(pstrdup(name)));
+	if (OidIsValid(get_collation_oid(collname, true)))
+		return;
+	/* A single CREATE TABLE can contain both ENUM and SET columns. */
+	foreach_ptr(DefineStmt, pending, cxt->blist)
+	{
+		if (pending->kind == OBJECT_COLLATION &&
+			list_length(pending->defnames) == 2 &&
+			strcmp(strVal(linitial(pending->defnames)), strVal(linitial(collname))) == 0 &&
+			strcmp(strVal(lsecond(pending->defnames)), strVal(lsecond(collname))) == 0)
+			return;
+	}
+
+	stmt = makeNode(DefineStmt);
+	stmt->kind = OBJECT_COLLATION;
+	stmt->oldstyle = false;
+	stmt->defnames = collname;
+	stmt->args = NIL;
+	stmt->definition = list_make3(
+		makeDefElem("provider", (Node *) makeString("icu"), location),
+		makeDefElem("locale", (Node *) makeString(pstrdup(locale)), location),
+		makeDefElem("deterministic", (Node *) makeBoolean(false), location));
+	stmt->if_not_exists = false;
+	stmt->replace = false;
+	cxt->blist = lappend(cxt->blist, stmt);
+}
+
+static CollateClause *
+mysEnumSetProfileCollate(const char *namespace_name, const char *profile,
+								 int location)
+{
+	CollateClause *collate = makeNode(CollateClause);
+	const char *name;
+
+	collate->arg = NULL;
+	collate->location = location;
+	if (strcmp(profile, MYS_LABEL_PROFILE_AI) == 0)
+		name = "unvdb_mysql_utf8mb4_ai_ci";
+	else if (strcmp(profile, MYS_LABEL_PROFILE_BINARY) == 0)
+		collate->collname = list_make2(makeString("pg_catalog"), makeString("C"));
+	else
+		name = "unvdb_mysql_utf8mb4_as_cs";
+	if (strcmp(profile, MYS_LABEL_PROFILE_BINARY) != 0)
+		collate->collname = list_make2(makeString(pstrdup(namespace_name)),
+											makeString(pstrdup(name)));
+	return collate;
 }
 
 static bool
@@ -1893,6 +2016,11 @@ MysProcessTableOption(CreateStmtContext *cxt, List *options)
 
             cxt->alist = lappend(cxt->alist, cs);
         }
+        else if (strcmp(option->defname, "collate") == 0 &&
+			 option->arg != NULL && IsA(option->arg, List))
+		{
+			tableOption->collation = pstrdup(strVal(linitial((List *) option->arg)));
+		}
 
         options = foreach_delete_current(options, lc);
     }
@@ -1967,8 +2095,6 @@ generateSerialExtraStmts(CreateStmtContext *cxt, ColumnDef *column,
 
     CreateFunctionStmt *funcStmt;
     CreateTrigStmt *trigStmt;
-    AlterObjectDependsStmt *alterDependStmt1;
-    AlterObjectDependsStmt *alterDependStmt2;
 
 	/*
 	 * Determine namespace and name to use for the sequence.
@@ -2120,16 +2246,13 @@ generateSerialExtraStmts(CreateStmtContext *cxt, ColumnDef *column,
     trigStmt = createAutoIncrementTrigger(snamespace, relName);
     cxt->alist = lappend(cxt->alist, trigStmt);
 
-    alterDependStmt1 = bindTriggerFunctionToTrigger(funcStmt->funcname, 
-                                                    trigStmt->relation, 
-                                                    trigStmt->trigname);
-    cxt->alist = lappend(cxt->alist, alterDependStmt1);
-
-    alterDependStmt2 = bindTriggerToSeq(trigStmt->relation, 
-                                        trigStmt->trigname, 
-                                        snamespace, 
-                                        seqstmt->sequence->relname);
-    cxt->alist = lappend(cxt->alist, alterDependStmt2);
+    /*
+     * PG18's AlterObjectDependsStmt no longer carries the referenced-object
+     * fields that the old UDB-TX helpers populated.  Emitting the partially
+     * initialized nodes reaches the generic dependency executor and crashes.
+     * The sequence OWNED BY command and the trigger/function definitions
+     * already establish the dependencies needed for this generated machinery.
+     */
 
 	if (snamespace_p)
 		*snamespace_p = snamespace;
@@ -2192,46 +2315,321 @@ bindTriggerToColumn(RangeVar *relation, char *trigName, char *colName)
 }
 
 
-static char *
-ChooseEnumTypeName(const char *prefix, const char *name1, const char *name2, Oid namespaceid)
-{
-    int	pass = 0;
-	char *enumTypName = NULL;
-	char modlabel[NAMEDATALEN];
-
-	/* try the unmodified label first */
-	strlcpy(modlabel, name2, sizeof(modlabel));
-
-	for (;;)
-	{
-		enumTypName = makeObjectName(prefix, name1, modlabel);
-
-		if (!OidIsValid(GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
-                                        PointerGetDatum(enumTypName),
-                                        ObjectIdGetDatum(namespaceid))))
-		{
-			break;
-		}
-
-		/* found a conflict, so try a new name component */
-		pfree(enumTypName);
-		snprintf(modlabel, sizeof(modlabel), "%s%d", name2, ++pass);
-	}
-
-	return enumTypName;
-}
-
 static void
 generateEnumExtraStmts(CreateStmtContext *cxt, ColumnDef *column)
 {
-	/* M3 stub: ENUM/SET DDL deferred to later phase */
+	ListCell   *lc;
+	Oid			typnamespace;
+	char	   *nspname;
+	char	   *domain_name;
+	CreateDomainStmt *create_domain;
+	Constraint *constraint;
+	A_ArrayExpr *labels;
+	ColumnRef  *value_ref;
+	FuncCall   *check;
+	CreateFunctionStmt *normalize_function;
+	CreateTrigStmt *normalize_trigger;
+	StringInfoData labels_sql;
+	char	   *function_name;
+	char	   *trigger_name;
+	const char *column_name;
+	char	   *function_body;
+	const char *profile;
+	RangeVar   *relation = cxt->relation;
+
+	/*
+	 * PostgreSQL enum input is exact and has no column collation.  A MySQL ENUM
+	 * is not: its labels are resolved by the column character set/collation.
+	 * Model it as a private collatable text domain plus a table CHECK and a
+	 * BEFORE trigger that stores the declared spelling selected by MySQL rules.
+	 */
+	typnamespace = RangeVarGetCreationNamespace(relation);
+	RangeVarAdjustRelationPersistence(relation, typnamespace);
+	nspname = get_namespace_name(typnamespace);
+	domain_name = mysBuildEnumDomainName(relation->relname, column->colname);
+	profile = mysEnumSetProfile(cxt, column);
+	labels = makeNode(A_ArrayExpr);
+	labels->elements = NIL;
+	labels->location = column->typeName->location;
+	initStringInfo(&labels_sql);
+	appendStringInfoChar(&labels_sql, '[');
+
+	foreach(lc, column->typeName->typmods)
+	{
+		A_Const    *value = lfirst_node(A_Const, lc);
+		ListCell   *prior;
+
+		if (value->isnull || value->val.node.type != T_String)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ENUM values must be string literals"),
+					 parser_errposition(cxt->pstate,
+									column->typeName->location)));
+		foreach(prior, labels->elements)
+		{
+			A_Const *prior_value = lfirst_node(A_Const, prior);
+
+			if (mys_compare_enum_set_labels(prior_value->val.sval.sval,
+									strlen(prior_value->val.sval.sval),
+									value->val.sval.sval,
+									strlen(value->val.sval.sval),
+									mys_label_profile_from_name(profile)) == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("ENUM contains duplicate value \"%s\"",
+								value->val.sval.sval),
+						 parser_errposition(cxt->pstate, value->location)));
+		}
+		labels->elements = lappend(labels->elements,
+				makeStringConst(pstrdup(value->val.sval.sval), value->location));
+		if (labels_sql.len != 1)
+			appendStringInfoChar(&labels_sql, ',');
+		appendStringInfoString(&labels_sql, quote_literal_cstr(value->val.sval.sval));
+	}
+	appendStringInfoChar(&labels_sql, ']');
+
+	if (labels->elements == NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ENUM must define at least one value"),
+				 parser_errposition(cxt->pstate, column->typeName->location)));
+
+	foreach(lc, column->constraints)
+	{
+		Constraint *default_constraint = lfirst_node(Constraint, lc);
+
+		if (default_constraint->contype == CONSTR_DEFAULT &&
+			default_constraint->raw_expr != NULL)
+			default_constraint->raw_expr = (Node *) makeFuncCall(
+				list_make2(makeString("pg_catalog"), makeString("mys_normalize_enum")),
+				list_make3(copyObject(labels), default_constraint->raw_expr,
+						   makeStringConst(pstrdup(profile), column->typeName->location)),
+				COERCE_EXPLICIT_CALL, column->typeName->location);
+	}
+
+	create_domain = makeNode(CreateDomainStmt);
+	create_domain->domainname = list_make2(makeString(pstrdup(nspname)),
+									makeString(pstrdup(domain_name)));
+	create_domain->typeName = makeTypeNameFromNameList(
+		list_make2(makeString("pg_catalog"), makeString("text")));
+	mysEnsureEnumSetProfileCollation(cxt, profile, column->typeName->location);
+	create_domain->collClause = mysEnumSetProfileCollate(nspname, profile,
+												 column->typeName->location);
+	create_domain->constraints = NIL;
+	cxt->blist = lappend(cxt->blist, create_domain);
+
+	constraint = makeNode(Constraint);
+	constraint->contype = CONSTR_CHECK;
+	constraint->conname = pstrdup("unvdb_enum_check");
+	constraint->is_enforced = true;
+	constraint->skip_validation = false;
+	constraint->initially_valid = true;
+	value_ref = makeNode(ColumnRef);
+	value_ref->fields = list_make1(makeString(pstrdup(column->colname)));
+	value_ref->location = column->typeName->location;
+	check = makeFuncCall(list_make2(makeString("pg_catalog"), makeString("mys_check_enum")),
+		list_make3(labels, value_ref,
+					   makeStringConst(pstrdup(profile), column->typeName->location)),
+		COERCE_EXPLICIT_CALL, column->typeName->location);
+	constraint->raw_expr = (Node *) check;
+	column->constraints = lappend(column->constraints, constraint);
+
+	function_name = makeObjectName("enumnorm", relation->relname, column->colname);
+	trigger_name = makeObjectName("enumnormtrig", relation->relname, column->colname);
+	column_name = quote_identifier(column->colname);
+	function_body = psprintf("BEGIN IF NEW.%s IS NOT NULL THEN NEW.%s := "
+		"pg_catalog.mys_normalize_enum(ARRAY%s::text[], NEW.%s, %s); "
+		"END IF; RETURN NEW; END;",
+		column_name, column_name, labels_sql.data, column_name,
+		quote_literal_cstr(profile));
+	normalize_function = createTriggerFunc(nspname, function_name, function_body);
+	normalize_trigger = createTrigger(nspname, relation->relname, function_name,
+		trigger_name, TRIGGER_TYPE_BEFORE,
+		TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE);
+	cxt->alist = lappend(cxt->alist, normalize_function);
+	cxt->alist = lappend(cxt->alist, normalize_trigger);
+
+	column->typeName->names = list_make2(makeString(pstrdup(nspname)),
+								makeString(pstrdup(domain_name)));
+	column->typeName->typmods = NIL;
+	column->collClause = NULL;
 }
 
 
 static void
 generateSetExtraStmts(CreateStmtContext *cxt, ColumnDef *column)
 {
-	/* M3 stub: ENUM/SET DDL deferred to later phase */
+	ListCell   *lc;
+	Oid			typnamespace;
+	char	   *nspname;
+	char	   *domain_name;
+	CreateDomainStmt *create_domain;
+	Constraint *constraint;
+	A_ArrayExpr *labels;
+	ColumnRef  *value_ref;
+	FuncCall   *check;
+	CreateFunctionStmt *normalize_function;
+	CreateTrigStmt *normalize_trigger;
+	StringInfoData labels_sql;
+	char	   *function_name;
+	char	   *trigger_name;
+	const char *column_name;
+	char	   *function_body;
+	const char *profile;
+	RangeVar   *relation = cxt->relation;
+
+	/*
+	 * PostgreSQL has no SET type.  Represent it as a table-column-specific
+	 * text domain.  The membership check belongs to the table, rather than
+	 * the domain: PostgreSQL performs domain checks before BEFORE triggers,
+	 * but a MySQL SET trigger must first canonicalize duplicate/out-of-order
+	 * input.  The check function is a pg_catalog builtin so DDL does not
+	 * depend on installing mysql_adapter first.
+	 */
+	typnamespace = RangeVarGetCreationNamespace(relation);
+	RangeVarAdjustRelationPersistence(relation, typnamespace);
+	nspname = get_namespace_name(typnamespace);
+	domain_name = mysBuildSetDomainName(relation->relname, column->colname);
+	profile = mysEnumSetProfile(cxt, column);
+
+	labels = makeNode(A_ArrayExpr);
+	labels->elements = NIL;
+	labels->location = column->typeName->location;
+	initStringInfo(&labels_sql);
+	appendStringInfoChar(&labels_sql, '[');
+	foreach(lc, column->typeName->typmods)
+	{
+		A_Const    *label = lfirst_node(A_Const, lc);
+		ListCell   *prior;
+
+		if (label->isnull || label->val.node.type != T_String)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("SET values must be string literals"),
+					 parser_errposition(cxt->pstate,
+										column->typeName->location)));
+		if (strchr(label->val.sval.sval, ',') != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("SET labels containing commas are not supported"),
+					 parser_errposition(cxt->pstate, label->location)));
+		if (label->val.sval.sval[0] == '\0')
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("empty SET labels are not supported"),
+					 parser_errposition(cxt->pstate, label->location)));
+		if (list_length(labels->elements) >= 64)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("SET can contain at most 64 values"),
+					 parser_errposition(cxt->pstate, label->location)));
+		foreach(prior, labels->elements)
+		{
+			A_Const    *prior_label = lfirst_node(A_Const, prior);
+
+			if (mys_compare_enum_set_labels(prior_label->val.sval.sval,
+									strlen(prior_label->val.sval.sval),
+									label->val.sval.sval,
+									strlen(label->val.sval.sval),
+									mys_label_profile_from_name(profile)) == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("SET contains duplicate value \"%s\"",
+								label->val.sval.sval),
+						 parser_errposition(cxt->pstate, label->location)));
+		}
+		labels->elements = lappend(labels->elements,
+								  makeStringConst(pstrdup(label->val.sval.sval),
+												  label->location));
+		if (labels_sql.len != 1)
+			appendStringInfoChar(&labels_sql, ',');
+		appendStringInfoString(&labels_sql,
+							   quote_literal_cstr(label->val.sval.sval));
+	}
+	appendStringInfoChar(&labels_sql, ']');
+
+	if (labels->elements == NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("SET must define at least one value"),
+				 parser_errposition(cxt->pstate, column->typeName->location)));
+
+	/*
+	 * INSERT does not invoke a BEFORE trigger for the catalog default itself.
+	 * Rewrite the raw default now so a SET default follows the same MySQL
+	 * declaration-order and duplicate-removal rules as an explicitly supplied
+	 * value.  copyObject() is required because expression transformation
+	 * mutates raw nodes independently for the CHECK and DEFAULT paths.
+	 */
+	foreach(lc, column->constraints)
+	{
+		Constraint *default_constraint = lfirst_node(Constraint, lc);
+
+		if (default_constraint->contype == CONSTR_DEFAULT &&
+			default_constraint->raw_expr != NULL)
+			default_constraint->raw_expr = (Node *) makeFuncCall(
+				list_make2(makeString("pg_catalog"),
+						   makeString("mys_normalize_set")),
+				list_make3(copyObject(labels), default_constraint->raw_expr,
+						   makeStringConst(pstrdup(profile), column->typeName->location)),
+				COERCE_EXPLICIT_CALL, column->typeName->location);
+	}
+
+	create_domain = makeNode(CreateDomainStmt);
+	create_domain->domainname = list_make2(makeString(pstrdup(nspname)),
+									  makeString(pstrdup(domain_name)));
+	create_domain->typeName = makeTypeNameFromNameList(
+		list_make2(makeString("pg_catalog"), makeString("text")));
+	mysEnsureEnumSetProfileCollation(cxt, profile, column->typeName->location);
+	create_domain->collClause = mysEnumSetProfileCollate(nspname, profile,
+												 column->typeName->location);
+	create_domain->constraints = NIL;
+	cxt->blist = lappend(cxt->blist, create_domain);
+
+	constraint = makeNode(Constraint);
+	constraint->contype = CONSTR_CHECK;
+	constraint->conname = mysBuildCheckNameForSet();
+	constraint->is_enforced = true;
+	constraint->skip_validation = false;
+	constraint->initially_valid = true;
+	value_ref = makeNode(ColumnRef);
+	value_ref->fields = list_make1(makeString(pstrdup(column->colname)));
+	value_ref->location = column->typeName->location;
+	check = makeFuncCall(list_make2(makeString("pg_catalog"),
+								  makeString("mys_check_set")),
+		list_make3(labels, value_ref,
+					   makeStringConst(pstrdup(profile), column->typeName->location)),
+		COERCE_EXPLICIT_CALL,
+					 column->typeName->location);
+	constraint->raw_expr = (Node *) check;
+	column->constraints = lappend(column->constraints, constraint);
+
+	/*
+	 * A domain check can reject an invalid SET but cannot rewrite its input.
+	 * MySQL stores SET values in declaration order with duplicate members
+	 * removed, so normalize the value in a per-column BEFORE trigger first.
+	 */
+	function_name = makeObjectName("setnorm", relation->relname,
+									column->colname);
+	trigger_name = makeObjectName("setnormtrig", relation->relname,
+								  column->colname);
+	column_name = quote_identifier(column->colname);
+	function_body = psprintf("BEGIN IF NEW.%s IS NOT NULL THEN NEW.%s := "
+							  "pg_catalog.mys_normalize_set(ARRAY%s::text[], NEW.%s, %s); "
+							  "END IF; RETURN NEW; END;",
+							  column_name, column_name, labels_sql.data, column_name,
+							  quote_literal_cstr(profile));
+	normalize_function = createTriggerFunc(nspname, function_name, function_body);
+	normalize_trigger = createTrigger(nspname, relation->relname, function_name,
+									trigger_name, TRIGGER_TYPE_BEFORE,
+									TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE);
+	cxt->alist = lappend(cxt->alist, normalize_function);
+	cxt->alist = lappend(cxt->alist, normalize_trigger);
+
+	column->typeName->names = list_make2(makeString(pstrdup(nspname)),
+								makeString(pstrdup(domain_name)));
+	column->typeName->typmods = NIL;
+	column->collClause = NULL;
 }
 
 
@@ -4471,97 +4869,272 @@ mysProcessAutoIncForModifyColumn(CreateStmtContext *cxt, char *oldColName, Colum
 }
 
 
-/* 在原来的set类型上重建check约束，调用者负责将新字段定义的数据类型(set)改为原来的set类型名 */
-static void
-mysProcessSet2SetForModifyColumn(CreateStmtContext *cxt, char *setTypeNamespace, char *setTypeName, ColumnDef *column)
+static const char *
+mysEnumSetDomainProfile(Form_pg_type domain, const ColumnDef *column,
+						CreateStmtContext *cxt)
 {
-    AlterDomainStmt *dropSetOldCheck;
-    AlterDomainStmt *addSetNewCheck;
-    char *setCheckName;
-    Constraint *checkCons;
-    FuncCall *funcCall;
-    A_Const *setItems;
-	ColumnRef *columnRef;
-    char origSetDef[1024];
-    int origSetDefOffset;
+	char	   *collation_name;
+
+	/* An explicit MODIFY/CHANGE COLLATE is not silently ignored. */
+	if (column->collClause != NULL)
+		return mysEnumSetProfile(cxt, column);
+
+	collation_name = get_collation_name(domain->typcollation);
+	if (strcmp(collation_name, "unvdb_mysql_utf8mb4_ai_ci") == 0)
+		return MYS_LABEL_PROFILE_AI;
+	if (strcmp(collation_name, "unvdb_mysql_utf8mb4_as_cs") == 0)
+		return MYS_LABEL_PROFILE_AS_CS;
+	if (strcmp(collation_name, "C") == 0)
+		return MYS_LABEL_PROFILE_BINARY;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot determine MySQL ENUM/SET collation for domain \"%s\"",
+					NameStr(domain->typname))));
+	pg_unreachable();
+}
+
+/*
+ * Replace the membership rules of an existing MySQL ENUM column.  The private
+ * domain keeps its identity, so ALTER TABLE can retain compatible rows while
+ * replacing its table CHECK and normalizer body.
+ */
+static void
+mysProcessEnum2EnumForModifyColumn(CreateStmtContext *cxt, char *oldColName,
+							  char *enumTypeNamespace, char *enumTypeName,
+							  const char *profile, ColumnDef *column)
+{
+	AlterTableCmd *drop_cmd;
+	Constraint *check_constraint;
+	A_ArrayExpr *labels;
+	ColumnRef *value_ref;
+	FuncCall *check;
+	StringInfoData labels_sql;
+	ListCell *lc;
+	char *function_name;
+	char *function_body;
+	const char *column_name;
+
+	labels = makeNode(A_ArrayExpr);
+	labels->elements = NIL;
+	labels->location = column->typeName->location;
+	initStringInfo(&labels_sql);
+	appendStringInfoChar(&labels_sql, '[');
+	foreach(lc, column->typeName->typmods)
+	{
+		A_Const *label = lfirst_node(A_Const, lc);
+		ListCell *prior;
+
+		if (label->isnull || label->val.node.type != T_String)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ENUM values must be string literals"),
+					 parser_errposition(cxt->pstate, column->typeName->location)));
+		foreach(prior, labels->elements)
+		{
+			A_Const *prior_label = lfirst_node(A_Const, prior);
+
+			if (mys_compare_enum_set_labels(prior_label->val.sval.sval,
+										strlen(prior_label->val.sval.sval),
+										label->val.sval.sval,
+										strlen(label->val.sval.sval),
+										mys_label_profile_from_name(profile)) == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("ENUM contains duplicate value \"%s\"",
+								label->val.sval.sval),
+						 parser_errposition(cxt->pstate, label->location)));
+		}
+		labels->elements = lappend(labels->elements,
+				makeStringConst(pstrdup(label->val.sval.sval), label->location));
+		if (labels_sql.len != 1)
+			appendStringInfoChar(&labels_sql, ',');
+		appendStringInfoString(&labels_sql,
+				quote_literal_cstr(label->val.sval.sval));
+	}
+	appendStringInfoChar(&labels_sql, ']');
+	if (labels->elements == NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ENUM must define at least one value"),
+				 parser_errposition(cxt->pstate, column->typeName->location)));
+
+	drop_cmd = makeNode(AlterTableCmd);
+	drop_cmd->subtype = AT_DropConstraint;
+	drop_cmd->name = pstrdup("unvdb_enum_check");
+	drop_cmd->behavior = DROP_RESTRICT;
+	drop_cmd->missing_ok = false;
+	cxt->mys_pre_alter_cmds = lappend(cxt->mys_pre_alter_cmds, drop_cmd);
+
+	check_constraint = makeNode(Constraint);
+	check_constraint->contype = CONSTR_CHECK;
+	check_constraint->conname = pstrdup("unvdb_enum_check");
+	check_constraint->is_enforced = true;
+	check_constraint->skip_validation = false;
+	check_constraint->initially_valid = true;
+	value_ref = makeNode(ColumnRef);
+	value_ref->fields = list_make1(makeString(pstrdup(column->colname)));
+	value_ref->location = column->typeName->location;
+	check = makeFuncCall(list_make2(makeString("pg_catalog"),
+								  makeString("mys_check_enum")),
+		list_make3(labels, value_ref,
+			makeStringConst(pstrdup(profile), column->typeName->location)),
+		COERCE_EXPLICIT_CALL, column->typeName->location);
+	check_constraint->raw_expr = (Node *) check;
+	column->constraints = lappend(column->constraints, check_constraint);
+
+	function_name = makeObjectName("enumnorm", cxt->relation->relname,
+			oldColName);
+	column_name = quote_identifier(column->colname);
+	function_body = psprintf("BEGIN IF NEW.%s IS NOT NULL THEN NEW.%s := "
+		"pg_catalog.mys_normalize_enum(ARRAY%s::text[], NEW.%s, %s); "
+		"END IF; RETURN NEW; END;",
+		column_name, column_name, labels_sql.data, column_name,
+		quote_literal_cstr(profile));
+	cxt->alist = lappend(cxt->alist,
+			createTriggerFunc(enumTypeNamespace, function_name, function_body));
+
+	column->typeName->names = list_make2(makeString(pstrdup(enumTypeNamespace)),
+			makeString(pstrdup(enumTypeName)));
+	column->typeName->typmods = NIL;
+	column->collClause = NULL;
+}
+
+/*
+ * Replace the membership rules of an existing MySQL SET column.
+ *
+ * SET backing domains deliberately have no domain constraint: a domain CHECK
+ * runs before a row-level BEFORE trigger, while MySQL needs that trigger to
+ * normalize duplicate/out-of-order members first.  The old PG14-era code
+ * attempted ALTER DOMAIN DROP/ADD CONSTRAINT and therefore could not modify
+ * any SET created by generateSetExtraStmts().  Keep the existing domain,
+ * replace its table CHECK, and replace the trigger function body instead.
+ */
+static void
+mysProcessSet2SetForModifyColumn(CreateStmtContext *cxt, char *oldColName,
+                                 char *setTypeNamespace, char *setTypeName,
+                                 const char *profile, ColumnDef *column)
+{
+    AlterTableCmd *drop_cmd;
+    Constraint *check_constraint;
+    A_ArrayExpr *labels;
+    ColumnRef *value_ref;
+    FuncCall *check;
+    StringInfoData labels_sql;
     ListCell *lc;
-    
-    setCheckName = mysBuildCheckNameForSet();
+    char *function_name;
+    char *function_body;
+    const char *column_name;
 
+    labels = makeNode(A_ArrayExpr);
+    labels->elements = NIL;
+    labels->location = column->typeName->location;
+    initStringInfo(&labels_sql);
+    appendStringInfoChar(&labels_sql, '[');
+    foreach(lc, column->typeName->typmods)
     {
-        dropSetOldCheck = makeNode(AlterDomainStmt);
-        dropSetOldCheck->subtype = 'X';
-        dropSetOldCheck->typeName = list_make2(makeString(setTypeNamespace), makeString(setTypeName));
-        dropSetOldCheck->name = setCheckName;
-        dropSetOldCheck->behavior = DROP_RESTRICT;
-        dropSetOldCheck->missing_ok = false;
+        A_Const *label = lfirst_node(A_Const, lc);
+        ListCell *prior;
 
-        cxt->blist = lappend(cxt->blist, dropSetOldCheck);
-    }
-    
-
-    {
-        checkCons = makeNode(Constraint);
-        checkCons->contype = CONSTR_CHECK;
-        checkCons->conname = setCheckName;
-        checkCons->skip_validation = false;
-        checkCons->initially_valid = true;
-        origSetDefOffset = 0;
-        foreach(lc, column->typeName->typmods)
+        if (label->isnull || label->val.node.type != T_String)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("SET values must be string literals"),
+                     parser_errposition(cxt->pstate, column->typeName->location)));
+        if (strchr(label->val.sval.sval, ',') != NULL)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("SET labels containing commas are not supported"),
+                     parser_errposition(cxt->pstate, label->location)));
+        if (label->val.sval.sval[0] == '\0')
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("empty SET labels are not supported"),
+                     parser_errposition(cxt->pstate, label->location)));
+        if (list_length(labels->elements) >= 64)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("SET can contain at most 64 values"),
+                     parser_errposition(cxt->pstate, label->location)));
+        foreach(prior, labels->elements)
         {
-            Node *n = (Node *)lfirst(lc);
-            if (IsA(n, A_Const) && IsA(&((A_Const *)n)->val, String))
-            {
-                char *val = pstrdup(((A_Const *)n)->val.sval.sval);
-                int valLen = strlen(val);
-                memcpy((origSetDef + origSetDefOffset), val, valLen);
-                origSetDefOffset += valLen;
-                memcpy((origSetDef + origSetDefOffset), ",", 1);
-                origSetDefOffset += 1;
-                if (924 < origSetDefOffset)
-                {
-                    ereport(ERROR,
-                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                            errmsg("len of set content can not longger than 924"),
-                            parser_errposition(cxt->pstate,
-                                                column->typeName->location)));
-                }      
-            }
-            else
-            {
+            A_Const *prior_label = lfirst_node(A_Const, prior);
+
+			if (mys_compare_enum_set_labels(prior_label->val.sval.sval,
+										strlen(prior_label->val.sval.sval),
+										label->val.sval.sval,
+										strlen(label->val.sval.sval),
+										mys_label_profile_from_name(profile)) == 0)
                 ereport(ERROR,
-                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                        errmsg("vals of set can only be string"),
-                        parser_errposition(cxt->pstate,
-                                            column->typeName->location)));
-            }
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("SET contains duplicate value \"%s\"",
+                                label->val.sval.sval),
+                         parser_errposition(cxt->pstate, label->location)));
         }
-        origSetDef[origSetDefOffset - 1] = '\0';
-
-        columnRef = makeNode(ColumnRef);
-        columnRef->fields = list_make1(makeString(pstrdup("value")));
-        columnRef->location = -1;
-        setItems = makeNode(A_Const);
-        setItems->val.sval.type = T_String;
-        setItems->val.sval.sval = pstrdup(origSetDef);
-        setItems->location = -1;
-        funcCall = makeFuncCall(list_make1(makeString("check_set")), 
-                                list_make2(setItems, columnRef), 
-                                COERCE_EXPLICIT_CALL, 
-                                -1);
-        checkCons->raw_expr = (Node*)funcCall;
-
-        addSetNewCheck = makeNode(AlterDomainStmt);
-        addSetNewCheck->subtype = 'C';
-        addSetNewCheck->typeName = list_make2(makeString(setTypeNamespace), makeString(setTypeName));
-        addSetNewCheck->def = (Node *)checkCons;
-
-        cxt->blist = lappend(cxt->blist, addSetNewCheck);
+        labels->elements = lappend(labels->elements,
+                                   makeStringConst(pstrdup(label->val.sval.sval),
+                                                   label->location));
+        if (labels_sql.len != 1)
+            appendStringInfoChar(&labels_sql, ',');
+        appendStringInfoString(&labels_sql,
+                               quote_literal_cstr(label->val.sval.sval));
     }
+    appendStringInfoChar(&labels_sql, ']');
 
-    column->typeName->names = list_make2(makeString(setTypeNamespace), 
-                                         makeString(setTypeName));
-    column->typeName->typmods = NIL;
+    if (labels->elements == NIL)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("SET must define at least one value"),
+                 parser_errposition(cxt->pstate, column->typeName->location)));
+
+    /*
+     * Remove the old table-level membership CHECK before adding its update.
+     * It must be part of this ALTER TABLE's pass schedule, not a nested
+     * before-statement: the outer ALTER holds the relation open while it
+     * invokes parse transformation.
+     */
+    drop_cmd = makeNode(AlterTableCmd);
+    drop_cmd->subtype = AT_DropConstraint;
+    drop_cmd->name = mysBuildCheckNameForSet();
+    drop_cmd->behavior = DROP_RESTRICT;
+    drop_cmd->missing_ok = false;
+    cxt->mys_pre_alter_cmds = lappend(cxt->mys_pre_alter_cmds, drop_cmd);
+
+    check_constraint = makeNode(Constraint);
+    check_constraint->contype = CONSTR_CHECK;
+    check_constraint->conname = mysBuildCheckNameForSet();
+    check_constraint->is_enforced = true;
+    check_constraint->skip_validation = false;
+    check_constraint->initially_valid = true;
+    value_ref = makeNode(ColumnRef);
+    value_ref->fields = list_make1(makeString(pstrdup(column->colname)));
+    value_ref->location = column->typeName->location;
+	check = makeFuncCall(list_make2(makeString("pg_catalog"),
+								  makeString("mys_check_set")),
+						 list_make3(labels, value_ref,
+							makeStringConst(pstrdup(profile), column->typeName->location)),
+						 COERCE_EXPLICIT_CALL,
+						 column->typeName->location);
+    check_constraint->raw_expr = (Node *) check;
+    column->constraints = lappend(column->constraints, check_constraint);
+
+    /* The existing trigger keeps its identity; refresh its current function. */
+    function_name = makeObjectName("setnorm", cxt->relation->relname,
+                                   oldColName);
+    column_name = quote_identifier(column->colname);
+	function_body = psprintf("BEGIN IF NEW.%s IS NOT NULL THEN NEW.%s := "
+							"pg_catalog.mys_normalize_set(ARRAY%s::text[], NEW.%s, %s); "
+							"END IF; RETURN NEW; END;",
+							column_name, column_name, labels_sql.data, column_name,
+							quote_literal_cstr(profile));
+    cxt->alist = lappend(cxt->alist,
+                         createTriggerFunc(setTypeNamespace, function_name,
+                                           function_body));
+
+	column->typeName->names = list_make2(makeString(pstrdup(setTypeNamespace)),
+										 makeString(pstrdup(setTypeName)));
+	column->typeName->typmods = NIL;
+	column->collClause = NULL;
 }
 
 
@@ -4638,17 +5211,39 @@ mysProcessYearSetEnumForModifyColumn(CreateStmtContext *cxt, char *oldColName, C
             cxt->alist = lappend(cxt->alist, dropType);
         }
     }
-    else if (oldColumnTypeInfo->typtype == TYPTYPE_DOMAIN)
-    {
-        char *setTypeNamespace = get_namespace_name(oldColumnTypeInfo->typnamespace);
-        char *setTypeName = pstrdup(NameStr(oldColumnTypeInfo->typname));
-        if (strncmp(setTypeName, "set_", 4) == 0)
-        {
-            if (strncmp(newTypeName, "set", 3) == 0)
-            {
-                mysProcessSet2SetForModifyColumn(cxt, setTypeNamespace, setTypeName, column);
-            }
-        }
+	else if (oldColumnTypeInfo->typtype == TYPTYPE_DOMAIN)
+	{
+		char *domain_namespace = get_namespace_name(oldColumnTypeInfo->typnamespace);
+		char *domain_name = pstrdup(NameStr(oldColumnTypeInfo->typname));
+		const char *old_profile;
+		const char *new_profile;
+
+		if (strncmp(domain_name, "set_", 4) == 0 ||
+			strncmp(domain_name, "enum_", 5) == 0)
+		{
+			old_profile = mysEnumSetDomainProfile(oldColumnTypeInfo, column, cxt);
+			new_profile = mysEnumSetProfile(cxt, column);
+			if (column->collClause != NULL &&
+				strcmp(old_profile, new_profile) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("changing a MySQL ENUM/SET collation with MODIFY is not supported"),
+						 errhint("create a new column with the target collation and copy the values")));
+
+			if (strncmp(domain_name, "enum_", 5) == 0 &&
+				strncmp(newTypeName, "enum", 4) == 0)
+			{
+				mysProcessEnum2EnumForModifyColumn(cxt, oldColName,
+						domain_namespace, domain_name, old_profile, column);
+			}
+			else if (strncmp(domain_name, "set_", 4) == 0 &&
+					 strncmp(newTypeName, "set", 3) == 0)
+			{
+				mysProcessSet2SetForModifyColumn(cxt, oldColName,
+										  domain_namespace, domain_name, old_profile,
+										  column);
+			}
+		}
     }
     else
     {
@@ -4794,6 +5389,7 @@ mys_transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
     cxt.AutoIncrement = NIL;
     cxt.AutoIncrementIsIndex = false;
     cxt.mysTableOption = NULL;
+    cxt.mys_pre_alter_cmds = NIL;
 
 	/*
 	 * Transform ALTER subcommands that need it (most don't).  These largely
@@ -5031,6 +5627,13 @@ mys_transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 				break;
 		}
 	}
+
+	/*
+	 * MySQL SET MODIFY can replace an existing table CHECK.  Insert its DROP
+	 * into the same ALTER so the normal pass ordering runs it before the
+	 * MODIFY and the newly transformed CHECK.
+	 */
+	newcmds = list_concat(newcmds, cxt.mys_pre_alter_cmds);
 
 	/*
 	 * Transfer anything we already have in cxt.alist into save_alist, to keep

@@ -175,4 +175,3 @@ read_seq_tuple(Relation rel, Buffer *buf, HeapTupleData *tuple)
                     errmsg("read_seq_tuple not yet implemented")));
     return NULL;
 }
-
