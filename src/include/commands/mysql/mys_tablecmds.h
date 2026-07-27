@@ -44,5 +44,6 @@ char *mysBuildSetDomainName(char *tableName, char *colName);
 char *mysBuildEnumDomainName(char *tableName, char *colName);
 Oid getColumnDefaultSeq(Relation rel, const char *colName);
 char *mysBuildPartitionTableName(char *tableName, char *pTableName);
+void mysSetColumnDefaultKind(Oid relid, AttrNumber attnum, char kind);
 
 #endif                          /* MYS_TABLECMDS_H */

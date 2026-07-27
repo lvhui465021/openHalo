@@ -163,6 +163,8 @@ static void transformConstraintAttrs(CreateStmtContext *cxt,
 static void transformColumnType(CreateStmtContext *cxt, ColumnDef *column);
 static void transformPartitionCmd(CreateStmtContext *cxt, PartitionCmd *cmd);
 static List *MysProcessTableOption(CreateStmtContext *cxt, List *options);
+static char mysqlDefaultKind(ParseState *pstate, Node *raw_default,
+							 int default_location);
 static void MysProcessOnUpdateNow(CreateStmtContext *cxt, ColumnDef *colDef);
 static bool isStrTypeColumn(ColumnDef *columnDef);
 static bool isTableCollationCaseInsensitive(List *tabOptions);
@@ -2899,6 +2901,9 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 							 parser_errposition(cxt->pstate,
 												constraint->location)));
 				column->raw_default = constraint->raw_expr;
+				column->mysql_default_kind = mysqlDefaultKind(cxt->pstate,
+													 constraint->raw_expr,
+													 constraint->location);
 				Assert(constraint->cooked_expr == NULL);
 				saw_default = true;
 				break;
@@ -3096,6 +3101,41 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 
 		cxt->alist = lappend(cxt->alist, stmt);
 	}
+}
+
+/*
+ * Parentheses are intentionally erased by the common expression grammar.
+ * MySQL's list-fields metadata nevertheless distinguishes DEFAULT 7 from
+ * DEFAULT (7), so preserve the distinction while the original query text is
+ * still available to parse analysis.
+ */
+static char
+mysqlDefaultKind(ParseState *pstate, Node *raw_default, int default_location)
+{
+	int		location = exprLocation(raw_default);
+	const char *source = pstate->p_sourcetext;
+
+	if (default_location >= 0 && source != NULL)
+	{
+		const char *pos = source + default_location + strlen("DEFAULT");
+
+		while (isspace((unsigned char) *pos))
+			pos++;
+		if (*pos == '(')
+			return 'e';
+	}
+
+	if (location > 0 && source != NULL)
+	{
+		int		pos = location - 1;
+
+		while (pos >= 0 && isspace((unsigned char) source[pos]))
+			pos--;
+		if (pos >= 0 && source[pos] == '(')
+			return 'e';
+	}
+
+	return IsA(raw_default, A_Const) ? 'l' : 'e';
 }
 
 /*
@@ -5398,6 +5438,9 @@ mys_transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 	foreach(lcmd, stmt->cmds)
 	{
 		AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lcmd);
+
+		if (cmd->subtype == AT_ColumnDefault && cmd->def != NULL)
+			cmd->mysql_default_kind = mysqlDefaultKind(pstate, cmd->def, -1);
 
 		switch (cmd->subtype)
 		{

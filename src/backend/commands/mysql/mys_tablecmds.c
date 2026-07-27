@@ -107,6 +107,7 @@
 #include "storage/predicate.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
+#include "utils/attoptcache.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
@@ -514,7 +515,8 @@ static bool NotNullImpliedByRelConstraints(Relation rel, Form_pg_attribute attr)
 static bool ConstraintImpliedByRelConstraint(Relation scanrel,
 											 List *testConstraint, List *provenConstraint);
 static ObjectAddress ATExecColumnDefault(Relation rel, const char *colName,
-										 Node *newDefault, LOCKMODE lockmode);
+									 Node *newDefault, char mysql_default_kind,
+									 LOCKMODE lockmode);
 static ObjectAddress ATExecCookedColumnDefault(Relation rel, AttrNumber attnum,
 											   Node *newDefault);
 static ObjectAddress ATExecAddIdentity(Relation rel, const char *colName,
@@ -2423,7 +2425,8 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab,
             address = ATExecTableOption(tab, rel, cmd, lockmode);
             break;
 		case AT_ColumnDefault:	/* ALTER COLUMN DEFAULT */
-			address = ATExecColumnDefault(rel, cmd->name, cmd->def, lockmode);
+			address = ATExecColumnDefault(rel, cmd->name, cmd->def,
+									  cmd->mysql_default_kind, lockmode);
 			break;
 		case AT_CookedColumnDefault:	/* add a pre-cooked default */
 			address = ATExecCookedColumnDefault(rel, cmd->num, cmd->def);
@@ -3181,6 +3184,11 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		/* Make the additional catalog changes visible */
 		CommandCounterIncrement();
 	}
+
+	mysSetColumnDefaultKind(RelationGetRelid(rel), attribute.attnum,
+							colDef->raw_default == NULL ? '\0' :
+							colDef->mysql_default_kind);
+	CommandCounterIncrement();
 
 	/*
 	 * Tell Phase 3 to fill in the default expression, if there is one.
@@ -4203,7 +4211,7 @@ ATExecChangeColumn(AlteredTableInfo *tab, Relation rel, AlterTableCmd *cmd, LOCK
 
     // 删除原有默认值
     RemoveAttrDefault(RelationGetRelid(rel), attnum, DROP_RESTRICT, false, true);
-    if (newColDef->raw_default)
+	if (newColDef->raw_default)
     {
         /* SET DEFAULT */
 		RawColumnDefault *rawEnt;
@@ -4220,6 +4228,11 @@ ATExecChangeColumn(AlteredTableInfo *tab, Relation rel, AlterTableCmd *cmd, LOCK
 		AddRelationNewConstraints(rel, list_make1(rawEnt), NIL,
 								  false, true, false, NULL);
     }
+
+	mysSetColumnDefaultKind(RelationGetRelid(rel), attnum,
+							newColDef->raw_default == NULL ? '\0' :
+							newColDef->mysql_default_kind);
+	CommandCounterIncrement();
 
     InvokeObjectPostAlterHook(RelationRelationId,
 							  RelationGetRelid(rel), attributeForm->attnum);
@@ -4352,7 +4365,7 @@ ATExecTableOption(AlteredTableInfo *tab, Relation rel, AlterTableCmd *cmd, LOCKM
  */
 static ObjectAddress
 ATExecColumnDefault(Relation rel, const char *colName,
-					Node *newDefault, LOCKMODE lockmode)
+					Node *newDefault, char mysql_default_kind, LOCKMODE lockmode)
 {
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	AttrNumber	attnum;
@@ -4427,9 +4440,62 @@ ATExecColumnDefault(Relation rel, const char *colName,
 								  false, true, false, NULL);
 	}
 
+	mysSetColumnDefaultKind(RelationGetRelid(rel), attnum,
+							newDefault == NULL ? '\0' : mysql_default_kind);
+
 	ObjectAddressSubSet(address, RelationRelationId,
 						RelationGetRelid(rel), attnum);
 	return address;
+}
+
+/*
+ * Store only the MySQL default-record classification.  pg_attrdef remains
+ * the source of the literal value, while pg_attribute.attoptions gives the
+ * protocol layer the information PostgreSQL's expression tree discarded.
+ */
+void
+mysSetColumnDefaultKind(Oid relid, AttrNumber attnum, char kind)
+{
+	Relation	attrelation;
+	HeapTuple	tuple;
+	HeapTuple	newtuple;
+	Datum		oldoptions;
+	Datum		newoptions;
+	bool		isnull;
+	DefElem	   *option;
+	Datum		repl_val[Natts_pg_attribute];
+	bool		repl_null[Natts_pg_attribute];
+	bool		repl_repl[Natts_pg_attribute];
+
+	attrelation = table_open(AttributeRelationId, RowExclusiveLock);
+	tuple = SearchSysCacheCopyAttNum(relid, attnum);
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for attribute %u/%d", relid, attnum);
+
+	oldoptions = SysCacheGetAttr(ATTNUM, tuple,
+							 Anum_pg_attribute_attoptions, &isnull);
+	option = makeDefElem("mysql_default_kind",
+			kind == 'l' ? (Node *) makeString("literal") :
+			kind == 'e' ? (Node *) makeString("expression") : NULL,
+			-1);
+	newoptions = transformRelOptions(isnull ? (Datum) 0 : oldoptions,
+									 list_make1(option), NULL, NULL, false,
+									 kind == '\0');
+	(void) attribute_reloptions(newoptions, true);
+
+	memset(repl_null, false, sizeof(repl_null));
+	memset(repl_repl, false, sizeof(repl_repl));
+	if (newoptions != (Datum) 0)
+		repl_val[Anum_pg_attribute_attoptions - 1] = newoptions;
+	else
+		repl_null[Anum_pg_attribute_attoptions - 1] = true;
+	repl_repl[Anum_pg_attribute_attoptions - 1] = true;
+	newtuple = heap_modify_tuple(tuple, RelationGetDescr(attrelation), repl_val,
+								  repl_null, repl_repl);
+	CatalogTupleUpdate(attrelation, &newtuple->t_self, newtuple);
+	heap_freetuple(newtuple);
+	heap_freetuple(tuple);
+	table_close(attrelation, RowExclusiveLock);
 }
 
 

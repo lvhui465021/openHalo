@@ -579,6 +579,29 @@ is_deeply([$field_text_default_seq, $field_text_default_end_seq], [1, 2],
 is(mysql_column_default($field_text_default), 'xy',
    'COM_FIELD_LIST text default is a length-encoded literal');
 
+# Parentheses make a MySQL default an expression even if PostgreSQL reduces
+# its raw expression to the same A_Const node.  mysql_list_fields restores a
+# default record, so nullable expression defaults are NULL and NOT NULL ones
+# expose their MySQL type reset value instead of the evaluated expression.
+mysql_send_seq($sock,
+    "\x03CREATE TABLE mysql_field_expression_default_wire (nullable_value INT DEFAULT (7), nonnull_value INT NOT NULL DEFAULT (7))",
+    0);
+my ($expression_default_create_seq, $expression_default_create_ok) = mysql_recv_packet($sock);
+is($expression_default_create_seq, 1,
+   'expression-default COM_FIELD_LIST fixture CREATE uses sequence 1');
+is(ord(substr($expression_default_create_ok, 0, 1)), 0x00,
+   'expression-default COM_FIELD_LIST fixture CREATE succeeds');
+is($node->safe_psql('postgres',
+    "SELECT coalesce(attoptions::text, '') FROM pg_attribute WHERE attrelid = 'mysql_field_expression_default_wire'::regclass AND attname = 'nullable_value'"),
+   '{mysql_default_kind=expression}',
+   'expression-default CREATE persists MySQL provenance in attoptions');
+mysql_send_seq($sock, "\x04mysql_field_expression_default_wire\0", 0);
+my @expression_default_defs = map { scalar mysql_recv_packet($sock) } 1 .. 2;
+mysql_recv_packet($sock);       # COM_FIELD_LIST terminator
+is_deeply([map { mysql_column_default($_) } @expression_default_defs],
+          [undef, '0'],
+          'COM_FIELD_LIST preserves MySQL expression default-record reset values');
+
 # COM_FIELD_LIST predates CLIENT_DEPRECATE_EOF.  The response has no column
 # count in either mode, but a client that did not negotiate the capability
 # must receive the legacy five-byte EOF terminator.

@@ -39,6 +39,7 @@
 #include "tcop/tcopprot.h"
 #include "tcop/dest.h"
 #include "utils/builtins.h"
+#include "utils/attoptcache.h"
 #include "utils/elog.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -342,16 +343,47 @@ mysql_field_append_lenenc(StringInfo buf, const char *value)
  * implementation; that requires persisted MySQL default provenance.
  */
 static char *
-mysql_field_default_value(TupleDesc desc, Form_pg_attribute attr)
+mysql_field_default_reset_value(Form_pg_attribute attr)
+{
+	switch (attr->atttypid)
+	{
+		case DATEOID:
+			return pstrdup("0000-00-00");
+		case TIMEOID:
+		case TIMETZOID:
+			return pstrdup("00:00:00");
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			return pstrdup("0000-00-00 00:00:00");
+		case BOOLOID:
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case FLOAT4OID:
+		case FLOAT8OID:
+		case NUMERICOID:
+			return pstrdup("0");
+		default:
+			return pstrdup("");
+	}
+}
+
+static char *
+mysql_field_default_value(Relation rel, TupleDesc desc, Form_pg_attribute attr)
 {
 	Node	   *expr;
 	Const	  *constant;
+	AttributeOpts *options;
 	Oid		outputfunc;
 	bool		isvarlena;
 	char	   *result;
 
 	if (!attr->atthasdef)
 		return NULL;
+	options = get_attribute_options(RelationGetRelid(rel), attr->attnum);
+	if (options != NULL &&
+		options->mysql_default_kind == MYSQL_DEFAULT_KIND_EXPRESSION)
+		return attr->attnotnull ? mysql_field_default_reset_value(attr) : NULL;
 	expr = TupleDescGetDefault(desc, attr->attnum);
 	if (expr == NULL)
 		return NULL;
@@ -369,7 +401,7 @@ mysql_field_default_value(TupleDesc desc, Form_pg_attribute attr)
 
 static void
 mysql_field_send_definition(MysPacketState *ps, const char *schema,
-								const char *table, TupleDesc desc,
+								const char *table, Relation rel, TupleDesc desc,
 								Form_pg_attribute attr)
 {
 	StringInfoData buf;
@@ -392,7 +424,7 @@ mysql_field_send_definition(MysPacketState *ps, const char *schema,
 	appendStringInfoChar(&buf, 0x00);
 	appendStringInfoChar(&buf, 0x00);
 	appendStringInfoChar(&buf, 0x00);
-	default_value = mysql_field_default_value(desc, attr);
+	default_value = mysql_field_default_value(rel, desc, attr);
 	if (default_value == NULL)
 		appendStringInfoChar(&buf, 0xfb);
 	else
@@ -442,7 +474,7 @@ mysql_field_list(StringInfo inBuf)
 		if (!attr->attisdropped &&
 			mysql_field_name_matches(NameStr(attr->attname), pattern))
 			mysql_field_send_definition(mysql_ps(), schema,
-									RelationGetRelationName(rel), desc, attr);
+									RelationGetRelationName(rel), rel, desc, attr);
 	}
 	relation_close(rel, AccessShareLock);
 	ProtocolFinishCommand();

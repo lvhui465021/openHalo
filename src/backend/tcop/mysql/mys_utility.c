@@ -59,6 +59,7 @@
 #include "commands/view.h"
 #include "executor/tstoreReceiver.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/mysql/mys_parsenodes.h"
 #include "parser/analyze.h"
 #include "parser/parse_node.h"
@@ -920,10 +921,24 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 						{
 							CreateStmt *cstmt = (CreateStmt *) stmt;
 							Datum		toast_options;
+							ListCell   *lc;
+							List	   *mysql_default_columns = NIL;
 							static const char *const validnsps[] = HEAP_RELOPT_NAMESPACES;
 
 							/* Remember transformed RangeVar for LIKE */
 							table_rv = cstmt->relation;
+							foreach(lc, cstmt->tableElts)
+							{
+								ColumnDef *coldef;
+
+								if (!IsA(lfirst(lc), ColumnDef))
+									continue;
+								coldef = castNode(ColumnDef, lfirst(lc));
+								if (coldef->raw_default != NULL)
+									mysql_default_columns = lappend(mysql_default_columns,
+										makeDefElem(coldef->colname,
+											(Node *) makeInteger(coldef->mysql_default_kind), -1));
+							}
 
 							/* Create the table itself */
 							address = DefineRelation(cstmt,
@@ -938,6 +953,15 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 							 * Let NewRelationCreateToastTable decide if this
 							 * one needs a secondary relation too.
 							 */
+							CommandCounterIncrement();
+							foreach(lc, mysql_default_columns)
+							{
+								DefElem *coldef = lfirst(lc);
+
+								mysSetColumnDefaultKind(address.objectId,
+									get_attnum(address.objectId, coldef->defname),
+									intVal(coldef->arg));
+							}
 							CommandCounterIncrement();
 
 							/*

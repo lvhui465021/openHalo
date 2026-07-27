@@ -759,6 +759,7 @@ typedef struct ColumnDef
 	char		storage;		/* attstorage setting, or 0 for default */
 	char	   *storage_name;	/* attstorage setting name or NULL for default */
 	Node	   *raw_default;	/* default value (untransformed parse tree) */
+	char		mysql_default_kind; /* MySQL literal/expression default provenance */
 	Node	   *cooked_default; /* default value (transformed expr tree) */
 	char		identity;		/* attidentity setting */
 	RangeVar   *identitySequence;	/* to store identity sequence name for
@@ -2499,6 +2500,7 @@ typedef struct AlterTableCmd	/* one subcommand of an ALTER TABLE */
 	RoleSpec   *newowner;
 	Node	   *def;			/* definition of new column, index,
 								 * constraint, or parent table */
+	char		mysql_default_kind; /* MySQL default provenance for AT_ColumnDefault */
 	DropBehavior behavior;		/* RESTRICT or CASCADE for DROP cases */
 	bool		missing_ok;		/* skip error if missing? */
 	bool		recurse;		/* exec-time recursion */
