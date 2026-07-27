@@ -51,6 +51,32 @@ extern bool isIgnoreStmt;
 /* M2 stub: will be properly migrated with MySQL namespace module */
 extern Oid getCurrentNamespaceOid(void);
 
+/*
+ * ALTER COLUMN SET DEFAULT stores only the expression in AlterTableCmd, so
+ * the common expression grammar has already erased any enclosing parens by
+ * transform time.  Retain the MySQL default-record distinction while the
+ * scanner's original source text and the SET token location are available.
+ */
+static char
+mysql_alter_default_kind(core_yyscan_t yyscanner, int set_location)
+{
+	mys_yy_extra_type *yyextra = mys_yyget_extra(yyscanner);
+	const char *pos;
+
+	if (set_location < 0)
+		return 'l';
+	pos = yyextra->core_yy_extra.scanbuf + set_location;
+	pos += strlen("SET");
+	while (isspace((unsigned char) *pos))
+		pos++;
+	if (pg_strncasecmp(pos, "DEFAULT", strlen("DEFAULT")) != 0)
+		return 'l';
+	pos += strlen("DEFAULT");
+	while (isspace((unsigned char) *pos))
+		pos++;
+	return *pos == '(' ? 'e' : 'l';
+}
+
 
 /*
  * Location tracking support --- simpler than bison's default, since we only
@@ -4520,6 +4546,8 @@ alter_table_cmd:
 					n->subtype = AT_ColumnDefault;
 					n->name = $3;
 					n->def = $4;
+					n->mysql_default_kind = $4 == NULL ? '\0' :
+						mysql_alter_default_kind(yyscanner, @4);
 					$$ = (Node *)n;
 				}
 			/* ALTER TABLE <name> ALTER [COLUMN] <colname> DROP NOT NULL */

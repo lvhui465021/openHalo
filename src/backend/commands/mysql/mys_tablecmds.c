@@ -4229,6 +4229,8 @@ ATExecChangeColumn(AlteredTableInfo *tab, Relation rel, AlterTableCmd *cmd, LOCK
 								  false, true, false, NULL);
     }
 
+	/* The default update changed pg_attribute before we update attoptions. */
+	CommandCounterIncrement();
 	mysSetColumnDefaultKind(RelationGetRelid(rel), attnum,
 							newColDef->raw_default == NULL ? '\0' :
 							newColDef->mysql_default_kind);
@@ -4440,6 +4442,8 @@ ATExecColumnDefault(Relation rel, const char *colName,
 								  false, true, false, NULL);
 	}
 
+	/* RemoveAttrDefault/AddRelationNewConstraints update pg_attribute. */
+	CommandCounterIncrement();
 	mysSetColumnDefaultKind(RelationGetRelid(rel), attnum,
 							newDefault == NULL ? '\0' : mysql_default_kind);
 

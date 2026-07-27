@@ -4299,6 +4299,9 @@ transformModifyColumnConstraints(CreateStmtContext *cxt, char *oldColName,
 							 parser_errposition(cxt->pstate,
 												constraint->location)));
 				column->raw_default = constraint->raw_expr;
+				column->mysql_default_kind = mysqlDefaultKind(cxt->pstate,
+												constraint->raw_expr,
+												constraint->location);
 				Assert(constraint->cooked_expr == NULL);
 				saw_default = true;
 				break;
@@ -5439,7 +5442,8 @@ mys_transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 	{
 		AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lcmd);
 
-		if (cmd->subtype == AT_ColumnDefault && cmd->def != NULL)
+		if (cmd->subtype == AT_ColumnDefault && cmd->def != NULL &&
+			cmd->mysql_default_kind == '\0')
 			cmd->mysql_default_kind = mysqlDefaultKind(pstate, cmd->def, -1);
 
 		switch (cmd->subtype)

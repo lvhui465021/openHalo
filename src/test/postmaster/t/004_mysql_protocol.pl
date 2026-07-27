@@ -602,6 +602,38 @@ is_deeply([map { mysql_column_default($_) } @expression_default_defs],
           [undef, '0'],
           'COM_FIELD_LIST preserves MySQL expression default-record reset values');
 
+# ALTER ... SET/DROP DEFAULT and the MySQL MODIFY/CHANGE spellings all pass
+# through distinct parser/utility paths.  In particular, MODIFY/CHANGE must
+# retain DEFAULT (7) as an expression, not silently collapse it to DEFAULT 7.
+mysql_send_seq($sock,
+    "\x03CREATE TABLE mysql_field_alter_default_wire (alter_value INT, drop_value INT DEFAULT 7, modify_value INT, change_source INT)",
+    0);
+my ($alter_default_create_seq, $alter_default_create_ok) = mysql_recv_packet($sock);
+is($alter_default_create_seq, 1,
+   'ALTER default COM_FIELD_LIST fixture CREATE uses sequence 1');
+is(ord(substr($alter_default_create_ok, 0, 1)), 0x00,
+   'ALTER default COM_FIELD_LIST fixture CREATE succeeds');
+for my $ddl (
+    'ALTER TABLE mysql_field_alter_default_wire ALTER COLUMN alter_value SET DEFAULT (7)',
+    'ALTER TABLE mysql_field_alter_default_wire ALTER COLUMN drop_value DROP DEFAULT',
+    'ALTER TABLE mysql_field_alter_default_wire MODIFY COLUMN modify_value INT NOT NULL DEFAULT (7)',
+    'ALTER TABLE mysql_field_alter_default_wire CHANGE COLUMN change_source change_value INT NOT NULL DEFAULT (7)')
+{
+    mysql_send_seq($sock, "\x03$ddl", 0);
+    my ($ddl_seq, $ddl_ok) = mysql_recv_packet($sock);
+    is($ddl_seq, 1, "MySQL DDL uses response sequence 1: $ddl");
+    is(ord(substr($ddl_ok, 0, 1)), 0x00, "MySQL DDL succeeds: $ddl");
+}
+mysql_send_seq($sock, "\x04mysql_field_alter_default_wire\0", 0);
+my @alter_default_defs = map { scalar mysql_recv_packet($sock) } 1 .. 4;
+mysql_recv_packet($sock);       # COM_FIELD_LIST terminator
+is_deeply([map { mysql_column_name($_) } @alter_default_defs],
+          [qw(alter_value drop_value modify_value change_value)],
+          'COM_FIELD_LIST reflects CHANGE COLUMN rename after default updates');
+is_deeply([map { mysql_column_default($_) } @alter_default_defs],
+          [undef, undef, '0', '0'],
+          'COM_FIELD_LIST preserves default provenance across ALTER/MODIFY/CHANGE');
+
 # COM_FIELD_LIST predates CLIENT_DEPRECATE_EOF.  The response has no column
 # count in either mode, but a client that did not negotiate the capability
 # must receive the legacy five-byte EOF terminator.
