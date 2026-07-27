@@ -880,10 +880,28 @@ pg_analyze_and_rewrite_fixedparams_with_routine(RawStmt *parsetree,
  */
 List *
 pg_analyze_and_rewrite_varparams(RawStmt *parsetree,
-								 const char *query_string,
-								 Oid **paramTypes,
-								 int *numParams,
-								 QueryEnvironment *queryEnv)
+									 const char *query_string,
+									 Oid **paramTypes,
+									 int *numParams,
+									 QueryEnvironment *queryEnv)
+{
+	return pg_analyze_and_rewrite_varparams_with_routine(parsetree,
+																 query_string, paramTypes, numParams,
+																 queryEnv, GetStandardParserRoutine());
+}
+
+/*
+ * Keep variable parameter analysis in the dialect that produced the raw
+ * statement.  This is the varparams counterpart of the existing fixedparams
+ * routine and is required by protocol-level prepared statements.
+ */
+List *
+pg_analyze_and_rewrite_varparams_with_routine(RawStmt *parsetree,
+															const char *query_string,
+															Oid **paramTypes,
+															int *numParams,
+															QueryEnvironment *queryEnv,
+															const ParserRoutine *parser_routine)
 {
 	Query	   *query;
 	List	   *querytree_list;
@@ -896,8 +914,9 @@ pg_analyze_and_rewrite_varparams(RawStmt *parsetree,
 	if (log_parser_stats)
 		ResetUsage();
 
-	query = parse_analyze_varparams(parsetree, query_string, paramTypes, numParams,
-									queryEnv);
+	query = parse_analyze_varparams_with_routine(parsetree, query_string,
+															 paramTypes, numParams, queryEnv,
+															 parser_routine);
 
 	/*
 	 * Check all parameter types got determined.
@@ -1195,6 +1214,8 @@ exec_simple_query(const char *query_string, const ParserRoutine *parser_routine)
 	bool		save_log_statement_stats = log_statement_stats;
 	bool		was_logged = false;
 	bool		use_implicit_block;
+	bool		simple_query_statement_ends_xact = false;
+	const ProtocolRoutine *protocol_routine;
 	char		msec_str[32];
 
 	/*
@@ -1240,6 +1261,18 @@ exec_simple_query(const char *query_string, const ParserRoutine *parser_routine)
 	 * we are in aborted transaction state!)
 	 */
 	parsetree_list = pg_parse_query_with_routine(query_string, parser_routine);
+	protocol_routine = GetCurrentProtocolRoutine();
+	if (list_length(parsetree_list) > 1 &&
+		protocol_routine != NULL &&
+		protocol_routine->allow_multi_statements != NULL &&
+		!protocol_routine->allow_multi_statements())
+		ereport(ERROR,
+			(errcode(ERRCODE_SYNTAX_ERROR),
+			 errmsg("multiple statements are disabled for this connection")));
+	if (protocol_routine != NULL &&
+		protocol_routine->simple_query_statement_ends_xact != NULL)
+		simple_query_statement_ends_xact =
+			protocol_routine->simple_query_statement_ends_xact();
 
 	/* Log immediately if dictated by log_statement */
 	if (check_log_statement(parsetree_list))
@@ -1264,7 +1297,8 @@ exec_simple_query(const char *query_string, const ParserRoutine *parser_routine)
 	 * behavior properly in the transaction machinery, we use an "implicit"
 	 * transaction block.
 	 */
-	use_implicit_block = (list_length(parsetree_list) > 1);
+	use_implicit_block = (list_length(parsetree_list) > 1 &&
+					  !simple_query_statement_ends_xact);
 
 	/*
 	 * Run through the raw parsetree(s) and process each one.
@@ -1283,6 +1317,11 @@ exec_simple_query(const char *query_string, const ParserRoutine *parser_routine)
 		int16		format;
 		const char *cmdtagname;
 		size_t		cmdtaglen;
+		bool		has_more = lnext(parsetree_list, parsetree_item) != NULL;
+
+		if (protocol_routine != NULL &&
+			protocol_routine->set_simple_query_more_results != NULL)
+			protocol_routine->set_simple_query_more_results(has_more);
 
 		pgstat_report_query_id(0, true);
 		pgstat_report_plan_id(0, true);
@@ -1318,6 +1357,16 @@ exec_simple_query(const char *query_string, const ParserRoutine *parser_routine)
 
 		/* Make sure we are in a transaction command */
 		start_xact_command();
+
+		/*
+		 * Let non-PostgreSQL protocols establish statement-specific session
+		 * transaction state after the command is active, but before planning
+		 * can acquire a snapshot.  MySQL uses this for autocommit=0's lazy
+		 * transaction start and for BEGIN's implicit-commit boundary.
+		 */
+		if (protocol_routine != NULL &&
+			protocol_routine->before_simple_query_statement != NULL)
+			protocol_routine->before_simple_query_statement(parsetree->stmt);
 
 		/*
 		 * If using an implicit transaction block, and we're not already in a
@@ -1459,7 +1508,7 @@ exec_simple_query(const char *query_string, const ParserRoutine *parser_routine)
 
 		PortalDrop(portal, false);
 
-		if (lnext(parsetree_list, parsetree_item) == NULL)
+		if (!has_more)
 		{
 			/*
 			 * If this is the last parsetree of the query string, close down
@@ -1474,7 +1523,8 @@ exec_simple_query(const char *query_string, const ParserRoutine *parser_routine)
 				EndImplicitTransactionBlock();
 			finish_xact_command();
 		}
-		else if (IsA(parsetree->stmt, TransactionStmt))
+		else if (IsA(parsetree->stmt, TransactionStmt) ||
+				 simple_query_statement_ends_xact)
 		{
 			/*
 			 * If this was a transaction control statement, commit it. We will
@@ -3022,6 +3072,25 @@ finish_xact_command(void)
 
 		xact_started = false;
 	}
+}
+
+/*
+ * Compatibility protocol handlers can consume commands before the normal
+ * PostgresMain switch.  Keep their transaction and timeout lifecycle here,
+ * rather than allowing adapters to manipulate xact_started directly.
+ */
+void
+ProtocolStartCommand(void)
+{
+	/* Compatibility commands bypass the normal PostgresMain switch. */
+	SetCurrentStatementStartTimestamp();
+	start_xact_command();
+}
+
+void
+ProtocolFinishCommand(void)
+{
+	finish_xact_command();
 }
 
 

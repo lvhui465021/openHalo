@@ -57,11 +57,13 @@
 #include "commands/vacuum.h"
 #include "commands/view.h"
 #include "miscadmin.h"
+#include "nodes/mysql/mys_parsenodes.h"
 #include "parser/parse_utilcmd.h"
 #include "postmaster/bgwriter.h"
 #include "rewrite/rewriteDefine.h"
 #include "storage/fd.h"
 #include "tcop/utility.h"
+#include "postmaster/protocol_routine.h"
 #include "utils/acl.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -266,6 +268,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_PrepareStmt:
 		case T_UnlistenStmt:
 		case T_VariableSetStmt:
+		case T_MysVariableSetStmt:
 			{
 				/*
 				 * These modify only backend-local state, so they're OK to run
@@ -520,9 +523,16 @@ ProcessUtility(PlannedStmt *pstmt,
 								context, params, queryEnv,
 								dest, qc);
 	else
-		standard_ProcessUtility(pstmt, queryString, readOnlyTree,
-								context, params, queryEnv,
-								dest, qc);
+	{
+		const ProtocolRoutine *routine = GetCurrentProtocolRoutine();
+
+		if (routine->process_utility != NULL)
+			routine->process_utility(pstmt, queryString, readOnlyTree,
+								 context, params, queryEnv, dest, qc);
+		else
+			standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+									context, params, queryEnv, dest, qc);
+	}
 }
 
 /*
@@ -2393,6 +2403,10 @@ CreateCommandTag(Node *parsetree)
 
 		case T_PLAssignStmt:
 			tag = CMDTAG_SELECT;
+			break;
+
+		case T_MysVariableSetStmt:
+			tag = CMDTAG_SET;
 			break;
 
 			/* utility statements --- same whether raw or cooked */

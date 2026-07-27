@@ -160,6 +160,23 @@ parse_analyze_varparams(RawStmt *parseTree, const char *sourceText,
 						Oid **paramTypes, int *numParams,
 						QueryEnvironment *queryEnv)
 {
+	return parse_analyze_varparams_with_routine(parseTree, sourceText,
+														paramTypes, numParams, queryEnv,
+														GetStandardParserRoutine());
+}
+
+/*
+ * Variant of parse_analyze_varparams for compatibility parsers.  Variable
+ * parameters must use the same transform routine as the raw parse tree:
+ * otherwise a MySQL '?' marker can parse successfully but later be analyzed
+ * as PostgreSQL syntax when a cached plan is prepared or revalidated.
+ */
+Query *
+parse_analyze_varparams_with_routine(RawStmt *parseTree, const char *sourceText,
+									 Oid **paramTypes, int *numParams,
+									 QueryEnvironment *queryEnv,
+									 const ParserRoutine *parser_routine)
+{
 	ParseState *pstate = make_parsestate(NULL);
 	Query	   *query;
 	JumbleState *jstate = NULL;
@@ -167,6 +184,7 @@ parse_analyze_varparams(RawStmt *parseTree, const char *sourceText,
 	Assert(sourceText != NULL); /* required as of 8.4 */
 
 	pstate->p_sourcetext = sourceText;
+	pstate->p_parser_routine = parser_routine;
 
 	setup_parse_variable_parameters(pstate, paramTypes, numParams);
 

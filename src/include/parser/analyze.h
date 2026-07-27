@@ -34,6 +34,11 @@ extern Query *parse_analyze_fixedparams_with_routine(RawStmt *parseTree,
 											 const struct ParserRoutine *parser_routine);
 extern Query *parse_analyze_varparams(RawStmt *parseTree, const char *sourceText,
 									  Oid **paramTypes, int *numParams, QueryEnvironment *queryEnv);
+extern Query *parse_analyze_varparams_with_routine(RawStmt *parseTree,
+												 const char *sourceText,
+												 Oid **paramTypes, int *numParams,
+												 QueryEnvironment *queryEnv,
+												 const struct ParserRoutine *parser_routine);
 extern Query *parse_analyze_withcb(RawStmt *parseTree, const char *sourceText,
 								   ParserSetupHook parserSetup,
 								   void *parserSetupArg,

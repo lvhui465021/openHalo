@@ -36,6 +36,7 @@ static const ParserRoutine StandardParserRoutine = {
 const ParserRoutine MySQLParserRoutine = {
     .raw_parse = mys_raw_parser,
     .transform_expr_node = mys_transform_expr_node,
+	.figure_colname = mys_figure_colname,
 };
 
 const ParserRoutine *

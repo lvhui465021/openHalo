@@ -139,6 +139,13 @@ typedef struct ParserRoutine
                                        Node *expr,
                                        Node **result);
 
+	/*
+	 * figure_colname -- optionally derive an implicit result-column name
+	 * from a dialect-specific raw expression.  Returning NULL requests the
+	 * standard PostgreSQL FigureColname() fallback.
+	 */
+	char	   *(*figure_colname)(Node *expr);
+
     /* ------------------------------------------------------------
      * Utility command transform hooks.
      * ------------------------------------------------------------

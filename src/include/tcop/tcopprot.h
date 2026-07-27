@@ -66,6 +66,12 @@ extern List *pg_analyze_and_rewrite_varparams(RawStmt *parsetree,
 											  Oid **paramTypes,
 											  int *numParams,
 											  QueryEnvironment *queryEnv);
+extern List *pg_analyze_and_rewrite_varparams_with_routine(RawStmt *parsetree,
+														  const char *query_string,
+														  Oid **paramTypes,
+														  int *numParams,
+														  QueryEnvironment *queryEnv,
+														  const struct ParserRoutine *parser_routine);
 extern List *pg_analyze_and_rewrite_withcb(RawStmt *parsetree,
 										   const char *query_string,
 										   ParserSetupHook parserSetup,
@@ -93,6 +99,11 @@ pg_noreturn extern void PostgresSingleUserMain(int argc, char *argv[],
 pg_noreturn extern void PostgresMain(const char *dbname,
 									 const char *username);
 extern void ResetUsage(void);
+
+/* Compatibility handlers retain PostgresMain transaction bookkeeping. */
+extern void ProtocolStartCommand(void);
+extern void ProtocolFinishCommand(void);
+
 extern void ShowUsage(const char *title);
 extern int	check_log_duration(char *msec_str, bool was_logged);
 extern void set_debug_options(int debug_flag,

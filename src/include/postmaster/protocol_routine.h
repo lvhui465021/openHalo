@@ -18,12 +18,14 @@
 
 #include "libpq/libpq-be.h"          /* CompatibilityProtocolKind, Port        */
 #include "tcop/dest.h"               /* CommandDest, DestReceiver             */
+#include "tcop/utility.h"            /* ProcessUtility_hook_type               */
 
 /* forward declarations */
 struct QueryCompletion;
 struct ParserRoutine;
 struct PortalData;
 struct ErrorData;
+struct Node;
 
 /* ----------------------------------------------------------------
  *    ProtocolCommandResult
@@ -76,9 +78,18 @@ typedef struct ProtocolRoutine
     void        (*null_command)(CommandDest dest);
     void        (*send_ready_for_query)(CommandDest dest);
 
+    /* --- simple-query multi-statement policy / result framing --- */
+    bool        (*allow_multi_statements)(void);
+    bool        (*simple_query_statement_ends_xact)(void);
+    void        (*set_simple_query_more_results)(bool more);
+    void        (*before_simple_query_statement)(struct Node *stmt);
+
     /* --- error / GUC hooks --- */
     void        (*send_error)(struct ErrorData *edata);
     void        (*report_parameter_status)(const char *name, const char *value);
+
+    /* --- utility-command execution --- */
+    ProcessUtility_hook_type process_utility;
 
     /* --- parser selection --- */
     const struct ParserRoutine *parser_routine;
