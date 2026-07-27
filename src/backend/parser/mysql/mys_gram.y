@@ -527,7 +527,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 %type <node>	TableElement TypedTableElement ConstraintElem TableFuncElement
 %type <node>	columnDef columnOptions
 %type <defelt>	def_elem reloption_elem old_aggr_elem operator_def_elem
-%type <node>	def_arg columnElem where_clause on_clause where_or_current_clause
+%type <node>	def_arg columnElem where_clause on_clause opt_on_clause where_or_current_clause
 				a_expr on_a_expr b_expr c_expr AexprConst indirection_el opt_slice_bound
 				columnref in_expr having_clause func_table xmltable array_expr
 				OptWhereClause operator_def_arg interval_expr
@@ -15891,127 +15891,47 @@ MysUpdateStmt:
 					$$ = (Node *)n;
 				}
         |   UPDATE update_options relation_expr_opt_alias
-            update_join_type JOIN relation_expr_opt_aliass on_clause
+            update_join_type JOIN relation_expr_opt_aliass opt_on_clause
 			SET set_clause_list_for_mysql
 			where_or_current_clause
 				{
-                    // 暂时只考虑一个join的情况
-                    // TODO: 还要考虑多个join的情况
 					UpdateStmt *n = makeNode(UpdateStmt);
-                    //int i;
-                    //ListCell* lc;
-                    //int len;
-                    //char* targetRelationName;
 
                     n->relation = $3;
                     n->targetList = $9;
-                    //i = 0;
-                    //len = 0;
-                    //targetRelationName = NULL;
-                    //foreach (lc, $9)
-                    //{
-                    //    Node *node = lfirst(lc);
-                    //    if ((i % 2) == 1)
-                    //    {
-                    //        // 表名部分
-                    //        if (!IsA(node, ResTarget))
-                    //        {
-                    //            ereport(ERROR,
-                    //                    (errcode(ERRCODE_SYNTAX_ERROR),
-                    //                     errmsg("syntax error after set.")));
-                    //        }
-
-                    //        n->targetList = lappend(n->targetList, node);
-                    //    }
-                    //    //else
-                    //    //{
-                    //    //    // 别名部分，做多表检查
-                    //    //    if (node != NULL)
-                    //    //    {
-                    //    //        A_Const *rel;
-                    //    //        if (!IsA(node, A_Const))
-                    //    //        {
-                    //    //            ereport(ERROR,
-                    //    //                    (errcode(ERRCODE_SYNTAX_ERROR),
-                    //    //                     errmsg("syntax error in table name or alias after set.")));
-                    //    //        }
-
-                    //    //        rel = castNode(A_Const, node);
-                    //    //        if (i == 0)
-                    //    //        {
-                    //    //            targetRelationName = rel->val.sval.sval;
-                    //    //            len = strlen(targetRelationName);
-                    //    //        }
-                    //    //        else
-                    //    //        {
-                    //    //            if (strncasecmp(targetRelationName, rel->val.sval.sval, len) != 0)
-                    //    //            {
-                    //    //                ereport(ERROR,
-                    //    //                        (errcode(ERRCODE_SYNTAX_ERROR),
-                    //    //                         errmsg("2 syntax error, multi table name or alias in set.")));
-                    //    //            }
-                    //    //        }
-                    //    //    }
-                    //    //    else
-                    //    //    {
-                    //    //        RangeVar* rangeVar = (RangeVar*)$3;
-                    //    //        if (i == 0)
-                    //    //        {
-                    //    //            targetRelationName = rangeVar->alias->aliasname;
-                    //    //            len = strlen(targetRelationName);
-                    //    //        }
-                    //    //        else
-                    //    //        {
-                    //    //            if (strncasecmp(targetRelationName, rangeVar->alias->aliasname, len) != 0)
-                    //    //            {
-                    //    //                ereport(ERROR,
-                    //    //                        (errcode(ERRCODE_SYNTAX_ERROR),
-                    //    //                         errmsg("3 syntax error, multi table name or alias in set.")));
-                    //    //            }
-                    //    //        }
-                    //    //    }
-                    //    //}
-                    //    ++i;
-                    //}
                     n->fromClause = $6;
-                    /* n->onClause = $7; -- field removed in PG18 */
-                    if ($4 == JOIN_INNER)
+
+                    if ($4 == JOIN_INNER || $4 == JOIN_LEFT || $4 == JOIN_RIGHT)
                     {
+                        /*
+                         * Merge ON clause into WHERE for inner/outer joins.
+                         * For LEFT/RIGHT JOIN, PG's UPDATE ... FROM does not
+                         * natively support outer-join semantics, so unmatched
+                         * rows are silently excluded (inner-join behavior).
+                         * This is a known limitation: MySQL would update
+                         * unmatched left rows with NULLs from the right table.
+                         */
+                        if ($7 != NULL && $10 != NULL)
+                            n->whereClause = makeAndExpr($7, $10, -1);
+                        else if ($7 != NULL)
+                            n->whereClause = $7;
+                        else
+                            n->whereClause = $10;
+                    }
+                    else if ($4 == JOIN_FULL)  /* CROSS JOIN */
+                    {
+                        if ($7 != NULL)
+                            ereport(ERROR,
+                                    (errcode(ERRCODE_SYNTAX_ERROR),
+                                     errmsg("CROSS JOIN does not allow ON clause"),
+                                     parser_errposition(@1)));
                         n->whereClause = $10;
-                        //if ($10 != NULL)
-                        //{
-                        //    n->whereClause = makeAndExpr($10, $7, -1);
-                        //}
-                        //else
-                        //{
-                        //    n->whereClause = $7;
-                        //}
-                    }
-                    else if ($4 == JOIN_LEFT)
-                    {
-                        /* TODO: */
-                        ereport(ERROR,
-                                (errcode(ERRCODE_SYNTAX_ERROR),
-                                 errmsg("LEFT [OUTER] JOIN syntax is not supported in update stmt"),
-                                 errhint("LEFT [OUTER] JOIN syntax is not supported int update stmt"),
-                                 parser_errposition(@1)));
-                    }
-                    else if ($4 == JOIN_RIGHT)
-                    {
-                        /* TODO: */
-                        ereport(ERROR,
-                                (errcode(ERRCODE_SYNTAX_ERROR),
-                                 errmsg("RIGHT [OUTER] JOIN syntax is not supported in update stmt"),
-                                 errhint("RIGHT [OUTER] JOIN syntax is not supported in update stmt"),
-                                 parser_errposition(@1)));
                     }
                     else
                     {
-                        /* TODO: */
                         ereport(ERROR,
                                 (errcode(ERRCODE_SYNTAX_ERROR),
-                                 errmsg("CROSS JOIN syntax is not supported in update stmt"),
-                                 errhint("CROSS JOIN syntax is not supported in update stmt"),
+                                 errmsg("unsupported join type in UPDATE"),
                                  parser_errposition(@1)));
                     }
                     $$ = (Node *)n;
@@ -17592,6 +17512,11 @@ where_clause:
 
 on_clause:
 			ON a_expr							    { $$ = $2; }
+		;
+
+opt_on_clause:
+			on_clause							{ $$ = $1; }
+			| /*EMPTY*/							{ $$ = NULL; }
 		;
 
 /* variant for UPDATE and DELETE */
