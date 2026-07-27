@@ -70,6 +70,18 @@ extern bool needCommitTrx;
 extern bool needStartNewTrx;
 extern bool isStrictTransTablesOn;
 
+extern bool MysAutocommitEnabled(void);
+extern void MysSetAutocommit(bool enabled);
+extern void MysInitSessionTimeZone(void);
+extern bool MysIsSessionVariableSupported(const char *name);
+extern bool MysIsGlobalVariableSupported(const char *name);
+extern void MysSetSessionTimeZone(const char *value);
+extern const char *MysGetSessionTimeZone(void);
+extern void MysSetGlobalTimeZone(const char *value);
+extern char *MysGetGlobalTimeZone(void);
+extern Size MysTimeZoneShmemSize(void);
+extern void MysTimeZoneShmemInit(void);
+
 Size GlobalSystemVariablesShmemSize(void);
 void GlobalSystemVariablesShmemInit(void);
 void getSystemVariableValueForSelect(char *varName, 
@@ -87,4 +99,3 @@ bool isSystemVariable(char *varName);
 
 
 #endif                          /* ADAPTER_MYSQL_SYSTEMVAR_H */
-

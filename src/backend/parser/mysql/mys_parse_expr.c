@@ -907,6 +907,23 @@ transformSysVarRef(ParseState *pstate, SysVarRef *sysVarRef)
     const char *val;
     A_Const *n;
 
+    if (pg_strcasecmp(sysVarRef->sysVarName, "time_zone") == 0 ||
+        pg_strcasecmp(sysVarRef->sysVarName, "session.time_zone") == 0 ||
+        pg_strcasecmp(sysVarRef->sysVarName, "local.time_zone") == 0)
+    {
+        List *funcName = list_make2(makeString(pstrdup("pg_catalog")),
+                                    makeString(pstrdup("mys_get_session_time_zone")));
+        Node *funcCall = (Node *) makeFuncCall(funcName, NIL,
+                                                COERCE_EXPLICIT_CALL,
+                                                sysVarRef->location);
+
+        /*
+         * Keep this volatile: SQL PREPARE must read the session value when
+         * EXECUTE runs, not fold @@session.time_zone at prepare time.
+         */
+        return transformExprRecurse(pstate, funcCall);
+    }
+
     if (pg_strcasecmp(sysVarRef->sysVarName, "version_comment") == 0)
         val = "8.0.40-openhalo-1.0";
     else if (pg_strcasecmp(sysVarRef->sysVarName, "version") == 0)

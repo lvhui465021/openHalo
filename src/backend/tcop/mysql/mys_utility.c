@@ -18,6 +18,7 @@
 #include "access/reloptions.h"
 #include "access/twophase.h"
 #include "access/xact.h"
+#include "adapter/mysql/systemVar.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_inherits.h"
@@ -62,11 +63,14 @@
 #include "parser/analyze.h"
 #include "parser/parse_node.h"
 #include "parser/parse_utilcmd.h"
+#include "parser/parsereng.h"
+#include "parser/mysql/mys_parse_utilcmd.h"
 #include "postmaster/bgwriter.h"
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/fd.h"
 #include "tcop/utility.h"
+#include "tcop/mysql/mys_utility.h"
 #include "utils/acl.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -211,6 +215,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_PrepareStmt:
 		case T_UnlistenStmt:
 		case T_VariableSetStmt:
+		case T_MysVariableSetStmt:
 			return COMMAND_OK_IN_RECOVERY | COMMAND_OK_IN_READ_ONLY_TXN;
 
 		case T_ClusterStmt:
@@ -289,6 +294,11 @@ static void mys_ProcessUtilitySlow(ParseState *pstate,
 static void mys_ExecDropStmt(DropStmt *stmt, bool isTopLevel);
 static void MysExecSetVariableStmt(ParseState *pstate, MysVariableSetStmt *parsetree, ParamListInfo params, bool isTopLevel);
 static void MysExecSelectIntoStmt(ParseState *pstate, MysSelectIntoStmt *parsetree, ParamListInfo params, QueryCompletion *qc);
+static bool MysSetAutocommitValue(Node *arg, bool *enabled);
+static bool MysApplyAutocommitAssignment(Node *assignment);
+static bool MysApplyTimeZoneAssignment(Node *assignment);
+static bool MysApplyGlobalTimeZoneAssignment(Node *assignment);
+static const char *MysStringAssignmentValue(Node *arg);
 
 
 void
@@ -340,6 +350,7 @@ mys_standard_ProcessUtility(PlannedStmt *pstmt,
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;
 	pstate->p_queryEnv = queryEnv;
+	pstate->p_parser_routine = GetMySQLParserRoutine();
 
 	switch (nodeTag(parsetree))
 	{
@@ -891,8 +902,8 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 					RangeVar   *table_rv = NULL;
 
 					/* Run parse analysis ... */
-					stmts = transformCreateStmt((CreateStmt *) parsetree,
-												queryString);
+					stmts = mys_transformCreateStmt((CreateStmt *) parsetree,
+													  queryString);
 
 					/*
 					 * ... and do it.  We can't use foreach() because we may
@@ -1766,6 +1777,234 @@ mys_ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 	}
 }
 
+static bool
+MysSetAutocommitValue(Node *arg, bool *enabled)
+{
+    A_Const    *constant;
+
+    if (!IsA(arg, A_Const))
+        return false;
+
+    constant = castNode(A_Const, arg);
+    if (constant->isnull)
+        return false;
+
+    if (IsA(&constant->val, Integer))
+    {
+        int value = intVal(&constant->val);
+
+        if (value == 0 || value == 1)
+        {
+            *enabled = value == 1;
+            return true;
+        }
+    }
+    else if (IsA(&constant->val, String))
+    {
+        const char *value = strVal(&constant->val);
+
+        if (pg_strcasecmp(value, "on") == 0 ||
+            pg_strcasecmp(value, "true") == 0 ||
+            strcmp(value, "1") == 0)
+        {
+            *enabled = true;
+            return true;
+        }
+        if (pg_strcasecmp(value, "off") == 0 ||
+            pg_strcasecmp(value, "false") == 0 ||
+            strcmp(value, "0") == 0)
+        {
+            *enabled = false;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool
+MysApplyAutocommitAssignment(Node *assignment)
+{
+	SelectStmt *select_stmt;
+	ListCell   *lc;
+	bool        found = false;
+
+	if (!IsA(assignment, SelectStmt))
+		return false;
+	select_stmt = castNode(SelectStmt, assignment);
+
+	foreach(lc, select_stmt->targetList)
+	{
+		ResTarget  *target = lfirst_node(ResTarget, lc);
+		FuncCall   *call;
+		Node       *name_arg;
+		Node       *value_arg;
+		A_Const    *name_constant;
+		const char *name;
+		bool        enabled;
+		bool        was_enabled;
+
+		if (!IsA(target->val, FuncCall))
+			continue;
+		call = castNode(FuncCall, target->val);
+		if (list_length(call->funcname) != 2 || list_length(call->args) != 2 ||
+			strcmp(strVal(linitial(call->funcname)), "mysql") != 0 ||
+			strcmp(strVal(lsecond(call->funcname)),
+				   "set_system_session_variable") != 0)
+			continue;
+
+		name_arg = linitial(call->args);
+		value_arg = lsecond(call->args);
+		if (!IsA(name_arg, A_Const))
+			continue;
+		name_constant = castNode(A_Const, name_arg);
+		if (name_constant->isnull || !IsA(&name_constant->val, String))
+			continue;
+		name = strVal(&name_constant->val);
+		if (pg_strcasecmp(name, "autocommit") != 0)
+			continue;
+		if (!MysSetAutocommitValue(value_arg, &enabled))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("autocommit must be set to 0 or 1")));
+
+		was_enabled = MysAutocommitEnabled();
+		MysSetAutocommit(enabled);
+
+		/* MySQL commits only on the autocommit-off to autocommit-on edge. */
+		if (enabled && !was_enabled && IsTransactionBlock())
+			(void) EndTransactionBlock(false);
+		found = true;
+	}
+
+	return found;
+}
+
+static const char *
+MysStringAssignmentValue(Node *arg)
+{
+	A_Const    *constant;
+
+	if (!IsA(arg, A_Const))
+		return NULL;
+	constant = castNode(A_Const, arg);
+	if (constant->isnull)
+		return NULL;
+	if (IsA(&constant->val, String))
+		return strVal(&constant->val);
+	return NULL;
+}
+
+static bool
+MysApplyTimeZoneAssignment(Node *assignment)
+{
+	SelectStmt *select_stmt;
+	ListCell   *lc;
+	bool        found = false;
+
+	if (!IsA(assignment, SelectStmt))
+		return false;
+	select_stmt = castNode(SelectStmt, assignment);
+
+	foreach(lc, select_stmt->targetList)
+	{
+		ResTarget  *target = lfirst_node(ResTarget, lc);
+		FuncCall   *call;
+		Node       *name_arg;
+		Node       *value_arg;
+		A_Const    *name_constant;
+		const char *name;
+		const char *value;
+
+		if (!IsA(target->val, FuncCall))
+			continue;
+		call = castNode(FuncCall, target->val);
+		if (list_length(call->funcname) != 2 || list_length(call->args) != 2 ||
+			strcmp(strVal(linitial(call->funcname)), "mysql") != 0 ||
+			strcmp(strVal(lsecond(call->funcname)),
+				   "set_system_session_variable") != 0)
+			continue;
+
+		name_arg = linitial(call->args);
+		value_arg = lsecond(call->args);
+		if (!IsA(name_arg, A_Const))
+			continue;
+		name_constant = castNode(A_Const, name_arg);
+		if (name_constant->isnull || !IsA(&name_constant->val, String))
+			continue;
+		name = strVal(&name_constant->val);
+		if (!MysIsSessionVariableSupported(name))
+			continue;
+
+		value = MysStringAssignmentValue(value_arg);
+		if (value == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("time_zone must be set to SYSTEM or a UTC offset")));
+		MysSetSessionTimeZone(value);
+		found = true;
+	}
+
+	return found;
+}
+
+static bool
+MysApplyGlobalTimeZoneAssignment(Node *assignment)
+{
+	SelectStmt *select_stmt;
+	ListCell   *lc;
+	bool		found = false;
+
+	if (!IsA(assignment, SelectStmt))
+		return false;
+	select_stmt = castNode(SelectStmt, assignment);
+
+	foreach(lc, select_stmt->targetList)
+	{
+		ResTarget  *target = lfirst_node(ResTarget, lc);
+		FuncCall   *call;
+		Node		*name_arg;
+		Node		*value_arg;
+		A_Const    *name_constant;
+		const char *name;
+		const char *value;
+
+		if (!IsA(target->val, FuncCall))
+			continue;
+		call = castNode(FuncCall, target->val);
+		if (list_length(call->funcname) != 2 || list_length(call->args) != 2 ||
+			strcmp(strVal(linitial(call->funcname)), "mysql") != 0 ||
+			strcmp(strVal(lsecond(call->funcname)),
+				   "set_system_global_variable") != 0)
+			continue;
+
+		name_arg = linitial(call->args);
+		value_arg = lsecond(call->args);
+		if (!IsA(name_arg, A_Const))
+			continue;
+		name_constant = castNode(A_Const, name_arg);
+		if (name_constant->isnull || !IsA(&name_constant->val, String))
+			continue;
+		name = strVal(&name_constant->val);
+		if (!MysIsGlobalVariableSupported(name))
+			continue;
+		if (!superuser())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("access denied; SYSTEM_VARIABLES_ADMIN privilege is required")));
+
+		value = MysStringAssignmentValue(value_arg);
+		if (value == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("time_zone must be set to SYSTEM or a UTC offset")));
+		MysSetGlobalTimeZone(value);
+		found = true;
+	}
+
+	return found;
+}
+
 static void
 MysExecSetVariableStmt(ParseState *pstate, MysVariableSetStmt *parsetree, ParamListInfo params, bool isTopLevel)
 {
@@ -1773,61 +2012,57 @@ MysExecSetVariableStmt(ParseState *pstate, MysVariableSetStmt *parsetree, ParamL
 
     foreach(lc, parsetree->assignments)
     {
-        Node	   *stmt = (Node *) lfirst(lc);
-        Query	   *query;
-        PlannedStmt *plan;
-        QueryDesc  *queryDesc;
-        DestReceiver *treceiver;
-        List	   *rewritten;
+        Node *assignment = lfirst(lc);
+        bool user_variable_assignment = false;
 
-        /* Parse-analyze the raw SelectStmt to get a Query */
-        query = transformStmt(pstate, stmt);
+        if (IsA(assignment, SelectStmt))
+        {
+            SelectStmt *select_stmt = castNode(SelectStmt, assignment);
 
-        if (query->commandType != CMD_SELECT)
+            if (list_length(select_stmt->targetList) == 1)
+            {
+                ResTarget *target = linitial_node(ResTarget,
+                                                   select_stmt->targetList);
+
+                if (IsA(target->val, FuncCall))
+                {
+                    FuncCall *call = castNode(FuncCall, target->val);
+
+                    user_variable_assignment =
+                        list_length(call->funcname) == 2 &&
+                        strcmp(strVal(linitial(call->funcname)), "pg_catalog") == 0 &&
+                        strcmp(strVal(lsecond(call->funcname)),
+                               "mys_set_user_var") == 0;
+                }
+            }
+        }
+
+        if (user_variable_assignment)
+        {
+            MysSelectIntoStmt set_stmt = {0};
+
+            /*
+             * The grammar represents SET @var := expr as a one-row SELECT
+             * whose target is mys_set_user_var().  Execute it with a
+             * tuplestore receiver so the volatile setter runs, while keeping
+             * SET's normal OK-only wire response.
+             */
+            set_stmt.type = T_MysSelectIntoStmt;
+            set_stmt.selectStmt = assignment;
+            set_stmt.intoTarget = NULL;
+            MysExecSelectIntoStmt(pstate, &set_stmt, params, NULL);
             continue;
+        }
 
-        /* All output from varSetStmt goes to the bit bucket */
-        treceiver = CreateDestReceiver(DestNone);
-
-        rewritten = QueryRewrite(query);
-
-        /* SELECT should never rewrite to more or less than one SELECT query */
-        if (list_length(rewritten) != 1)
-            elog(ERROR, "unexpected rewrite result for setUserVariable");
-
-        query = linitial_node(Query, rewritten);
-        Assert(query->commandType == CMD_SELECT);
-
-        /* plan the query */
-        plan = pg_plan_query(query, pstate->p_sourcetext,
-                             CURSOR_OPT_PARALLEL_OK, params);
-
-        /*
-         * Use a snapshot with an updated command ID to ensure this query sees
-         * results of any previously executed queries.
-         */
-        PushCopiedSnapshot(GetActiveSnapshot());
-        UpdateActiveSnapshotCommandId();
-
-        /* Create a QueryDesc, redirecting output to our tuple receiver */
-        queryDesc = CreateQueryDesc(plan, pstate->p_sourcetext,
-                                    GetActiveSnapshot(), InvalidSnapshot,
-                                    treceiver, params, pstate->p_queryEnv, 0);
-
-        /* call ExecutorStart to prepare the plan for execution */
-        ExecutorStart(queryDesc, 0);
-
-        /* run the plan to completion */
-        ExecutorRun(queryDesc, ForwardScanDirection, 0L);
-
-        /* and clean up */
-        ExecutorFinish(queryDesc);
-        ExecutorEnd(queryDesc);
-
-        FreeQueryDesc(queryDesc);
-
-        PopActiveSnapshot();
+        (void) MysApplyAutocommitAssignment(assignment);
+        (void) MysApplyTimeZoneAssignment(assignment);
+		(void) MysApplyGlobalTimeZoneAssignment(assignment);
     }
+
+    /* Other driver initialization variables retain the established no-op. */
+    (void) pstate;
+    (void) params;
+    (void) isTopLevel;
 }
 
 static void

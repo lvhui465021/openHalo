@@ -1502,6 +1502,10 @@ character_set_collate:
                 {
                     $$ = NULL;
                 }
+            | opt_default COLLATE opt_equal BINARY
+                {
+                    $$ = NULL;
+                }
         ;
 
 
@@ -1530,8 +1534,8 @@ mysql_user_variable:
             MysqlUserVariableName plassign_equals a_expr
                 {
                     ResTarget *result = makeNode(ResTarget);
-                    List *funcName = list_make2(makeString(pstrdup("mysql")),
-                                                makeString(pstrdup("set_user_var")));
+                    List *funcName = list_make2(makeString(pstrdup("pg_catalog")),
+                                                makeString(pstrdup("mys_set_user_var")));
                     List *argList = list_make2(mys_makeStringConst($1, @1), $3);
                     Node *funcCall = (Node *) makeFuncCall(funcName, argList,
 								            			   COERCE_EXPLICIT_CALL,
@@ -1772,7 +1776,7 @@ mysql_system_variable:
                 }
             | LOCAL IDENT plassign_equals on_a_expr
                 {
-                    if (isSystemVariable($2))
+                    if (MysIsSessionVariableSupported($2) || isSystemVariable($2))
                     {
                         ResTarget *result;
                         List *funcName;
@@ -1822,7 +1826,7 @@ mysql_system_variable:
                 }
             | SESSION IDENT plassign_equals on_a_expr
                 {
-                    if (isSystemVariable($2))
+                    if (MysIsSessionVariableSupported($2) || isSystemVariable($2))
                     {
                         ResTarget *result;
                         List *funcName;
@@ -1872,7 +1876,7 @@ mysql_system_variable:
                 }
             | GLOBAL IDENT plassign_equals on_a_expr
                 {
-                    if (isSystemVariable($2))
+                    if (MysIsGlobalVariableSupported($2) || isSystemVariable($2))
                     {
                         ResTarget *result;
                         List *funcName;
@@ -5061,6 +5065,14 @@ opt_collate_clause:
 					n->location = @1;
 					$$ = (Node *) n;
 				}
+			| COLLATE BINARY
+				{
+					CollateClause *n = makeNode(CollateClause);
+					n->arg = NULL;
+					n->collname = list_make1(makeString(pstrdup("binary")));
+					n->location = @1;
+					$$ = (Node *) n;
+				}
 			| COLLATE SCONST            { $$ = NULL; }
 			| /* EMPTY */				{ $$ = NULL; }
 		;
@@ -6121,11 +6133,17 @@ create_table_option:
                     {
                         $$ = NULL;
                     }
-                | opt_default COLLATE opt_equal any_name
-                    {
-                        //$$ = NULL;
-                        $$ = makeDefElem("collate", (Node *)$4, @1);
-                    }
+            | opt_default COLLATE opt_equal any_name
+                {
+                    //$$ = NULL;
+                    $$ = makeDefElem("collate", (Node *)$4, @1);
+                }
+            | opt_default COLLATE opt_equal BINARY
+                {
+                    $$ = makeDefElem("collate",
+                                     (Node *)list_make1(makeString(pstrdup("binary"))),
+                                     @1);
+                }
             ;
 
 opt_comma:
@@ -6482,7 +6500,15 @@ ColConstraint:
 					n->collname = $2;
 					n->location = @1;
 					$$ = (Node *) n;
-                    //$$ = NULL;
+					//$$ = NULL;
+				}
+			| COLLATE BINARY
+				{
+					CollateClause *n = makeNode(CollateClause);
+					n->arg = NULL;
+					n->collname = list_make1(makeString(pstrdup("binary")));
+					n->location = @1;
+					$$ = (Node *) n;
 				}
             | AUTO_INCREMENT
                 {
@@ -24186,6 +24212,3 @@ makeOnClause(Node **expr, JoinExpr *joinExpr)
         joinExpr->quals = NULL;
     }
 }
-
-
-

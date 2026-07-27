@@ -55,6 +55,239 @@ bool needCommitTrx = false;
 bool needStartNewTrx = false;
 bool isStrictTransTablesOn = false;
 
+/*
+ * New session-variable slices must not depend on the historic
+ * mys_informa_schema.base_variables registry below.  That registry is a
+ * migration artifact and is not installed by the current extension.  Keep
+ * the small amount of session state that has real backend semantics here,
+ * in TopMemoryContext, just as the MySQL user-variable store does.
+ */
+static char *mys_session_time_zone = NULL;
+static char *mys_system_time_zone_guc = NULL;
+
+/*
+ * MySQL's global time_zone is a server-wide default for new connections;
+ * existing sessions retain their own current value.  Keep that small piece
+ * of live state independent of the uninstalled historic registry below.
+ */
+typedef struct MysTimeZoneGlobalState
+{
+	slock_t		mutex;
+	char		time_zone[8];
+} MysTimeZoneGlobalState;
+
+static MysTimeZoneGlobalState *mys_global_time_zone = NULL;
+
+static void mys_init_session_time_zone(void);
+static bool mys_parse_time_zone_offset(const char *value, int *hours,
+                                       int *minutes, char *sign);
+
+bool
+MysAutocommitEnabled(void)
+{
+    return autoCommit != 0;
+}
+
+void
+MysSetAutocommit(bool enabled)
+{
+    /* MySQL's SERVER_STATUS_AUTOCOMMIT bit is 0x0002. */
+    autoCommit = enabled ? 0x0002 : 0;
+}
+
+void
+MysInitSessionTimeZone(void)
+{
+	mys_init_session_time_zone();
+}
+
+bool
+MysIsSessionVariableSupported(const char *name)
+{
+    return name != NULL && pg_strcasecmp(name, "time_zone") == 0;
+}
+
+bool
+MysIsGlobalVariableSupported(const char *name)
+{
+	return MysIsSessionVariableSupported(name);
+}
+
+Size
+MysTimeZoneShmemSize(void)
+{
+	return MAXALIGN(sizeof(MysTimeZoneGlobalState));
+}
+
+void
+MysTimeZoneShmemInit(void)
+{
+	bool		found;
+
+	mys_global_time_zone = ShmemInitStruct("MySQL time zone state",
+									   MysTimeZoneShmemSize(), &found);
+	if (!found)
+	{
+		SpinLockInit(&mys_global_time_zone->mutex);
+		strlcpy(mys_global_time_zone->time_zone, "SYSTEM",
+				sizeof(mys_global_time_zone->time_zone));
+	}
+}
+
+char *
+MysGetGlobalTimeZone(void)
+{
+	char	   *value;
+
+	Assert(mys_global_time_zone != NULL);
+	SpinLockAcquire(&mys_global_time_zone->mutex);
+	value = pstrdup(mys_global_time_zone->time_zone);
+	SpinLockRelease(&mys_global_time_zone->mutex);
+	return value;
+}
+
+static void
+mys_init_session_time_zone(void)
+{
+    MemoryContext oldcontext;
+    char       *guc_value;
+
+    if (mys_session_time_zone != NULL)
+        return;
+
+    oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+    guc_value = GetConfigOptionByName("TimeZone", NULL, false);
+    mys_system_time_zone_guc = pstrdup(guc_value);
+    pfree(guc_value);
+    mys_session_time_zone = pstrdup("SYSTEM");
+	{
+		char *global_time_zone = MysGetGlobalTimeZone();
+
+		if (pg_strcasecmp(global_time_zone, "SYSTEM") != 0)
+			MysSetSessionTimeZone(global_time_zone);
+		pfree(global_time_zone);
+	}
+    MemoryContextSwitchTo(oldcontext);
+}
+
+/* MySQL accepts +8:00 as input but reports the canonical +08:00 form. */
+static bool
+mys_parse_time_zone_offset(const char *value, int *hours, int *minutes,
+                           char *sign)
+{
+    const char *colon;
+    int         hour_digits;
+    int         hour = 0;
+    int         minute;
+
+    if (value == NULL || (value[0] != '+' && value[0] != '-'))
+        return false;
+    colon = strchr(value + 1, ':');
+    if (colon == NULL || colon[1] == '\0' || colon[2] == '\0' ||
+        colon[3] != '\0')
+        return false;
+    hour_digits = colon - (value + 1);
+    if (hour_digits < 1 || hour_digits > 2 ||
+        !isdigit((unsigned char) value[1]) ||
+        (hour_digits == 2 && !isdigit((unsigned char) value[2])) ||
+        !isdigit((unsigned char) colon[1]) ||
+        !isdigit((unsigned char) colon[2]))
+        return false;
+
+    for (int i = 0; i < hour_digits; i++)
+        hour = hour * 10 + (value[1 + i] - '0');
+    minute = (colon[1] - '0') * 10 + (colon[2] - '0');
+
+    /* MySQL's documented fixed-offset range is -13:59 through +14:00. */
+    if (minute > 59 || hour > 14 ||
+        (value[0] == '+' && hour == 14 && minute != 0) ||
+        (value[0] == '-' && hour == 14))
+        return false;
+
+    *hours = hour;
+    *minutes = minute;
+    *sign = value[0];
+    return true;
+}
+
+void
+MysSetSessionTimeZone(const char *value)
+{
+    int         hours;
+    int         minutes;
+    char        sign;
+    char        pg_value[16];
+    char        mysql_value[8];
+    MemoryContext oldcontext;
+
+    MysInitSessionTimeZone();
+
+    if (value != NULL && pg_strcasecmp(value, "SYSTEM") == 0)
+    {
+        SetConfigOption("TimeZone", mys_system_time_zone_guc,
+                        PGC_USERSET, PGC_S_SESSION);
+        oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+        pfree(mys_session_time_zone);
+        mys_session_time_zone = pstrdup("SYSTEM");
+        MemoryContextSwitchTo(oldcontext);
+        return;
+    }
+
+    if (!mys_parse_time_zone_offset(value, &hours, &minutes, &sign))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("Unknown or incorrect time zone: '%s'", value)));
+
+    /* PostgreSQL's UTC offset spelling uses the POSIX sign convention. */
+    if (hours == 0 && minutes == 0)
+        strlcpy(pg_value, "UTC", sizeof(pg_value));
+    else
+        snprintf(pg_value, sizeof(pg_value), "UTC%c%02d:%02d",
+                 sign == '+' ? '-' : '+', hours, minutes);
+    snprintf(mysql_value, sizeof(mysql_value), "%c%02d:%02d",
+             sign, hours, minutes);
+
+    SetConfigOption("TimeZone", pg_value, PGC_USERSET, PGC_S_SESSION);
+    oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+    pfree(mys_session_time_zone);
+    mys_session_time_zone = pstrdup(mysql_value);
+    MemoryContextSwitchTo(oldcontext);
+}
+
+void
+MysSetGlobalTimeZone(const char *value)
+{
+	int			hours;
+	int			minutes;
+	char			sign;
+	char			mysql_value[8];
+
+	Assert(mys_global_time_zone != NULL);
+	if (value != NULL && pg_strcasecmp(value, "SYSTEM") == 0)
+		strlcpy(mysql_value, "SYSTEM", sizeof(mysql_value));
+	else
+	{
+		if (!mys_parse_time_zone_offset(value, &hours, &minutes, &sign))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Unknown or incorrect time zone: '%s'", value)));
+		snprintf(mysql_value, sizeof(mysql_value), "%c%02d:%02d",
+				 sign, hours, minutes);
+	}
+
+	SpinLockAcquire(&mys_global_time_zone->mutex);
+	strlcpy(mys_global_time_zone->time_zone, mysql_value,
+			sizeof(mys_global_time_zone->time_zone));
+	SpinLockRelease(&mys_global_time_zone->mutex);
+}
+
+const char *
+MysGetSessionTimeZone(void)
+{
+    MysInitSessionTimeZone();
+    return mys_session_time_zone;
+}
+
 HTAB *globalSystemVars = NULL;
 HTAB *globalSystemVarsLock = NULL;
 
@@ -1641,4 +1874,3 @@ getOSTimeZone(void)
 
     return ret;
 }
-
