@@ -37,14 +37,15 @@ extern void mysql_packet_free(MysPacketState *ps);
 
 /* --- raw I/O (used during the startup exchange) -------------------- */
 
-/* Read exactly one MySQL packet payload into a freshly palloc'd buffer.
+/* Read one complete MySQL message into a freshly palloc'd buffer, reassembling
+ * any 0xffffff-byte protocol fragments.
  * *payload receives the buffer, *len the number of payload bytes.
  * Returns true on success; on EOF or protocol error the caller must
  * close the connection (we ereport a SQL-facing error). */
 extern bool mysql_packet_read(MysPacketState *ps,
                               char **payload, size_t *len);
 
-/* Write a single-packet payload + flush.  seq is reset on first write. */
+/* Write one logical message, splitting it into protocol packets as needed. */
 extern void mysql_packet_write(MysPacketState *ps,
                                const char *payload, size_t len);
 
@@ -88,7 +89,8 @@ extern uint32 mysql_packet_get_client_caps(MysPacketState *ps);
 #define MYSQL_CAP_PROTOCOL_41                0x00000200
 #define MYSQL_CAP_TRANSACTIONS               0x00002000
 #define MYSQL_CAP_MULTI_STATEMENTS           0x00010000
-#define MYSQL_CAP_MULTI_RESULTS              0x00040000
+#define MYSQL_CAP_MULTI_RESULTS              0x00020000
+#define MYSQL_CAP_PS_MULTI_RESULTS           0x00040000
 #define MYSQL_CAP_SECURE_CONNECTION          0x00008000
 #define MYSQL_CAP_PLUGIN_AUTH                0x00080000
 #define MYSQL_CAP_PLUGIN_AUTH_LENENC         0x00200000
@@ -110,9 +112,11 @@ extern uint32 mysql_packet_get_client_caps(MysPacketState *ps);
          MYSQL_CAP_LONG_PASSWORD       | MYSQL_CAP_FOUND_ROWS         |      \
          MYSQL_CAP_LONG_FLAG           | MYSQL_CAP_CONNECT_WITH_DB    |      \
          MYSQL_CAP_PROTOCOL_41         | MYSQL_CAP_TRANSACTIONS       |      \
-         MYSQL_CAP_SECURE_CONNECTION | MYSQL_CAP_MULTI_STATEMENTS | MYSQL_CAP_MULTI_RESULTS |                                      \
+         MYSQL_CAP_SECURE_CONNECTION | MYSQL_CAP_MULTI_STATEMENTS |      \
+         MYSQL_CAP_MULTI_RESULTS | MYSQL_CAP_PS_MULTI_RESULTS |            \
          MYSQL_CAP_PLUGIN_AUTH         | MYSQL_CAP_PLUGIN_AUTH_LENENC |      \
-         MYSQL_CAP_DEPRECATE_EOF | MYSQL_CAP_SESSION_TRACK))
+	 MYSQL_CAP_OPTIONAL_RESULTSET_METADATA | MYSQL_CAP_DEPRECATE_EOF |   \
+	 MYSQL_CAP_SESSION_TRACK))
 
 /*
  * Return the negotiated capability set (server-advertised & client-requested).

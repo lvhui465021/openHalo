@@ -28,7 +28,9 @@
 
 #include "adapter/mysql/mysql_auth.h"
 #include "adapter/mysql/mysql_packet.h"
+#include "libpq/auth.h"
 #include "libpq/crypt.h"
+#include "libpq/hba.h"
 #include "libpq/libpq-be.h"
 #include "libpq/libpq.h"
 #include "libpq/pqcomm.h"           /* pq_getmsgstring, etc. (may borrow)  */
@@ -55,8 +57,8 @@
 #define CLIENT_TRANSACTIONS             0x00002000
 #define CLIENT_SECURE_CONNECTION        0x00008000
 #define CLIENT_MULTI_STATEMENTS         0x00010000
-#define CLIENT_MULTI_RESULTS            0x00040000
-#define CLIENT_PS_MULTI_RESULTS         0x00080000
+#define CLIENT_MULTI_RESULTS            0x00020000
+#define CLIENT_PS_MULTI_RESULTS         0x00040000
 #define CLIENT_PLUGIN_AUTH              0x00080000
 #define CLIENT_PLUGIN_AUTH_LENENC       0x00200000
 #define CLIENT_OPTIONAL_RESULTSET_META  0x00400000
@@ -70,18 +72,18 @@
  * capabilities are masked against this set in the DestReceiver and
  * end_command callbacks.
  */
-#define MYSQL_SERVER_CAPABILITY                                        \
-        ((uint32)MYSQL_CAPABILITY_LO |                                  \
-         ((uint32)MYSQL_CAPABILITY_HI << 16))
-
 #define MYSQL_CAPABILITY_LO   (uint16)(                             \
         CLIENT_LONG_PASSWORD  | CLIENT_FOUND_ROWS    |                 \
         CLIENT_LONG_FLAG      | CLIENT_CONNECT_WITH_DB |               \
         CLIENT_PROTOCOL_41    | CLIENT_TRANSACTIONS   |                \
-        CLIENT_SECURE_CONNECTION | CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS)
+        CLIENT_SECURE_CONNECTION)
 #define MYSQL_CAPABILITY_HI   (uint16)(                             \
+        (CLIENT_MULTI_STATEMENTS >> 16)      |                          \
+        (CLIENT_MULTI_RESULTS >> 16)         |                          \
+        (CLIENT_PS_MULTI_RESULTS >> 16)      |                          \
         (CLIENT_PLUGIN_AUTH >> 16)           |                          \
         (CLIENT_PLUGIN_AUTH_LENENC >> 16)    |                          \
+	(CLIENT_OPTIONAL_RESULTSET_META >> 16) |                       \
         (CLIENT_DEPRECATE_EOF >> 16) | (CLIENT_SESSION_TRACK >> 16))
 
 /* Scramble length: part1 = 8, part2 = 12, total = 20. */
@@ -102,10 +104,19 @@ typedef struct MysAuthState
     uint8       scramble[MYSQL_SCRAMBLE_LEN];   /* 20-byte random challenge */
     char        auth_plugin_data[MYSQL_AUTH_PLUGIN_DATA_LEN];  /* 8+13, NUL-padded */
 
-    /* Saved login-packet fields — verified in authenticate(). */
-    uint8       auth_response[MYSQL_SCRAMBLE_LEN]; /* client's scramble response */
-    size_t      auth_response_len;
-    bool        switched_from_sha2; /* true if auth-switch happened */
+    /*
+     * Saved HandshakeResponse41 fields.  The phase-A exchange must not make
+     * an authentication decision: HBA matching needs catalog access and is
+     * therefore performed by mysql_perform_authentication() after
+     * InitPostgres().
+     */
+    uint8       initial_auth_response[SHA256_DIGEST_LENGTH];
+    size_t      initial_auth_response_len;
+    char       *client_auth_plugin_name;
+
+    /* AuthSwitchResponse for mysql_native_password, if one is required. */
+    uint8       native_auth_response[MYSQL_SCRAMBLE_LEN];
+    size_t      native_auth_response_len;
     /* port->user_name and port->compat_database_name already set. */
 } MysAuthState;
 
@@ -386,6 +397,14 @@ mysql_verify_login(MysPacketState *ps, Port *port)
     if ((client_cap & CLIENT_PLUGIN_AUTH) && remaining > 0)
     {
         size_t plen = strnlen(pos_ptr, remaining);
+
+        if (plen >= remaining)
+        {
+            mysql_packet_write_err(ps, 1043, "08S01",
+                                   "Bad handshake: unterminated authentication plugin name");
+            pfree(payload);
+            return STATUS_ERROR;
+        }
         if (plen > 0)
             auth_plugin_name = pos_ptr;
     }
@@ -399,146 +418,19 @@ mysql_verify_login(MysPacketState *ps, Port *port)
         return STATUS_ERROR;
     }
 
-    if (auth_response == NULL || auth_response_len == 0)
-    {
-        mysql_packet_write_err(ps, 1045, "28000",
-                               "Access denied for user '%s' (empty password)",
-                               username);
-        pfree(payload);
-        return STATUS_ERROR;
-    }
-
     /*
-     * MySQL 8.0+ clients default to caching_sha2_password.  We implement
-     * the auth-switch protocol: route SHA2 requests to mysql_native_password
-     * via an Auth Switch Request packet (0xFE header).  This triggers the
-     * client's auth-switch state machine, matching the real MySQL 8.0 flow
-     * where the server lacks a cached SHA2 hash and redirects to native.
+     * Keep the wire exchange deliberately free of authentication decisions.
+     * HBA matching happens after InitPostgres(), when catalog access is
+     * available.  In particular, do not send AuthSwitchRequest here: an HBA
+     * rejection must be the first response to the HandshakeResponse41.
      */
-    if (auth_plugin_name != NULL &&
-        strcmp(auth_plugin_name, "caching_sha2_password") == 0)
-    {
-        auth->switched_from_sha2 = true;
+    if (auth_response_len <= sizeof(auth->initial_auth_response))
+        memcpy(auth->initial_auth_response, auth_response, auth_response_len);
+    auth->initial_auth_response_len = auth_response_len;
 
-        /*
-         * Build Auth Switch Request:
-         *   0xFE marker + plugin_name(NUL) + plugin_data(20-byte scramble + NUL)
-         */
-        char switch_pkt[64];
-        int  sw_pos = 0;
-        const char *target_plugin = "mysql_native_password";
-        int  target_plugin_len = (int) strlen(target_plugin);
-
-        switch_pkt[sw_pos++] = (char) 0xFE;    /* auth-switch marker */
-        memcpy(switch_pkt + sw_pos, target_plugin, target_plugin_len);
-        sw_pos += target_plugin_len;
-        switch_pkt[sw_pos++] = '\0';
-        /*
-         * Auth plugin data for mysql_native_password: 20 bytes of
-         * random scramble + trailing NUL = 21 bytes (SCRAMBLE_LENGTH+1).
-         * MySQL server plugin sends scramble[20] followed by NUL[1],
-         * and the client takes the first 20 bytes as the scramble.
-         * Verified in mysql-server 8.4.10 source:
-         *   sql/auth/mysql_native_password.cc:222-223
-         *   write_packet(mpvio, mpvio->scramble, SCRAMBLE_LENGTH + 1)
-         */
-        memcpy(switch_pkt + sw_pos, auth->scramble, MYSQL_SCRAMBLE_LEN);
-        sw_pos += MYSQL_SCRAMBLE_LEN;
-        switch_pkt[sw_pos++] = '\0';
-
-        /*
-         * The handshake sequence is shared: greeting=0, login=1,
-         * auth-switch=2.  Set server_seq to 2 before writing the
-         * Auth Switch Request so the client receives it at the
-         * sequence number it expects after sending the login at seq 1.
-         */
-        mysql_packet_set_server_seq(ps, 2);
-
-        mysql_packet_write(ps, switch_pkt, (size_t) sw_pos);
-
-        /*
-         * caching_sha2_password sends initial auth at seq 1, native
-         * response at seq 3 after auth-switch.  Sync ps->seq.
-         */
-        mysql_packet_set_seq(ps, 3);
-
-        /*
-         * After the Auth Switch Request (server seq 2), the client
-         * responds with its native-password auth at seq 3.
-         * Set ps->seq to 3 so mysql_packet_read accepts it.
-         */
-        mysql_packet_set_seq(ps, 3);
-
-        /* Read the client's native-password response to our switch request */
-        {
-            char       *sw_payload;
-            size_t      sw_len;
-            const char *sw_auth = NULL;
-            size_t      sw_auth_len = 0;
-            const char *sw_pos_ptr;
-            size_t      sw_rem;
-
-            if (!mysql_packet_read(ps, &sw_payload, &sw_len))
-            {
-                pfree(payload);
-                return STATUS_ERROR;
-            }
-
-            /* Parse auth response: skip capabilities(4) + max_pkt(4) + charset(1) + reserved(23) + username(NUL) */
-            if (sw_len < 32) { pfree(sw_payload); pfree(payload); return STATUS_ERROR; }
-            sw_pos_ptr = sw_payload + 32;
-            sw_rem = sw_len - 32;
-
-            /* Skip username (NUL-terminated) */
-            {
-                size_t ulen = strnlen(sw_pos_ptr, sw_rem);
-                if (ulen >= sw_rem) { pfree(sw_payload); pfree(payload); return STATUS_ERROR; }
-                sw_pos_ptr += ulen + 1;
-                sw_rem -= ulen + 1;
-            }
-
-            /* Auth response (length-encoded) */
-            if (sw_rem < 1) { pfree(sw_payload); pfree(payload); return STATUS_ERROR; }
-            {
-                uint8 sw_auth_len_byte = (uint8) *sw_pos_ptr;
-                sw_pos_ptr += 1;
-                sw_rem -= 1;
-                if (sw_rem < sw_auth_len_byte) { pfree(sw_payload); pfree(payload); return STATUS_ERROR; }
-                sw_auth = sw_pos_ptr;
-                sw_auth_len = sw_auth_len_byte;
-            }
-
-            /* Save the native-password auth response */
-            if (sw_auth_len > MYSQL_SCRAMBLE_LEN)
-                sw_auth_len = MYSQL_SCRAMBLE_LEN;
-            memcpy(auth->auth_response, sw_auth, sw_auth_len);
-            auth->auth_response_len = sw_auth_len;
-
-            pfree(sw_payload);
-        }
-
-        /*
-         * After the auth switch: client sent at seq 3, server must
-         * respond with OK at seq 4.  Position server_seq for
-         * mysql_perform_authentication.
-         */
-        mysql_packet_set_server_seq(ps, 4);
-    }
-    else if (auth_plugin_name != NULL &&
-             strcmp(auth_plugin_name, "mysql_native_password") != 0)
-    {
-        mysql_packet_write_err(ps, 1045, "28000",
-                               "Authentication plugin '%s' is not supported",
-                               auth_plugin_name);
-        pfree(payload);
-        return STATUS_ERROR;
-    }
-
-    /* Save auth response for the authenticate callback. */
-    if (auth_response_len > MYSQL_SCRAMBLE_LEN)
-        auth_response_len = MYSQL_SCRAMBLE_LEN;
-    memcpy(auth->auth_response, auth_response, auth_response_len);
-    auth->auth_response_len = auth_response_len;
+    if (auth_plugin_name != NULL)
+        auth->client_auth_plugin_name =
+            MemoryContextStrdup(TopMemoryContext, auth_plugin_name);
 
     /* Set port fields — these are needed before InitPostgres().
      * port->database_name must always be set because BackendInitialize
@@ -575,47 +467,125 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
     MysAuthState *auth = (MysAuthState *) mysql_packet_get_auth_state(ps);
     char         *shadow_pass;
     const char   *logdetail = NULL;
+    const char   *plugin_name;
+    const uint8  *auth_response;
+    size_t        auth_response_len;
     int           auth_result;
 
 
     if (auth == NULL)
     {
-        mysql_packet_write_err(ps, 1045, "28000",
-                               "Internal error: no auth state");
         ereport(FATAL,
                 (errcode(ERRCODE_PROTOCOL_VIOLATION),
                  errmsg("MySQL authentication failed: no auth state")));
     }
 
+    /*
+     * HBA matching intentionally occurs here, after InitPostgres().  The
+     * MySQL listener supports only the PostgreSQL md5 HBA method, because
+     * the stored mysql_native_password verifier is a challenge response and
+     * cannot faithfully implement trust, SCRAM, password, or external auth.
+     */
+    hba_getauthmethod((hbaPort *) port);
+    CHECK_FOR_INTERRUPTS();
+
+    switch (port->hba->auth_method)
+    {
+        case uaMD5:
+            break;
+
+        case uaReject:
+        case uaImplicitReject:
+            ereport(FATAL,
+                    (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+                     errmsg("MySQL authentication failed for user \"%s\"",
+                            port->user_name)));
+            break;
+
+        default:
+            ereport(FATAL,
+                    (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+                     errmsg("MySQL authentication method \"%s\" is not supported",
+                            hba_authname(port->hba->auth_method))));
+            break;
+    }
+
+    plugin_name = auth->client_auth_plugin_name;
+    if (plugin_name == NULL || strcmp(plugin_name, "mysql_native_password") == 0)
+    {
+        if (auth->initial_auth_response_len != MYSQL_SCRAMBLE_LEN)
+            ereport(FATAL,
+                    (errcode(ERRCODE_INVALID_PASSWORD),
+                     errmsg("MySQL authentication failed for user \"%s\"",
+                            port->user_name)));
+
+        auth_response = auth->initial_auth_response;
+        auth_response_len = auth->initial_auth_response_len;
+    }
+    else if (strcmp(plugin_name, "caching_sha2_password") == 0)
+    {
+        char        switch_pkt[64];
+        char       *switch_response;
+        size_t      switch_response_len;
+        int         switch_pos = 0;
+        const char *target_plugin = "mysql_native_password";
+        size_t      target_plugin_len = strlen(target_plugin);
+
+        /*
+         * The server's AuthSwitchRequest is seq 2.  MySQL 8.4.10's native
+         * plugin receives exactly scramble[20] followed by one trailing NUL.
+         */
+        switch_pkt[switch_pos++] = (char) 0xFE;
+        memcpy(switch_pkt + switch_pos, target_plugin, target_plugin_len);
+        switch_pos += target_plugin_len;
+        switch_pkt[switch_pos++] = '\0';
+        memcpy(switch_pkt + switch_pos, auth->scramble, MYSQL_SCRAMBLE_LEN);
+        switch_pos += MYSQL_SCRAMBLE_LEN;
+        switch_pkt[switch_pos++] = '\0';
+
+        mysql_packet_set_server_seq(ps, 2);
+        mysql_packet_write(ps, switch_pkt, (size_t) switch_pos);
+        mysql_packet_set_seq(ps, 3);
+
+        if (!mysql_packet_read(ps, &switch_response, &switch_response_len))
+            ereport(FATAL,
+                    (errcode(ERRCODE_PROTOCOL_VIOLATION),
+                     errmsg("could not read MySQL AuthSwitchResponse")));
+
+        /* Client seq 3 was consumed; all following server replies are seq 4. */
+        mysql_packet_set_server_seq(ps, 4);
+        if (switch_response_len != MYSQL_SCRAMBLE_LEN)
+        {
+            pfree(switch_response);
+            ereport(FATAL,
+                    (errcode(ERRCODE_PROTOCOL_VIOLATION),
+                     errmsg("invalid mysql_native_password AuthSwitchResponse length")));
+        }
+
+        memcpy(auth->native_auth_response, switch_response, MYSQL_SCRAMBLE_LEN);
+        auth->native_auth_response_len = MYSQL_SCRAMBLE_LEN;
+        pfree(switch_response);
+        auth_response = auth->native_auth_response;
+        auth_response_len = auth->native_auth_response_len;
+    }
+    else
+        ereport(FATAL,
+                (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+                 errmsg("MySQL authentication plugin \"%s\" is not supported",
+                        plugin_name)));
+
     shadow_pass = get_role_password(port->user_name, &logdetail);
     if (shadow_pass == NULL)
     {
-        mysql_packet_write_err(ps, 1045, "28000",
-                               "Access denied for user '%s' (role does not exist)",
-                               port->user_name);
         ereport(FATAL,
                 (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
                  errmsg("MySQL authentication failed for user \"%s\"",
                         port->user_name)));
     }
 
-    /*
-     * For auth-switch: the client uses auth_plugin_data[0:20] as scramble
-     * (includes the NUL separator for 21-byte greeting format).
-     * For direct native auth: the client uses auth->scramble (20 bytes
-     * without NUL, as sent in the greeting).
-     *
-     * Distinguish by checking if auth_switch was triggered (auth_plugin_name
-     * was set during the switch flow, indicating we redirected from SHA2).
-     */
-    /*
-     * Both direct and auth-switch paths use the same 20-byte scramble.
-     * The auth switch sends it as scramble(20) + NUL(1) = 21 bytes;
-     * the client takes the first 20 bytes (identical to auth->scramble).
-     */
     auth_result = mysql_native_password_verify(port->user_name, shadow_pass,
-                                                auth->auth_response,
-                                                auth->auth_response_len,
+                                                auth_response,
+                                                auth_response_len,
                                                 auth->scramble,
                                                 MYSQL_SCRAMBLE_LEN,
                                                 &logdetail);
@@ -623,9 +593,6 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
 
     if (auth_result != STATUS_OK)
     {
-        mysql_packet_write_err(ps, 1045, "28000",
-                               "Access denied for user '%s' (password mismatch)",
-                               port->user_name);
         ereport(FATAL,
                 (errcode(ERRCODE_INVALID_PASSWORD),
                  errmsg("MySQL authentication failed for user \"%s\": password mismatch",
@@ -640,8 +607,12 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
      *
      * Sequence numbers during handshake are shared: greeting=0, login=1,
      * OK=2 (or greeting=0, login=1, auth-switch=2, client=3, OK=4).
-     * server_seq is already positioned correctly by mysql_verify_login.
+     * server_seq is 2 for direct native authentication and 4 after a switch.
      */
+    set_authn_id(port, port->user_name);
+    if (ClientAuthentication_hook)
+        (*ClientAuthentication_hook) (port, STATUS_OK);
+
     {
         char ok[7];
         int  okpos = 0;
@@ -668,6 +639,15 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
      */
     mysql_packet_reset_seq(ps);
     mysql_packet_set_server_seq(ps, 1);
+
+    explicit_bzero(auth->initial_auth_response,
+                   sizeof(auth->initial_auth_response));
+    explicit_bzero(auth->native_auth_response,
+                   sizeof(auth->native_auth_response));
+    if (auth->client_auth_plugin_name != NULL)
+        pfree(auth->client_auth_plugin_name);
+    pfree(auth);
+    mysql_packet_set_auth_state(ps, NULL);
 
     /*
      * The MysPacketState (port->protocol_state) stays alive for the
