@@ -16,6 +16,7 @@
 #include "libpq/libpq.h"
 #include "miscadmin.h"
 #include "utils/elog.h"
+#include "utils/memutils.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -29,7 +30,6 @@ struct MysPacketState
     Port       *port;               /* MyProcPort (socket, secure_read/write) */
     uint8       seq;                /* next expected client sequence number    */
     uint8       server_seq;         /* next server sequence number to send     */
-    bool        greeting_sent;      /* has the server greeting been emitted?   */
     void       *auth_state;         /* MysAuthState during handshake, else NULL */
     uint32      client_capabilities; /* client capability flags from login     */
 };
@@ -47,7 +47,6 @@ mysql_packet_create(Port *port)
     ps->port = port;
     ps->seq = 0;           /* client starts at seq 0 after server greeting   */
     ps->server_seq = 0;    /* greeting is seq 0                              */
-    ps->greeting_sent = false;
 
     return ps;
 }
@@ -68,54 +67,85 @@ mysql_packet_read(MysPacketState *ps, char **payload, size_t *len)
 {
     uint8       header[MYSQL_PACKET_HEADER_SIZE];
     ssize_t     nread;
+    size_t      bytes_read;
     uint32      payload_len;
     uint8       pkt_seq;
-    char       *buf;
-    Port       *port = MyProcPort;
+    char       *buf = NULL;
+    size_t      total_len = 0;
+    Port       *port = ps->port;
 
-    /* read 4-byte header (retry on EINTR/EAGAIN in non-blocking mode) */
-    do {
-        nread = secure_read(port, header, MYSQL_PACKET_HEADER_SIZE);
-    } while (nread < 0 && (errno == EINTR || errno == EAGAIN));
-    if (nread != MYSQL_PACKET_HEADER_SIZE)
+    /*
+     * A logical MySQL message is split into 0xffffff-byte packets.  The
+     * terminating packet is shorter than that limit; an exact multiple is
+     * terminated by an empty packet.  Keep the packet sequence advancing for
+     * every fragment, but return one contiguous command payload to callers.
+     */
+    for (;;)
     {
-        if (nread < 0)
-            ereport(COMMERROR,
-                    (errcode_for_socket_access(),
-                     errmsg("could not read MySQL packet header: %m")));
-        return false;
-    }
-
-    payload_len = (uint32) header[0]
-                | ((uint32) header[1] << 8)
-                | ((uint32) header[2] << 16);
-    pkt_seq = header[3];
-
-    if (pkt_seq != ps->seq && !ps->greeting_sent)
-    {
-        /* Before greeting is sent, we are reading the login packet;
-         * the client starts its sequence at 0.  Accept either. */
-        ps->seq = pkt_seq;
-    }
-    else if (pkt_seq != ps->seq)
-    {
-        ereport(COMMERROR,
-                (errmsg("MySQL packet sequence number mismatch: expected %u, got %u",
-                        ps->seq, pkt_seq)));
-        return false;
-    }
-
-    ps->seq = (ps->seq + 1) & 0xFF;
-
-    /* allocate and read payload */
-    buf = (char *) palloc(payload_len + 1);
-    if (payload_len > 0)
-    {
-        do {
-            nread = secure_read(port, buf, payload_len);
-        } while (nread < 0 && (errno == EINTR || errno == EAGAIN));
-        if (nread != (ssize_t) payload_len)
+        /* secure_read() is allowed to return a short read. */
+        bytes_read = 0;
+        while (bytes_read < MYSQL_PACKET_HEADER_SIZE)
         {
+            do {
+                nread = secure_read(port, header + bytes_read,
+                                    MYSQL_PACKET_HEADER_SIZE - bytes_read);
+            } while (nread < 0 && (errno == EINTR || errno == EAGAIN));
+            if (nread > 0)
+            {
+                bytes_read += (size_t) nread;
+                continue;
+            }
+            if (nread < 0)
+                ereport(COMMERROR,
+                        (errcode_for_socket_access(),
+                         errmsg("could not read MySQL packet header: %m")));
+            if (buf != NULL)
+                pfree(buf);
+            return false;
+        }
+
+        payload_len = (uint32) header[0]
+                    | ((uint32) header[1] << 8)
+                    | ((uint32) header[2] << 16);
+        pkt_seq = header[3];
+
+        if (pkt_seq != ps->seq)
+        {
+            ereport(COMMERROR,
+                    (errmsg("MySQL packet sequence number mismatch: expected %u, got %u",
+                            ps->seq, pkt_seq)));
+            if (buf != NULL)
+                pfree(buf);
+            return false;
+        }
+        ps->seq = (ps->seq + 1) & 0xFF;
+
+        if ((size_t) payload_len > MaxAllocSize - total_len - 1)
+        {
+            ereport(COMMERROR,
+                    (errmsg("MySQL packet payload is too large")));
+            if (buf != NULL)
+                pfree(buf);
+            return false;
+        }
+        if (buf == NULL)
+            buf = palloc((size_t) payload_len + 1);
+        else
+            buf = repalloc(buf, total_len + (size_t) payload_len + 1);
+
+        bytes_read = 0;
+        while (bytes_read < payload_len)
+        {
+            do {
+                nread = secure_read(port, buf + total_len + bytes_read,
+                                    payload_len - bytes_read);
+            } while (nread < 0 && (errno == EINTR || errno == EAGAIN));
+            if (nread > 0)
+            {
+                bytes_read += (size_t) nread;
+                continue;
+            }
+
             pfree(buf);
             if (nread < 0)
                 ereport(COMMERROR,
@@ -123,11 +153,17 @@ mysql_packet_read(MysPacketState *ps, char **payload, size_t *len)
                          errmsg("could not read MySQL packet payload: %m")));
             return false;
         }
-    }
-    buf[payload_len] = '\0';
+        total_len += payload_len;
 
+        if (payload_len < MYSQL_MAX_PAYLOAD_LENGTH)
+            break;
+    }
+
+    /* The server response continues the same command packet sequence. */
+    ps->server_seq = ps->seq;
+    buf[total_len] = '\0';
     *payload = buf;
-    *len = (size_t) payload_len;
+    *len = total_len;
     return true;
 }
 
@@ -140,7 +176,8 @@ mysql_write_raw(MysPacketState *ps, const char *payload, size_t len)
 {
     uint8       header[MYSQL_PACKET_HEADER_SIZE];
     ssize_t     written;
-    Port       *port = MyProcPort;
+    size_t      bytes_written;
+    Port       *port = ps->port;
 
     header[0] = (uint8) (len & 0xFF);
     header[1] = (uint8) ((len >> 8) & 0xFF);
@@ -149,19 +186,37 @@ mysql_write_raw(MysPacketState *ps, const char *payload, size_t len)
 
     ps->server_seq = (ps->server_seq + 1) & 0xFF;
 
-    do {
-        written = secure_write(port, header, MYSQL_PACKET_HEADER_SIZE);
-    } while (written < 0 && (errno == EINTR || errno == EAGAIN));
-    if (written != MYSQL_PACKET_HEADER_SIZE)
+    bytes_written = 0;
+    while (bytes_written < MYSQL_PACKET_HEADER_SIZE)
+    {
+        do {
+            written = secure_write(port, header + bytes_written,
+                                   MYSQL_PACKET_HEADER_SIZE - bytes_written);
+        } while (written < 0 && (errno == EINTR || errno == EAGAIN));
+        if (written > 0)
+        {
+            bytes_written += (size_t) written;
+            continue;
+        }
         goto write_fail;
+    }
 
     if (len > 0)
     {
-        do {
-            written = secure_write(port, payload, len);
-        } while (written < 0 && (errno == EINTR || errno == EAGAIN));
-        if (written != (ssize_t) len)
+        bytes_written = 0;
+        while (bytes_written < len)
+        {
+            do {
+                written = secure_write(port, payload + bytes_written,
+                                       len - bytes_written);
+            } while (written < 0 && (errno == EINTR || errno == EAGAIN));
+            if (written > 0)
+            {
+                bytes_written += (size_t) written;
+                continue;
+            }
             goto write_fail;
+        }
     }
 
     return;
@@ -176,6 +231,17 @@ write_fail:
 void
 mysql_packet_write(MysPacketState *ps, const char *payload, size_t len)
 {
+    /*
+     * Mirror mysql_packet_read(): every 0xffffff-byte fragment gets its own
+     * header/sequence number, and an exact multiple is followed by an empty
+     * terminator packet.
+     */
+    while (len >= MYSQL_MAX_PAYLOAD_LENGTH)
+    {
+        mysql_write_raw(ps, payload, MYSQL_MAX_PAYLOAD_LENGTH);
+        payload += MYSQL_MAX_PAYLOAD_LENGTH;
+        len -= MYSQL_MAX_PAYLOAD_LENGTH;
+    }
     mysql_write_raw(ps, payload, len);
 }
 
@@ -191,7 +257,7 @@ mysql_packet_write_ok(MysPacketState *ps,
      * (unused in the framing itself) — kept for API compatibility.
      */
     (void) header_byte;
-    mysql_write_raw(ps, payload, len);
+    mysql_packet_write(ps, payload, len);
 }
 
 void

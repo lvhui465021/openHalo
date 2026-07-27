@@ -25,11 +25,9 @@
 #include "parser/analyze.h"
 #include "parser/parse_type.h"
 #include "parser/parser.h"
+#include "parser/parsereng.h"
 #include "rewrite/rewriteHandler.h"
 #include "tcop/utility.h"
-
-extern void mys_setCurrentPreStmtColumnInfo(int currentPreStmtColumnIndex,
-											 Oid currentPreStmtColumnType);
 
 static bool mysUtilityCanPrepare(Node *parsetree);
 
@@ -101,7 +99,17 @@ mys_PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
         /* mys_gram.y保证不会到这里 */
     }
 
-    raw_parsetree_list = raw_parser(prepareStmt, RAW_PARSE_DEFAULT);
+	/*
+	 * The SQL text carried by MySQL PREPARE is MySQL dialect text.  In
+	 * particular, '?' is a MySQL parameter marker, so parsing it through the
+	 * standard PostgreSQL entry point loses the parameter before analysis.
+	 */
+	raw_parsetree_list = GetMySQLParserRoutine()->raw_parse(prepareStmt,
+																 RAW_PARSE_DEFAULT);
+	if (list_length(raw_parsetree_list) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("cannot prepare multiple statements")));
 	rawstmt = (RawStmt *)linitial(raw_parsetree_list);
 	rawstmt->stmt_location = stmt_location;
 	rawstmt->stmt_len = stmt_len;
@@ -110,7 +118,7 @@ mys_PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
 	 * Create the CachedPlanSource before we do parse analysis, since it needs
 	 * to see the unmodified raw parse tree.
 	 */
-	plansource = CreateCachedPlan(rawstmt, pstate->p_sourcetext,
+	plansource = CreateCachedPlan(rawstmt, prepareStmt,
 								  CMD_UNKNOWN);
 
 	/* Transform list of TypeNames to array of type OIDs */
@@ -137,8 +145,10 @@ mys_PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
 	 * passed in from above us will not be visible to it), allowing
 	 * information about unknown parameters to be deduced from context.
 	 */
-	query = parse_analyze_varparams(rawstmt, pstate->p_sourcetext,
-																	&argtypes, &nargs, pstate->p_queryEnv);
+	query = parse_analyze_varparams_with_routine(rawstmt, prepareStmt,
+																						 &argtypes, &nargs,
+																						 pstate->p_queryEnv,
+																						 GetMySQLParserRoutine());
     plansource->commandTag = CreateCommandTag((Node *)query);
 
 	/*
@@ -161,21 +171,6 @@ mys_PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
 	switch (query->commandType)
 	{
 		case CMD_SELECT:
-			{
-				int attIndex = 0;
-				ListCell *lc;
-
-				foreach (lc, query->targetList)
-				{
-					TargetEntry *tle = lfirst(lc);
-
-					if (tle->resjunk)
-						continue;
-					mys_setCurrentPreStmtColumnInfo(attIndex, exprType((Node *) tle->expr));
-					attIndex++;
-				}
-			}
-			break;
 		case CMD_INSERT:
 		case CMD_UPDATE:
 		case CMD_DELETE:
@@ -265,12 +260,4 @@ mysUtilityCanPrepare(Node *parsetree)
         default:
             return false;
     }
-}
-
-/* M3 stub: not yet migrated from UDB-TX */
-void
-mys_setCurrentPreStmtColumnInfo(int currentPreStmtColumnIndex,
-                                 Oid currentPreStmtColumnType)
-{
-    /* stub: prepared statement column metadata not yet implemented */
 }

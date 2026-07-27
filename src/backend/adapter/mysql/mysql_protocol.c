@@ -16,21 +16,34 @@
 #include "postgres.h"
 
 #include "access/printtup.h"
+#include "access/relation.h"
 #include "access/xact.h"
 #include "adapter/mysql/mysql_auth.h"
 #include "adapter/mysql/mysql_command.h"
 #include "adapter/mysql/mysql_packet.h"
 #include "adapter/mysql/mysql_protocol.h"
+#include "adapter/mysql/mysql_stmt.h"
+#include "adapter/mysql/systemVar.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_type.h"
 #include "libpq/libpq-be.h"
 #include "libpq/libpq.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/mysql/mys_parsenodes.h"
+#include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
 #include "parser/parsereng.h"
 #include "postmaster/protocol_routine.h"
+#include "tcop/mysql/mys_utility.h"
+#include "tcop/tcopprot.h"
 #include "tcop/dest.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/guc.h"
+#include "utils/syscache.h"
 
 #include <string.h>
 
@@ -49,7 +62,7 @@ static void mysql_comm_reset(void);
 static bool mysql_is_reading_msg(void);
 static void mysql_send_backend_key_data_noop(int pid, const uint8 *key,
                                               int keylen);
-static void mysql_session_initialize_noop(Port *port);
+static void mysql_session_initialize(Port *port);
 static void mysql_set_remote_dest_receiver_params(DestReceiver *receiver,
                                                    struct PortalData *portal);
 
@@ -62,6 +75,16 @@ static void mysql_send_ready_for_query(CommandDest dest);
 
 static void mysql_send_error(ErrorData *edata);
 static void mysql_report_parameter_status(const char *name, const char *value);
+static int mysql_write_lenenc_uint64(char *buf, uint64 value);
+static void mysql_field_list(StringInfo inBuf);
+static void mysql_set_option(StringInfo inBuf);
+static bool mysql_allow_multi_statements(void);
+static bool mysql_simple_query_statement_ends_xact(void);
+static void mysql_set_simple_query_more_results(bool more);
+static void mysql_before_simple_query_statement(Node *stmt);
+
+/* State for the current result within one COM_QUERY message. */
+static bool mysql_simple_query_more_results = false;
 
 /* ----------------------------------------------------------------
  *    Per-connection packet state accessor
@@ -71,6 +94,377 @@ static inline MysPacketState *
 mysql_ps(void)
 {
     return (MysPacketState *) MyProcPort->protocol_state;
+}
+
+static uint16
+mysql_server_status(uint16 extra_status)
+{
+	uint16		status = 0;
+
+	if (MysAutocommitEnabled())
+		status |= 0x0002; /* SERVER_STATUS_AUTOCOMMIT */
+	if (IsTransactionBlock())
+		status |= 0x0001; /* SERVER_STATUS_IN_TRANS */
+	if (mysql_simple_query_more_results)
+		status |= 0x0008; /* SERVER_MORE_RESULTS_EXISTS */
+	return status | extra_status;
+}
+
+static bool
+mysql_allow_multi_statements(void)
+{
+	return (mysql_negotiated_caps(mysql_ps()) & MYSQL_CAP_MULTI_STATEMENTS) != 0;
+}
+
+static bool
+mysql_simple_query_statement_ends_xact(void)
+{
+	/*
+	 * Always complete the current command.  When autocommit is off, the
+	 * explicit PG18 block created lazily below remains open across commands.
+	 */
+	return true;
+}
+
+static void
+mysql_set_simple_query_more_results(bool more)
+{
+	mysql_simple_query_more_results = more;
+}
+
+static bool
+mysql_statement_starts_autocommit_off_transaction(Node *stmt)
+{
+	if (IsA(stmt, InsertStmt) || IsA(stmt, UpdateStmt) ||
+		IsA(stmt, DeleteStmt) || IsA(stmt, MergeStmt))
+		return true;
+	if (IsA(stmt, SelectStmt))
+		return castNode(SelectStmt, stmt)->fromClause != NIL;
+	return false;
+}
+
+static void
+mysql_before_simple_query_statement(Node *stmt)
+{
+	if (IsA(stmt, TransactionStmt))
+	{
+		TransactionStmt *xact = castNode(TransactionStmt, stmt);
+
+		/*
+		 * MySQL BEGIN commits an active autocommit=0 transaction before it
+		 * starts the new explicit transaction.  Finish that PG18 command here
+		 * so the normal utility handler can safely call BeginTransactionBlock.
+		 */
+		if (!MysAutocommitEnabled() && IsTransactionBlock() &&
+			(xact->kind == TRANS_STMT_BEGIN || xact->kind == TRANS_STMT_START))
+		{
+			(void) EndTransactionBlock(false);
+			ProtocolFinishCommand();
+			ProtocolStartCommand();
+		}
+		return;
+	}
+
+	/* SET itself only changes session state; the first DML/read starts it. */
+	if (!MysAutocommitEnabled() && !IsTransactionBlock() &&
+		!IsA(stmt, MysVariableSetStmt) &&
+		mysql_statement_starts_autocommit_off_transaction(stmt))
+		BeginTransactionBlock();
+}
+
+/* COM_SET_OPTION only controls CLIENT_MULTI_STATEMENTS on this protocol. */
+static void
+mysql_set_option(StringInfo inBuf)
+{
+	uint16		option;
+	uint32		caps;
+	uint16		status;
+
+	if (inBuf->len != 2)
+		ereport(ERROR,
+			(errcode(ERRCODE_PROTOCOL_VIOLATION),
+			 errmsg("invalid MySQL COM_SET_OPTION packet")));
+	option = (uint16) (unsigned char) inBuf->data[0] |
+		((uint16) (unsigned char) inBuf->data[1] << 8);
+	caps = mysql_packet_get_client_caps(mysql_ps());
+	if (option == 0) /* MYSQL_OPTION_MULTI_STATEMENTS_ON */
+		caps |= MYSQL_CAP_MULTI_STATEMENTS;
+	else if (option == 1) /* MYSQL_OPTION_MULTI_STATEMENTS_OFF */
+		caps &= ~MYSQL_CAP_MULTI_STATEMENTS;
+	else
+		ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("unsupported MySQL COM_SET_OPTION value %u", option)));
+	mysql_packet_set_client_caps(mysql_ps(), caps);
+	status = mysql_server_status(0);
+	if (mysql_negotiated_caps(mysql_ps()) & MYSQL_CAP_DEPRECATE_EOF)
+	{
+		char		eof_ok[7] = {0xfe, 0x00, 0x00,
+			(char) (status & 0xff), (char) (status >> 8), 0x00, 0x00};
+
+		mysql_packet_write(mysql_ps(), eof_ok, sizeof(eof_ok));
+	}
+	else
+	{
+		char		eof[5] = {0xfe, 0x00, 0x00,
+			(char) (status & 0xff), (char) (status >> 8)};
+
+		mysql_packet_write(mysql_ps(), eof, sizeof(eof));
+	}
+	pq_flush();
+	mysql_packet_reset_seq(mysql_ps());
+	mysql_packet_set_server_seq(mysql_ps(), 1);
+}
+
+/* MySQL length-encoded integer used by OK affected_rows fields. */
+static int
+mysql_write_lenenc_uint64(char *buf, uint64 value)
+{
+	int			pos = 0;
+
+	if (value < 251)
+		buf[pos++] = (char) value;
+	else if (value <= UINT16_MAX)
+	{
+		buf[pos++] = (char) 0xfc;
+		buf[pos++] = (char) (value & 0xff);
+		buf[pos++] = (char) ((value >> 8) & 0xff);
+	}
+	else if (value <= UINT32_MAX)
+	{
+		buf[pos++] = (char) 0xfd;
+		buf[pos++] = (char) (value & 0xff);
+		buf[pos++] = (char) ((value >> 8) & 0xff);
+		buf[pos++] = (char) ((value >> 16) & 0xff);
+	}
+	else
+	{
+		buf[pos++] = (char) 0xfe;
+		for (int i = 0; i < 8; i++)
+			buf[pos++] = (char) ((value >> (i * 8)) & 0xff);
+	}
+	return pos;
+}
+
+static bool
+mysql_field_name_matches(const char *name, const char *pattern)
+{
+	/* MySQL FIELD_LIST uses SQL LIKE wildcards, with backslash escaping. */
+	if (*pattern == '\0')
+		return true;
+	if (*pattern == '\\')
+		return pattern[1] != '\0' && *name != '\0' &&
+			pg_tolower((unsigned char) *name) == pg_tolower((unsigned char) pattern[1]) &&
+			mysql_field_name_matches(name + 1, pattern + 2);
+	if (*pattern == '%')
+		return mysql_field_name_matches(name, pattern + 1) ||
+			(*name != '\0' && mysql_field_name_matches(name + 1, pattern));
+	if (*pattern == '_')
+		return *name != '\0' && mysql_field_name_matches(name + 1, pattern + 1);
+	return *name != '\0' &&
+		pg_tolower((unsigned char) *name) == pg_tolower((unsigned char) *pattern) &&
+		mysql_field_name_matches(name + 1, pattern + 1);
+}
+
+static uint8
+mysql_field_mysql_type(Oid typid)
+{
+	HeapTuple	typetup;
+	Form_pg_type typeform;
+
+	/* MySQL ENUM/SET are represented by private collatable text domains. */
+	/* Some synthetic protocol expressions retain an unresolved type OID. */
+	if (!OidIsValid(typid))
+		return 253;
+	typetup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+	if (HeapTupleIsValid(typetup))
+	{
+		typeform = (Form_pg_type) GETSTRUCT(typetup);
+		if (typeform->typtype == TYPTYPE_DOMAIN &&
+			typeform->typbasetype == TEXTOID &&
+			strncmp(NameStr(typeform->typname), "enum_", 5) == 0)
+		{
+			ReleaseSysCache(typetup);
+			return 247;              /* MYSQL_TYPE_ENUM */
+		}
+		if (typeform->typtype == TYPTYPE_DOMAIN &&
+			typeform->typbasetype == TEXTOID &&
+			strncmp(NameStr(typeform->typname), "set_", 4) == 0)
+		{
+			ReleaseSysCache(typetup);
+			return 248;              /* MYSQL_TYPE_SET */
+		}
+		ReleaseSysCache(typetup);
+	}
+
+	switch (typid)
+	{
+		case BOOLOID: return 1;
+		case INT2OID: return 2;
+		case INT4OID: return 3;
+		case INT8OID: return 8;
+		case FLOAT4OID: return 4;
+		case FLOAT8OID: return 5;
+		case NUMERICOID: return 246;
+		case BPCHAROID: return 254;
+		case BYTEAOID: return 252;
+		case TIMESTAMPOID: return 12;
+		case TIMESTAMPTZOID: return 7;
+		case DATEOID: return 10;
+		case TIMEOID: return 11;
+		case JSONOID: return 245;
+		case BITOID:
+		case VARBITOID: return 16;
+		default: return 253;
+	}
+}
+
+static void
+mysql_field_append_lenenc(StringInfo buf, const char *value)
+{
+	Size len = strlen(value);
+
+	if (len >= 251)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("MySQL field metadata string is too long")));
+	appendStringInfoChar(buf, (char) len);
+	appendBinaryStringInfo(buf, value, len);
+}
+
+/*
+ * mysqld_list_fields() restores the table's default record before sending
+ * field metadata.  PostgreSQL keeps only an analyzed default expression, so
+ * this is deliberately a limited literal projection.  In particular it
+ * cannot recover MySQL's distinction between DEFAULT 7 and DEFAULT (7): the
+ * latter is a default expression and MySQL sends its type's reset value.
+ * Do not treat this constant folding as a complete MySQL default-record
+ * implementation; that requires persisted MySQL default provenance.
+ */
+static char *
+mysql_field_default_value(TupleDesc desc, Form_pg_attribute attr)
+{
+	Node	   *expr;
+	Const	  *constant;
+	Oid		outputfunc;
+	bool		isvarlena;
+	char	   *result;
+
+	if (!attr->atthasdef)
+		return NULL;
+	expr = TupleDescGetDefault(desc, attr->attnum);
+	if (expr == NULL)
+		return NULL;
+	expr = eval_const_expressions(NULL, expr);
+	expr = strip_implicit_coercions(expr);
+	if (!IsA(expr, Const))
+		return NULL;
+	constant = (Const *) expr;
+	if (constant->constisnull)
+		return NULL;
+	getTypeOutputInfo(constant->consttype, &outputfunc, &isvarlena);
+	result = OidOutputFunctionCall(outputfunc, constant->constvalue);
+	return result;
+}
+
+static void
+mysql_field_send_definition(MysPacketState *ps, const char *schema,
+								const char *table, TupleDesc desc,
+								Form_pg_attribute attr)
+{
+	StringInfoData buf;
+	char	   *default_value;
+	int32 collen = attr->atttypmod > 0 ? attr->atttypmod : 256;
+
+	initStringInfo(&buf);
+	mysql_field_append_lenenc(&buf, "def");
+	mysql_field_append_lenenc(&buf, schema);
+	mysql_field_append_lenenc(&buf, table);
+	mysql_field_append_lenenc(&buf, table);
+	mysql_field_append_lenenc(&buf, NameStr(attr->attname));
+	mysql_field_append_lenenc(&buf, NameStr(attr->attname));
+	appendStringInfoChar(&buf, 0x0c);
+	appendStringInfoChar(&buf, 0x2d); appendStringInfoChar(&buf, 0x00);
+	appendBinaryStringInfo(&buf, (char *) &collen, sizeof(collen));
+	appendStringInfoChar(&buf, mysql_field_mysql_type(attr->atttypid));
+	appendStringInfoChar(&buf, attr->attnotnull ? 0x01 : 0x00);
+	appendStringInfoChar(&buf, 0x00);
+	appendStringInfoChar(&buf, 0x00);
+	appendStringInfoChar(&buf, 0x00);
+	appendStringInfoChar(&buf, 0x00);
+	default_value = mysql_field_default_value(desc, attr);
+	if (default_value == NULL)
+		appendStringInfoChar(&buf, 0xfb);
+	else
+	{
+		mysql_field_append_lenenc(&buf, default_value);
+		pfree(default_value);
+	}
+	mysql_packet_write(ps, buf.data, buf.len);
+	pfree(buf.data);
+}
+
+static void
+mysql_field_list(StringInfo inBuf)
+{
+	char *separator;
+	char *table;
+	char *pattern;
+	RangeVar *rv;
+	Relation rel;
+	TupleDesc desc;
+	const char *schema;
+
+	if (inBuf->len == 0 || (separator = memchr(inBuf->data, '\0', inBuf->len)) == NULL ||
+		separator == inBuf->data || memchr(separator + 1, '\0',
+		inBuf->len - (separator + 1 - inBuf->data)) != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("invalid COM_FIELD_LIST payload")));
+	table = pnstrdup(inBuf->data, separator - inBuf->data);
+	pattern = pnstrdup(separator + 1, inBuf->len - (separator + 1 - inBuf->data));
+
+	/*
+	 * COM_FIELD_LIST is not a MySQL SQL statement, but it still reads
+	 * PostgreSQL catalogs and relcache.  This direct protocol handler bypasses
+	 * the normal PostgresMain command switch, so establish only its internal
+	 * command/timeout lifecycle here; it emits no SQL completion packet.
+	 */
+	ProtocolStartCommand();
+	rv = makeRangeVar(NULL, table, -1);
+	rel = relation_openrv(rv, AccessShareLock);
+	desc = RelationGetDescr(rel);
+	schema = get_namespace_name(RelationGetNamespace(rel));
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+
+		if (!attr->attisdropped &&
+			mysql_field_name_matches(NameStr(attr->attname), pattern))
+			mysql_field_send_definition(mysql_ps(), schema,
+									RelationGetRelationName(rel), desc, attr);
+	}
+	relation_close(rel, AccessShareLock);
+	ProtocolFinishCommand();
+	{
+		uint16 status = mysql_server_status(0);
+
+	if (mysql_negotiated_caps(mysql_ps()) & MYSQL_CAP_DEPRECATE_EOF)
+	{
+		char eof_ok[7] = {0xfe, 0x00, 0x00,
+			(char) (status & 0xff), (char) (status >> 8), 0x00, 0x00};
+		mysql_packet_write(mysql_ps(), eof_ok, sizeof(eof_ok));
+	}
+	else
+	{
+		char eof[5] = {0xfe, 0x00, 0x00,
+			(char) (status & 0xff), (char) (status >> 8)};
+		mysql_packet_write(mysql_ps(), eof, sizeof(eof));
+	}
+	}
+	pq_flush();
+	mysql_packet_reset_seq(mysql_ps());
+	mysql_packet_set_server_seq(mysql_ps(), 1);
 }
 
 /* ----------------------------------------------------------------
@@ -169,8 +563,9 @@ mysql_read_command_cb(StringInfo inBuf)
 static ProtocolCommandResult
 mysql_process_command(int *command, StringInfo inBuf)
 {
-    if (command == NULL)
-        return PROTOCOL_COMMAND_PASSTHROUGH;
+	if (command == NULL)
+		return PROTOCOL_COMMAND_PASSTHROUGH;
+	mysql_simple_query_more_results = false;
 
     switch (*command)
     {
@@ -186,29 +581,18 @@ mysql_process_command(int *command, StringInfo inBuf)
              * letting the query pipeline fail with "unrecognized node
              * type: 441".
              */
-            elog(LOG, "MYSQL_QUERY: [%.*s]",
-                 inBuf->len > 1 ? inBuf->len - 1 : 0, inBuf->data);
-
-            if (inBuf->len >= 4 && pg_strncasecmp(inBuf->data, "SET ", 4) == 0)
             {
-                char ok[7];
-                int  pos = 0;
-                ok[pos++] = 0x00;
-                ok[pos++] = 0x00;
-                ok[pos++] = 0x00;
-                ok[pos++] = 0x02; ok[pos++] = 0x00;
-                ok[pos++] = 0x00; ok[pos++] = 0x00;
-                mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0x00);
-                pq_flush();
-                mysql_packet_reset_seq(mysql_ps());
-                mysql_packet_set_server_seq(mysql_ps(), 1);
-                return PROTOCOL_COMMAND_HANDLED;
+                int query_len = inBuf->len > 1 ? inBuf->len - 1 : 0;
+                int log_len = Min(query_len, 1024);
+
+                elog(LOG, "MYSQL_QUERY: [%.*s]%s", log_len, inBuf->data,
+                     query_len > log_len ? "... [truncated]" : "");
             }
 
             /*
-             * M2: All non-empty queries now flow through the MySQL
-             * parser pipeline (mys_raw_parser -> standard analyze ->
-             * executor -> MySQL DestReceiver).
+             * All non-empty queries, including SET, flow through the MySQL
+             * parser pipeline so session state can affect transaction
+             * lifetime and the completion status word.
              */
             *command = 'Q';
             return PROTOCOL_COMMAND_PASSTHROUGH;
@@ -255,6 +639,38 @@ mysql_process_command(int *command, StringInfo inBuf)
         }
         return PROTOCOL_COMMAND_HANDLED;
 
+    case MYSQL_PSEUDO_STMT_PREPARE:
+        mysql_stmt_prepare(mysql_ps(), inBuf);
+        return PROTOCOL_COMMAND_HANDLED;
+
+    case MYSQL_PSEUDO_STMT_CLOSE:
+        mysql_stmt_close(mysql_ps(), inBuf);
+        return PROTOCOL_COMMAND_HANDLED;
+
+    case MYSQL_PSEUDO_STMT_RESET:
+        mysql_stmt_reset(mysql_ps(), inBuf);
+        return PROTOCOL_COMMAND_HANDLED;
+
+    case MYSQL_PSEUDO_STMT_EXECUTE:
+        mysql_stmt_execute(mysql_ps(), inBuf);
+        return PROTOCOL_COMMAND_HANDLED;
+
+    case MYSQL_PSEUDO_STMT_SEND_LONG_DATA:
+        mysql_stmt_send_long_data(mysql_ps(), inBuf);
+        return PROTOCOL_COMMAND_HANDLED;
+
+    case MYSQL_PSEUDO_STMT_FETCH:
+        mysql_stmt_fetch(mysql_ps(), inBuf);
+        return PROTOCOL_COMMAND_HANDLED;
+
+    case MYSQL_PSEUDO_SET_OPTION:
+        mysql_set_option(inBuf);
+        return PROTOCOL_COMMAND_HANDLED;
+
+    case MYSQL_PSEUDO_FIELD_LIST:
+        mysql_field_list(inBuf);
+        return PROTOCOL_COMMAND_HANDLED;
+
     default:
         return PROTOCOL_COMMAND_PASSTHROUGH;
     }
@@ -286,9 +702,12 @@ mysql_send_backend_key_data_noop(int pid, const uint8 *key, int keylen)
 }
 
 static void
-mysql_session_initialize_noop(Port *port)
+mysql_session_initialize(Port *port)
 {
-    /* M1: no per-session MySQL init needed beyond what init() already did. */
+    /* Backend processes normally serve one session, but reset explicitly. */
+    MysSetAutocommit(true);
+	MysInitSessionTimeZone();
+    (void) port;
 }
 
 static void
@@ -337,16 +756,14 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
     {
         uint32 caps = mysql_negotiated_caps(dr->ps);
 
-        /*
-         * MySQL 8.0.3+: if the client set CLIENT_OPTIONAL_RESULTSET_METADATA,
-         * the column-count packet is prefixed with a 1-byte metadata_follows
-         * flag (1 = full column metadata follows).
-         */
+		/*
+		 * With CLIENT_OPTIONAL_RESULTSET_METADATA, the result-set header
+		 * contains column_count followed by metadata_follows (1 for the full
+		 * ColumnDefinition41 block).  libmysqlclient reads column_count first.
+		 */
         {
             char colhdr[20];
             int  pos = 0;
-            if (caps & MYSQL_CAP_OPTIONAL_RESULTSET_METADATA)
-                colhdr[pos++] = 1;    /* RESULTSET_METADATA_FULL */
             if (ncols < 251)
             {
                 colhdr[pos++] = (char) ncols;
@@ -364,6 +781,8 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
                 colhdr[pos++] = (char) ((ncols >> 8) & 0xFF);
                 colhdr[pos++] = (char) ((ncols >> 16) & 0xFF);
             }
+			if (caps & MYSQL_CAP_OPTIONAL_RESULTSET_METADATA)
+				colhdr[pos++] = 1;    /* RESULTSET_METADATA_FULL */
             mysql_packet_write_ok(dr->ps, colhdr, (size_t) pos, 0x00);
         }
 
@@ -377,11 +796,9 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
              * MySQL ColumnDefinition41 packet (text protocol).
              * All string fields are length-encoded.
              */
-            /* "def" marker */
+            /* catalog */
             appendStringInfoChar(&colbuf, 3);
             appendStringInfoString(&colbuf, "def");
-            /* catalog = "" */
-            appendStringInfoChar(&colbuf, 0);
             /* schema = "" */
             appendStringInfoChar(&colbuf, 0);
             /* table alias (use empty for computed columns) */
@@ -395,13 +812,13 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
                 appendStringInfoChar(&colbuf, (char) clen);
                 appendBinaryStringInfo(&colbuf, cname, clen);
             }
-            /* org_col_name */
-            {
-                const char *cname = NameStr(attr->attname);
-                int         clen = (int) strlen(cname);
-                appendStringInfoChar(&colbuf, (char) clen);
-                appendBinaryStringInfo(&colbuf, cname, clen);
-            }
+            /*
+             * A PostgreSQL target-list entry does not preserve MySQL's
+             * original column identity.  It is therefore an expression from
+             * the protocol's point of view, including @@system variables:
+             * leave org_name empty, as MySQL 8.4 does for those fields.
+             */
+            appendStringInfoChar(&colbuf, 0);
             /* length of fixed fields (always 0x0c = 12) */
             appendStringInfoChar(&colbuf, 0x0c);
             /* charset: utf8mb4 = 45 */
@@ -411,69 +828,9 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
                 int32 collen = attr->atttypmod > 0 ? attr->atttypmod : 256;
                 appendBinaryStringInfo(&colbuf, (char *)&collen, 4);
             }
-            /* type: map PG type → MySQL type */
-            {
-                Oid  typid = attr->atttypid;
-                char mysql_type;
-
-                switch (typid)
-                {
-                    case BOOLOID:       /* 16 */
-                        mysql_type = 1;     /* MYSQL_TYPE_TINY */
-                        break;
-                    case INT2OID:       /* 21 */
-                        mysql_type = 2;     /* MYSQL_TYPE_SHORT */
-                        break;
-                    case INT4OID:       /* 23 */
-                        mysql_type = 3;     /* MYSQL_TYPE_LONG */
-                        break;
-                    case INT8OID:       /* 20 */
-                        mysql_type = 8;     /* MYSQL_TYPE_LONGLONG */
-                        break;
-                    case FLOAT4OID:     /* 700 */
-                        mysql_type = 4;     /* MYSQL_TYPE_FLOAT */
-                        break;
-                    case FLOAT8OID:     /* 701 */
-                        mysql_type = 5;     /* MYSQL_TYPE_DOUBLE */
-                        break;
-                    case NUMERICOID:    /* 1700 */
-                        mysql_type = 246;   /* MYSQL_TYPE_NEWDECIMAL */
-                        break;
-                    case BPCHAROID:     /* 1042 */
-                        mysql_type = 254;   /* MYSQL_TYPE_STRING */
-                        break;
-                    case VARCHAROID:    /* 1043 */
-                        mysql_type = 253;   /* MYSQL_TYPE_VAR_STRING */
-                        break;
-                    case TEXTOID:       /* 25 */
-                    case BYTEAOID:      /* 17 */
-                        mysql_type = 252;   /* MYSQL_TYPE_BLOB */
-                        break;
-                    case TIMESTAMPOID:  /* 1114 */
-                        mysql_type = 12;    /* MYSQL_TYPE_DATETIME */
-                        break;
-                    case TIMESTAMPTZOID:/* 1184 */
-                        mysql_type = 7;     /* MYSQL_TYPE_TIMESTAMP */
-                        break;
-                    case DATEOID:       /* 1082 */
-                        mysql_type = 10;    /* MYSQL_TYPE_DATE */
-                        break;
-                    case TIMEOID:       /* 1083 */
-                        mysql_type = 11;    /* MYSQL_TYPE_TIME */
-                        break;
-                    case JSONOID:       /* 114 */
-                        mysql_type = 245;   /* MYSQL_TYPE_JSON */
-                        break;
-                    case BITOID:        /* 1560 */
-                    case VARBITOID:     /* 1562 */
-                        mysql_type = 16;    /* MYSQL_TYPE_BIT */
-                        break;
-                    default:
-                        mysql_type = 253;   /* MYSQL_TYPE_VAR_STRING */
-                        break;
-                }
-                appendStringInfoChar(&colbuf, mysql_type);
-            }
+			/* type: map PostgreSQL type/domain → MySQL type */
+			appendStringInfoChar(&colbuf,
+								 mysql_field_mysql_type(attr->atttypid));
             /* flags */
             appendStringInfoChar(&colbuf, 0x00); appendStringInfoChar(&colbuf, 0x00);
             /* decimals */
@@ -492,7 +849,9 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
          */
         if (!(caps & MYSQL_CAP_DEPRECATE_EOF))
         {
-            char eof[5] = {0xFE, 0x00, 0x00, 0x02, 0x00};
+			uint16 status = mysql_server_status(0);
+			char eof[5] = {0xFE, 0x00, 0x00,
+				(char) (status & 0xff), (char) (status >> 8)};
             mysql_packet_write_ok(dr->ps, eof, 5, 0xFE);
         }
         dr->started = true;
@@ -620,8 +979,9 @@ mysql_end_command(const QueryCompletion *qc,
     if (dest == DestRemote || dest == DestRemoteExecute ||
         dest == DestRemoteSimple)
     {
-        CommandTag  tag = qc->commandTag;
-        uint32      caps = mysql_negotiated_caps(mysql_ps());
+		CommandTag  tag = qc->commandTag;
+		uint32      caps = mysql_negotiated_caps(mysql_ps());
+		uint16		status = mysql_server_status(0);
 
         /*
          * Mirror openHalo's endCommand: SELECT → EOF, DML → OK.
@@ -642,14 +1002,16 @@ mysql_end_command(const QueryCompletion *qc,
                 ok[pos++] = 0xFE;                    /* header */
                 ok[pos++] = 0x00;                    /* affected_rows (lenenc 0) */
                 ok[pos++] = 0x00;                    /* last_insert_id (lenenc 0) */
-                ok[pos++] = 0x02; ok[pos++] = 0x00;  /* status: autocommit */
+                ok[pos++] = (char) (status & 0xff);
+                ok[pos++] = (char) (status >> 8);
                 ok[pos++] = 0x00; ok[pos++] = 0x00;  /* warnings: 0 */
                 mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0xFE);
             }
             else
             {
                 /* Traditional EOF to mark end of result set. */
-                char eof[5] = {0xFE, 0x00, 0x00, 0x02, 0x00};
+                char eof[5] = {0xFE, 0x00, 0x00,
+                    (char) (status & 0xff), (char) (status >> 8)};
                 mysql_packet_write_ok(mysql_ps(), eof, 5, 0xFE);
             }
         }
@@ -662,10 +1024,11 @@ mysql_end_command(const QueryCompletion *qc,
             char ok[256];
             int  pos = 0;
 
-            ok[pos++] = 0x00;                    /* OK header */
-            ok[pos++] = 0x00;                    /* affected rows = 0 */
-            ok[pos++] = 0x00;                    /* last insert id = 0 */
-            ok[pos++] = 0x02; ok[pos++] = 0x00;  /* status: autocommit */
+			ok[pos++] = 0x00;                    /* OK header */
+			pos += mysql_write_lenenc_uint64(ok + pos, qc->nprocessed);
+			ok[pos++] = 0x00;                    /* last insert id = 0 */
+			ok[pos++] = (char) (status & 0xff);
+			ok[pos++] = (char) (status >> 8);
             ok[pos++] = 0x00; ok[pos++] = 0x00;  /* warnings: 0 */
 
             mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0x00);
@@ -675,8 +1038,11 @@ mysql_end_command(const QueryCompletion *qc,
          * Reset sequence numbers for the next command.
          * MySQL protocol resets seq after each command completes.
          */
-        mysql_packet_reset_seq(mysql_ps());
-        mysql_packet_set_server_seq(mysql_ps(), 1);
+		if (!mysql_simple_query_more_results)
+		{
+			mysql_packet_reset_seq(mysql_ps());
+			mysql_packet_set_server_seq(mysql_ps(), 1);
+		}
     }
     else
     {
@@ -691,12 +1057,14 @@ mysql_null_command(CommandDest dest)
         dest == DestRemoteSimple)
     {
         /* Empty query → MySQL OK. */
+        uint16 status = mysql_server_status(0);
         char ok[7];
         int  pos = 0;
         ok[pos++] = 0x00;
         ok[pos++] = 0x00;
         ok[pos++] = 0x00;
-        ok[pos++] = 0x02; ok[pos++] = 0x00;
+        ok[pos++] = (char) (status & 0xff);
+        ok[pos++] = (char) (status >> 8);
         ok[pos++] = 0x00; ok[pos++] = 0x00;
         mysql_packet_write_ok(mysql_ps(), ok, (size_t) pos, 0x00);
     }
@@ -737,13 +1105,36 @@ mysql_send_error(ErrorData *edata)
 {
     uint16      errcode;
     const char *sqlstate;
+	bool		mysql_label_duplicate =
+		(strncmp(edata->message, "ENUM contains duplicate value ", 30) == 0 ||
+		 strncmp(edata->message, "SET contains duplicate value ", 29) == 0);
+	bool		mysql_label_invalid =
+		(strcmp(edata->message, "invalid value for MySQL ENUM") == 0 ||
+		 strcmp(edata->message, "invalid value for MySQL SET") == 0);
 
     /* Map PG error codes to MySQL-compatible codes. */
+	if (mysql_label_duplicate)
+	{
+		errcode = 1291;             /* ER_DUPLICATED_VALUE_IN_TYPE */
+		sqlstate = "HY000";
+	}
+	else if (mysql_label_invalid)
+	{
+		errcode = 1265;             /* ER_DATA_TRUNCATED in strict mode */
+		sqlstate = "01000";
+	}
+	else
     switch (edata->sqlerrcode)
     {
+    case ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION:
+    case ERRCODE_INVALID_PASSWORD:
     case ERRCODE_INSUFFICIENT_PRIVILEGE:
         errcode = 1045;
         sqlstate = "28000";
+        break;
+    case ERRCODE_PROTOCOL_VIOLATION:
+        errcode = 1043;
+        sqlstate = "08S01";
         break;
     case ERRCODE_UNDEFINED_TABLE:
         errcode = 1146;
@@ -761,14 +1152,34 @@ mysql_send_error(ErrorData *edata)
         errcode = 1064;
         sqlstate = "42000";
         break;
+    case ERRCODE_UNDEFINED_PSTATEMENT:
+        errcode = 1243;         /* ER_UNKNOWN_STMT_HANDLER */
+        sqlstate = "HY000";
+        break;
+    case ERRCODE_INVALID_CURSOR_STATE:
+        errcode = 1325;         /* ER_STMT_HAS_NO_OPEN_CURSOR */
+        sqlstate = "24000";
+        break;
+    case ERRCODE_FEATURE_NOT_SUPPORTED:
+        errcode = 1295;         /* ER_UNSUPPORTED_PS */
+        sqlstate = "HY000";
+        break;
+    case ERRCODE_INVALID_PARAMETER_VALUE:
+        errcode = 1210;         /* ER_WRONG_ARGUMENTS */
+        sqlstate = "HY000";
+        break;
     default:
         errcode = 1105;         /* ER_UNKNOWN_ERROR */
         sqlstate = "HY000";
         break;
     }
 
+	mysql_simple_query_more_results = false;
     mysql_packet_write_err(mysql_ps(), errcode, sqlstate,
                            "%s", edata->message);
+
+    /* Error paths do not reach mysql_send_ready_for_query(). */
+    pq_flush();
 
     /*
      * Reset sequence numbers for the next command, just like
@@ -806,7 +1217,7 @@ static const ProtocolRoutine MySQLProtocolRoutine = {
     .comm_reset = mysql_comm_reset,
     .is_reading_msg = mysql_is_reading_msg,
 
-    .session_initialize = mysql_session_initialize_noop,
+    .session_initialize = mysql_session_initialize,
     .send_backend_key_data = mysql_send_backend_key_data_noop,
 
     .create_dest_receiver = mysql_create_dest_receiver,
@@ -815,8 +1226,15 @@ static const ProtocolRoutine MySQLProtocolRoutine = {
     .null_command = mysql_null_command,
     .send_ready_for_query = mysql_send_ready_for_query,
 
+    .allow_multi_statements = mysql_allow_multi_statements,
+    .simple_query_statement_ends_xact = mysql_simple_query_statement_ends_xact,
+    .set_simple_query_more_results = mysql_set_simple_query_more_results,
+    .before_simple_query_statement = mysql_before_simple_query_statement,
+
     .send_error = mysql_send_error,
     .report_parameter_status = mysql_report_parameter_status,
+
+    .process_utility = mys_standard_ProcessUtility,
 
     .parser_routine = &MySQLParserRoutine,
 };

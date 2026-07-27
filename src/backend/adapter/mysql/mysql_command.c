@@ -89,15 +89,34 @@ mysql_read_command(MysPacketState *ps, int *command, StringInfo inBuf)
         break;
 
     case COM_INIT_DB:
-        /* COM_INIT_DB: convert "USE <db>" into a Query for processing. */
-        *command = MYSQL_PSEUDO_QUERY;
+        /* COM_INIT_DB maps non-backend names to a MySQL USE/schema query. */
         resetStringInfo(inBuf);
         if (len > 1)
         {
             char *dbname = pnstrdup(payload + 1, (int)(len - 1));
+
+            /*
+             * MySQL connections are backed by a fixed PostgreSQL database.
+             * Re-selecting that database is a successful no-op; lowering it
+             * to USE would instead put a nonexistent schema before public
+             * and make pg_catalog the first usable creation namespace.
+             */
+            if (strcmp(dbname, MyProcPort->database_name) == 0)
+            {
+                *command = MYSQL_PSEUDO_PING;
+                pfree(dbname);
+                break;
+            }
+            *command = MYSQL_PSEUDO_QUERY;
             appendStringInfo(inBuf, "USE `%s`", dbname);
             pfree(dbname);
         }
+        else
+            *command = MYSQL_PSEUDO_QUERY;
+        /* PqMsg_Query consumes a NUL-terminated string inside message len. */
+        enlargeStringInfo(inBuf, 1);
+        inBuf->data[inBuf->len] = '\0';
+        inBuf->len++;
         break;
 
     case COM_QUIT:
@@ -110,13 +129,60 @@ mysql_read_command(MysPacketState *ps, int *command, StringInfo inBuf)
         resetStringInfo(inBuf);
         break;
 
-    case COM_FIELD_LIST:
-        /* Not supported in M1; return an error that will be caught later. */
-        *command = MYSQL_PSEUDO_QUERY;
+    case COM_STMT_PREPARE:
+        *command = MYSQL_PSEUDO_STMT_PREPARE;
         resetStringInfo(inBuf);
-        appendStringInfoString(inBuf, "KILL CONNECTION 0");  /* dummy */
-        ereport(WARNING,
-                (errmsg("COM_FIELD_LIST is not supported in M1")));
+        if (len > 1)
+            appendBinaryStringInfo(inBuf, payload + 1, (int) (len - 1));
+        break;
+
+    case COM_STMT_EXECUTE:
+        *command = MYSQL_PSEUDO_STMT_EXECUTE;
+        resetStringInfo(inBuf);
+        if (len > 1)
+            appendBinaryStringInfo(inBuf, payload + 1, (int) (len - 1));
+        break;
+
+    case COM_STMT_CLOSE:
+        *command = MYSQL_PSEUDO_STMT_CLOSE;
+        resetStringInfo(inBuf);
+        if (len > 1)
+            appendBinaryStringInfo(inBuf, payload + 1, (int) (len - 1));
+        break;
+
+    case COM_STMT_RESET:
+        *command = MYSQL_PSEUDO_STMT_RESET;
+        resetStringInfo(inBuf);
+        if (len > 1)
+            appendBinaryStringInfo(inBuf, payload + 1, (int) (len - 1));
+        break;
+
+    case COM_STMT_SEND_LONG_DATA:
+        *command = MYSQL_PSEUDO_STMT_SEND_LONG_DATA;
+        resetStringInfo(inBuf);
+        if (len > 1)
+            appendBinaryStringInfo(inBuf, payload + 1, (int) (len - 1));
+        break;
+
+    case COM_STMT_FETCH:
+        *command = MYSQL_PSEUDO_STMT_FETCH;
+        resetStringInfo(inBuf);
+        if (len > 1)
+            appendBinaryStringInfo(inBuf, payload + 1, (int) (len - 1));
+        break;
+
+    case COM_SET_OPTION:
+        *command = MYSQL_PSEUDO_SET_OPTION;
+        resetStringInfo(inBuf);
+        if (len > 1)
+            appendBinaryStringInfo(inBuf, payload + 1, (int) (len - 1));
+        break;
+
+    case COM_FIELD_LIST:
+        *command = MYSQL_PSEUDO_FIELD_LIST;
+        resetStringInfo(inBuf);
+        if (len > 1)
+            appendBinaryStringInfo(inBuf, payload + 1, (int) (len - 1));
         break;
 
     default:
