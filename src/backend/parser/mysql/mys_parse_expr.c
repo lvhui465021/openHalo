@@ -39,6 +39,7 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 #include "utils/xml.h"
+#include "utils/guc.h"
 
 static Node *transformExprRecurse(ParseState *pstate, Node *expr);
 static Node *transformParamRef(ParseState *pstate, ParamRef *pref);
@@ -220,8 +221,40 @@ transformExprRecurse(ParseState *pstate, Node *expr)
 			break;
 
 		case T_FuncCall:
-			result = transformFuncCall(pstate, (FuncCall *) expr);
-			break;
+			{
+				FuncCall   *fn = (FuncCall *) expr;
+		
+				/*
+				 * Intercept VERSION() in MySQL protocol context:
+				 * return the MySQL server version from GUC, not PG's
+				 * built-in version().  Match only the unqualified,
+				 * no-argument form so schema-qualified calls like
+				 * pg_catalog.version() still return the PG version.
+				 */
+				if (fn->args == NIL && fn->agg_order == NIL &&
+					fn->agg_filter == NULL && fn->over == NULL &&
+					!fn->agg_star && !fn->agg_distinct &&
+					list_length(fn->funcname) == 1)
+				{
+					char *fname = strVal(linitial(fn->funcname));
+		
+					elog(LOG, "MYSQL FuncCall: fname=[%s], nargs=%d",
+						 fname, list_length(fn->args));
+		
+					if (pg_strcasecmp(fname, "version") == 0)
+					{
+						A_Const    *n = makeNode(A_Const);
+					
+						n->val.node.type = T_String;
+						n->val.sval = *makeString(pstrdup(mysql_server_version));
+						n->location = fn->location;
+						result = (Node *) n;
+						break;
+					}
+				}
+				result = transformFuncCall(pstate, fn);
+				break;
+			}
 
 		case T_MultiAssignRef:
 			result = transformMultiAssignRef(pstate, (MultiAssignRef *) expr);
@@ -925,9 +958,9 @@ transformSysVarRef(ParseState *pstate, SysVarRef *sysVarRef)
     }
 
     if (pg_strcasecmp(sysVarRef->sysVarName, "version_comment") == 0)
-        val = "8.0.40-openhalo-1.0";
+        val = mysql_server_version;
     else if (pg_strcasecmp(sysVarRef->sysVarName, "version") == 0)
-        val = "8.0.40";
+        val = mysql_server_version;
     else
         val = sysVarRef->sysVarName;
 

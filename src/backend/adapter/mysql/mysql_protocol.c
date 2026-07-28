@@ -635,6 +635,35 @@ mysql_process_command(int *command, StringInfo inBuf)
 
                 elog(LOG, "MYSQL_QUERY: [%.*s]%s", log_len, inBuf->data,
                      query_len > log_len ? "... [truncated]" : "");
+
+                /*
+                 * MySQL 8.x CLI sends "select $$" as a session-tracking
+                 * capability probe during connection initialisation.
+                 * PG interprets $$ as a dollar-quote start, causing a
+                 * syntax error that corrupts the MySQL protocol packet
+                 * sequence counter.  Intercept the probe here and return
+                 * a proper MySQL ER_BAD_FIELD_ERROR so the CLI continues
+                 * gracefully.
+                 */
+                {
+                    const char *q = inBuf->data;
+                    int qlen = query_len;
+
+                    /* Skip leading whitespace */
+                    while (qlen > 0 && (*q == ' ' || *q == '\t' ||
+                                        *q == '\n' || *q == '\r'))
+                    { q++; qlen--; }
+
+                    if (qlen >= 9 && pg_strncasecmp(q, "select $$", 9) == 0)
+                    {
+                        mysql_packet_write_err(mysql_ps(), 1054, "42S22",
+                            "Unknown column '$$' in 'field list'");
+                        pq_flush();
+                        mysql_packet_reset_seq(mysql_ps());
+                        mysql_packet_set_server_seq(mysql_ps(), 1);
+                        return PROTOCOL_COMMAND_HANDLED;
+                    }
+                }
             }
 
             /*

@@ -1,0 +1,230 @@
+# mysql-compat full transcript
+--------------
+SHOW DATABASES LIKE 'mysql_compat_known_metadata'
+--------------
+
+ERROR 1478 (HY000) at line 7: syntax error at or near "LIKE"
+--------------
+SHOW STATUS
+--------------
+
+ERROR 1146 (HY000) at line 10: relation "mys_informa_schema.db_status" does not exist
+--------------
+SHOW SESSION STATUS
+--------------
+
+ERROR 1146 (HY000) at line 11: relation "mys_informa_schema.db_status" does not exist
+--------------
+SHOW GLOBAL STATUS
+--------------
+
+ERROR 1146 (HY000) at line 12: relation "mys_informa_schema.db_status" does not exist
+--------------
+SELECT repeat('ab', 3)
+--------------
+
+ERROR 32900 (HY000) at line 15: could not determine polymorphic type because input has type unknown
+--------------
+SELECT SQL_CALC_FOUND_ROWS oid FROM pg_class ORDER BY oid LIMIT 2
+--------------
+
+ERROR 1054 (HY000) at line 18: column "sql_calc_found_rows" does not exist
+--------------
+SELECT FOUND_ROWS()
+--------------
+
+found_rows
+1
+1 row in set
+
+--------------
+SELECT UNHEX(CAST('616263' AS CHAR))
+--------------
+
+ERROR 32900 (HY000) at line 22: function unhex(character varying) does not exist
+--------------
+SELECT TO_BASE64(CAST('abc' AS CHAR))
+--------------
+
+ERROR 32900 (HY000) at line 23: function to_base64(character varying) does not exist
+--------------
+SELECT FROM_BASE64(CAST('YWJj' AS CHAR))
+--------------
+
+ERROR 32900 (HY000) at line 24: function from_base64(character varying) does not exist
+--------------
+SELECT LOAD_FILE('/mysql-compat-file-does-not-exist')
+--------------
+
+ERROR 517 (HY000) at line 27: could not open file "/mysql-compat-file-does-not-exist" for reading: No such file or directory
+--------------
+SELECT CAST(18446744073709551615 AS UNSIGNED)
+--------------
+
+ERROR 1264 (HY000) at line 30: bigint out of range
+--------------
+SELECT 'literal_like_case_insensitive' AS test_name,
+       'AbC' LIKE 'a%' AS passed
+--------------
+
+test_name	passed
+literal_like_case_insensitive	0
+1 row in set
+
+--------------
+SELECT 'json_dollar_path' AS test_name,
+       JSON_OBJECT('key', 'text')->>'$.key' = 'text' AS passed
+--------------
+
+test_name	passed
+json_dollar_path	NULL
+1 row in set
+
+--------------
+SELECT mysql.get_lock('mysql_compat_known_lock', 0)
+--------------
+
+get_lock
+1
+1 row in set
+
+--------------
+SELECT 'named_lock_state' AS test_name,
+       mysql.is_used_lock('mysql_compat_known_lock') IS NOT NULL AS passed
+--------------
+
+test_name	passed
+named_lock_state	0
+1 row in set
+
+--------------
+SELECT mysql.release_lock('mysql_compat_known_lock')
+--------------
+
+release_lock
+1
+1 row in set
+
+--------------
+DROP DATABASE IF EXISTS mysql_compat_known_metadata
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+CREATE DATABASE mysql_compat_known_metadata
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+CREATE TABLE mysql_known_indexed (id INT PRIMARY KEY, value_int INT)
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+CREATE INDEX mysql_known_value_idx ON mysql_known_indexed(value_int)
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+CREATE TABLE mysql_known_trigger_audit(id INT PRIMARY KEY, value_int INT)
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+CREATE TRIGGER mysql_known_after_insert AFTER INSERT ON mysql_known_indexed
+FOR EACH ROW INSERT INTO mysql_known_trigger_audit(id, value_int)
+VALUES (NEW.id, NEW.value_int)
+--------------
+
+ERROR 1478 (HY000) at line 56: syntax error at or near "INSERT"
+--------------
+SELECT 'information_schema_statistics' AS test_name,
+       COUNT(*) > 0 AS passed
+FROM information_schema.statistics
+WHERE table_schema = 'mysql_compat_known_metadata'
+  AND table_name = 'mysql_known_indexed'
+--------------
+
+Test_name	Passed
+information_schema_statistics	0
+1 row in set
+
+--------------
+CREATE TABLE mysql_known_update_a(id INT PRIMARY KEY, value_int INT)
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+CREATE TABLE mysql_known_update_b(id INT PRIMARY KEY, value_int INT)
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+INSERT INTO mysql_known_update_a VALUES (1, 10)
+--------------
+
+Query OK, 1 row affected
+
+--------------
+INSERT INTO mysql_known_update_b VALUES (1, 20)
+--------------
+
+Query OK, 1 row affected
+
+--------------
+UPDATE mysql_known_update_a AS a, mysql_known_update_b AS b
+SET a.value_int = 11, b.value_int = 21
+WHERE a.id = b.id
+--------------
+
+ERROR 1478 (HY000) at line 70: syntax error, multi table name or alias in set.
+--------------
+CREATE TABLE mysql_known_partitioned(id INT, value_int INT)
+PARTITION BY RANGE(id)
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+CREATE TABLE mysql_known_partition_0 PARTITION OF mysql_known_partitioned
+FOR VALUES FROM (0) TO (10)
+--------------
+
+ERROR 32900 (HY000) at line 77: cannot inherit from partitioned table "mysql_known_partitioned"
+--------------
+UPDATE LOW_PRIORITY mysql_known_indexed
+SET value_int = value_int WHERE id = 1
+--------------
+
+ERROR 1478 (HY000) at line 81: syntax error at or near "LOW_PRIORITY"
+--------------
+SET sql_mode = ''
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+SELECT '12abc' + 0
+--------------
+
+ERROR 1064 (HY000) at line 86: invalid input syntax for type integer: "12abc"
+--------------
+SET sql_mode = DEFAULT
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+DROP DATABASE mysql_compat_known_metadata
+--------------
+
+Query OK, 0 rows affected
+
+Bye

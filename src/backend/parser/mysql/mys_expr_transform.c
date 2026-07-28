@@ -9,6 +9,7 @@
 #include "parser/parse_node.h"
 #include "parser/mysql/mys_expr_transform.h"
 #include "adapter/mysql/systemVar.h"
+#include "utils/guc.h"
 
 static Node *
 mys_transform_user_var_call(ParseState *pstate, const char *function_name,
@@ -147,9 +148,9 @@ mys_transform_expr_node(ParseState *pstate, Node *expr, Node **result)
 					 pg_strcasecmp(sv->sysVarName, "interactive_timeout") == 0)
 				val = "28800";
             else if (pg_strcasecmp(sv->sysVarName, "version_comment") == 0)
-                val = "8.0.40-openhalo-1.0";
+                val = mysql_server_version;
             else if (pg_strcasecmp(sv->sysVarName, "version") == 0)
-                val = "8.0.40";
+                val = mysql_server_version;
             else
                 val = sv->sysVarName;
 
@@ -166,6 +167,35 @@ mys_transform_expr_node(ParseState *pstate, Node *expr, Node **result)
 											"mys_get_user_var", uv->userVarName,
 											NULL, uv->location);
 			return true;
+		}
+
+	case T_FuncCall:
+		{
+			FuncCall *fn = (FuncCall *) expr;
+
+			/*
+			 * Intercept VERSION() in MySQL protocol: return the MySQL
+			 * server version from GUC instead of PG's built-in version().
+			 * Match only the unqualified, no-argument form so that
+			 * pg_catalog.version() still returns the PG version.
+			 */
+			if (fn->args == NIL && fn->agg_order == NIL &&
+				fn->agg_filter == NULL && fn->over == NULL &&
+				!fn->agg_star && !fn->agg_distinct &&
+				list_length(fn->funcname) == 1)
+			{
+				char *fname = strVal(linitial(fn->funcname));
+
+				if (pg_strcasecmp(fname, "version") == 0)
+				{
+					*result = (Node *) make_const(pstate,
+						(A_Const *) makeStringConst(
+							pstrdup(mysql_server_version),
+							fn->location));
+					return true;
+				}
+			}
+			break;
 		}
 
     case T_UserVarAssign:

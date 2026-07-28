@@ -104,7 +104,7 @@
 #mysql.port = 3306			# requires restart
 #mysql.backend_database = 'postgres' # physical PostgreSQL database for MySQL sessions;
 					# MySQL USE selects a schema instead
-#mysql.server_version = '5.7.32-log'
+#mysql.server_version = '8.4.10-openhalo-1.0'
 #mysql.max_allowed_packet = 64MB
 
 # GSSAPI using Kerberos

@@ -22,4 +22,9 @@ tests += {
       'versioning',
     ],
   },
+  'tap': {
+    'tests': [
+      't/005_mysql_compat.pl',
+    ],
+  },
 }

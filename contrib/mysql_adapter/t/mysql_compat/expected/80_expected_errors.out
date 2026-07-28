@@ -1,0 +1,95 @@
+# mysql-compat full transcript
+--------------
+DROP DATABASE IF EXISTS mysql_compat_expected_errors
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+CREATE DATABASE mysql_compat_expected_errors
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+CREATE TABLE mysql_negative_values (
+  id INT PRIMARY KEY,
+  required_value INT NOT NULL,
+  unique_value VARCHAR(10) UNIQUE,
+  enum_value ENUM('a', 'b'),
+  positive_value INT CHECK (positive_value > 0),
+  tiny_unsigned TINYINT UNSIGNED
+)
+--------------
+
+Query OK, 0 rows affected
+
+--------------
+INSERT INTO mysql_negative_values VALUES (1, 1, 'one', 'a', 1, 1)
+--------------
+
+Query OK, 1 row affected
+
+--------------
+INSERT INTO mysql_negative_values VALUES (1, 2, 'two', 'b', 2, 2)
+--------------
+
+ERROR 1062 (HY000) at line 18: duplicate key value violates unique constraint "mysql_negative_values_pkey"
+--------------
+INSERT INTO mysql_negative_values VALUES (2, 2, 'one', 'b', 2, 2)
+--------------
+
+ERROR 1062 (HY000) at line 19: duplicate key value violates unique constraint "mysql_negative_values_unique_value_key"
+--------------
+INSERT INTO mysql_negative_values VALUES (3, NULL, 'three', 'a', 3, 3)
+--------------
+
+ERROR 1048 (HY000) at line 20: null value in column "required_value" of relation "mysql_negative_values" violates not-null constraint
+--------------
+INSERT INTO mysql_negative_values VALUES (4, 4, 'four', 'a', -1, 4)
+--------------
+
+ERROR 1264 (HY000) at line 21: new row for relation "mysql_negative_values" violates check constraint "mysql_negative_values_positive_value_check"
+--------------
+INSERT INTO mysql_negative_values VALUES (5, 5, 'five', 'not-in-enum', 5, 5)
+--------------
+
+ERROR 1064 (HY000) at line 22: invalid input value for enum enum_mysql_negative_values_enum_value: "not-in-enum"
+--------------
+INSERT INTO mysql_negative_values VALUES (6, 6, 'six', 'a', 6, 256)
+--------------
+
+ERROR 1264 (HY000) at line 23: value for domain `tinyint unsigned` violates check constraint "tinyint unsigned_check"
+--------------
+SELECT DATE('2024-02-30')
+--------------
+
+ERROR 130 (HY000) at line 25: Incorrect datetime value: '2024-02-30'
+--------------
+SELECT DATE('0000-00-00')
+--------------
+
+ERROR 130 (HY000) at line 26: Incorrect datetime value: '0000-00-00'
+--------------
+SELECT TIMESTAMP('2024-13-01 00:00:00')
+--------------
+
+ERROR 130 (HY000) at line 27: Incorrect datetime value: '2024-13-01 00:00:00'
+--------------
+SELECT 'abc' REGEXP 'a{0}'
+--------------
+
+ERROR 130 (HY000) at line 28: invalid regular expression: invalid repetition count(s)
+--------------
+CREATE TABLE mysql_negative_values(id INT)
+--------------
+
+ERROR 1050 (HY000) at line 29: relation "mysql_negative_values" already exists
+ERROR 130 (HY000) at line 30: invalid value for parameter "search_path": "mysql_compat_database_does_not_exist, mysql, pg_catalog, public"
+--------------
+DROP DATABASE mysql_compat_expected_errors
+--------------
+
+Query OK, 0 rows affected
+
+Bye

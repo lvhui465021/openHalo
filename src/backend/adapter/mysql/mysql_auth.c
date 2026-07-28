@@ -157,7 +157,8 @@ mysql_send_greeting(MysPacketState *ps, Port *port)
     uint16      cap_lo = MYSQL_CAPABILITY_LO;
     uint16      cap_hi = MYSQL_CAPABILITY_HI;
     uint32      capability;
-    const char *server_version = "8.0.40-openhalo-1.0";
+    extern char *mysql_server_version;
+    const char *server_version = mysql_server_version;
     const char *auth_plugin_name = "caching_sha2_password";
     int         auth_plugin_name_len;
     uint8       charset = MYSQL_CHARSET_UTF8MB4;

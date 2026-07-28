@@ -565,7 +565,7 @@ char	   *mysql_backend_database = "postgres";
 bool		mysql_listener_on = false;
 int			mysql_port = 3306;
 int			mysql_max_allowed_packet = 64 * 1024 * 1024;
-char	   *mysql_server_version = "5.7.32-log";
+char	   *mysql_server_version = "8.4.10-openhalo-1.0";
 char	   *ConfigFileName;
 char	   *HbaFileName;
 char	   *IdentFileName;
@@ -4727,7 +4727,7 @@ struct config_string ConfigureNamesString[] =
 			GUC_SUPERUSER_ONLY
 		},
 		&mysql_server_version,
-		"5.7.32-log",
+		"8.4.10-openhalo-1.0",
 		NULL, NULL, NULL
 	},
 

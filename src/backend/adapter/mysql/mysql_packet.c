@@ -112,6 +112,8 @@ mysql_packet_read(MysPacketState *ps, char **payload, size_t *len)
 
         if (pkt_seq != ps->seq)
         {
+            elog(LOG, "MySQL packet seq mismatch at read: expected %u, got %u, server_seq=%u",
+                 ps->seq, pkt_seq, ps->server_seq);
             ereport(COMMERROR,
                     (errmsg("MySQL packet sequence number mismatch: expected %u, got %u",
                             ps->seq, pkt_seq)));

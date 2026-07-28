@@ -5,6 +5,8 @@ DATA = mysql_adapter--1.0.sql mysql_adapter--1.0--1.1.sql mysql_adapter--1.1--1.
 
 REGRESS = versioning
 
+TAP_TESTS = 1
+
 ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
