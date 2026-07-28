@@ -78,6 +78,10 @@ extern void *mysql_packet_get_auth_state(MysPacketState *ps);
 extern void mysql_packet_set_client_caps(MysPacketState *ps, uint32 caps);
 extern uint32 mysql_packet_get_client_caps(MysPacketState *ps);
 
+/* Store / retrieve FOUND_ROWS() session counter. */
+extern void mysql_packet_set_found_rows(MysPacketState *ps, uint64 count);
+extern uint64 mysql_packet_get_found_rows(MysPacketState *ps);
+
 /*
  * MySQL capability flags (subset relevant to our adapter).
  * Full list: https://dev.mysql.com/doc/dev/mysql-server/latest/group__group__cs__capabilities__flags.html

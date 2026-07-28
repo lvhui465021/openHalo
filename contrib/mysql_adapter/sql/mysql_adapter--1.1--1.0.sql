@@ -1,5 +1,10 @@
 -- \echo mysql_adapter extension downgrading 1.1 -> 1.0
 
+-- Restore original pg_cast castcontext for int<->bool casts
+-- (changed to implicit by the extension for MySQL WHERE-clause compatibility).
+UPDATE pg_catalog.pg_cast SET castcontext = 'e' WHERE castsource = 23 AND casttarget = 16;
+UPDATE pg_catalog.pg_cast SET castcontext = 'e' WHERE castsource = 16 AND casttarget = 23;
+
 -- Version 1.1 only adds functions.  Remove each object from the extension
 -- before dropping it; the objects that define version 1.0 remain members.
 DO $$
@@ -102,7 +107,8 @@ BEGIN
 		'mysql.version()'::regprocedure,
 		'mysql.connection_id()'::regprocedure,
 		'mysql.last_insert_id()'::regprocedure,
-		'mysql.row_count()'::regprocedure
+		'mysql.row_count()'::regprocedure,
+		'mysql.found_rows()'::regprocedure
 	]
 	LOOP
 		EXECUTE format('ALTER EXTENSION mysql_adapter DROP FUNCTION %s',
@@ -111,3 +117,7 @@ BEGIN
 	END LOOP;
 END
 $$;
+
+-- Drop bare INT / INTEGER domains added during upgrade (KF-053)
+DROP DOMAIN IF EXISTS mysql.integer;
+DROP DOMAIN IF EXISTS mysql.int;

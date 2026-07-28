@@ -532,7 +532,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 				columnref in_expr having_clause func_table xmltable array_expr
 				OptWhereClause operator_def_arg interval_expr
 %type <list>	rowsfrom_item rowsfrom_list opt_col_def_list
-%type <boolean> opt_ordinality
+%type <boolean> opt_ordinality opt_calc_found_rows_clause
 %type <list>	ExclusionConstraintList ExclusionConstraintElem
 %type <list>	func_arg_list func_arg_list_opt
 %type <node>	func_arg_expr
@@ -767,7 +767,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 	SAVEPOINT SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT SELETC SEPARATOR SEQUENCE SEQUENCES
 	SERIALIZABLE SERVER SESSION 
     SESSION_USER SET SETS SETOF SHARE SHARED SHOW
-	SIGNED SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SPATIAL SQL_BIG_RESULT SQL_BUFFER_RESULT SQL_CACHE SQL_NO_CACHE SQL_SMALL_RESULT SQL_P 
+	SIGNED SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SPATIAL SQL_BIG_RESULT SQL_BUFFER_RESULT SQL_CACHE SQL_CALC_FOUND_ROWS SQL_NO_CACHE SQL_SMALL_RESULT SQL_P
     SQLEXCEPTION SQLSTATE STABLE STANDALONE_P
 	START STATEMENT STATISTICS STATS_AUTO_RECALC STATS_PERSISTENT STATS_SAMPLE_PAGES STATUS STD STDDEV STDIN STDOUT STORAGE STORED STRICT_P STRIP_P
 	SUBPARTITION SUBPARTITIONS SUBSCRIPTION SUBSTR SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
@@ -16331,19 +16331,20 @@ select_clause:
  * However, this is not checked by the grammar; parse analysis must check it.
  */
 simple_select:
-			SELECT distinct_optimizer_hints_clause target_list
+			SELECT opt_calc_found_rows_clause distinct_optimizer_hints_clause target_list
 			into_clause from_clause where_clause
 			group_clause having_clause window_clause
 				{
 					SelectStmt *n;
                     ListCell *lc;
 					n = makeNode(SelectStmt);
-					n->distinctClause = $2;
-					n->targetList = $3;
-					n->intoClause = $4;
-					n->fromClause = $5;
+					n->calcFoundRows = $2;
+					n->distinctClause = $3;
+					n->targetList = $4;
+					n->intoClause = $5;
+					n->fromClause = $6;
                     /* n->onClause = NULL; -- field removed in PG18 */
-                    foreach (lc, $5)
+                    foreach (lc, $6)
                     {
                         Node *node = lfirst(lc);
                         if (IsA(node, JoinExpr))
@@ -16363,11 +16364,11 @@ simple_select:
                             }
                         }
                     }
-					n->whereClause = $6;
-					n->groupClause = ($7)->list;
-					n->groupDistinct = ($7)->distinct;
-					n->havingClause = $8;
-					n->windowClause = $9;
+					n->whereClause = $7;
+					n->groupClause = ($8)->list;
+					n->groupDistinct = ($8)->distinct;
+					n->havingClause = $9;
+					n->windowClause = $10;
 					$$ = (Node *)n;
 				}
 			| values_clause							{ $$ = $1; }
@@ -16588,6 +16589,11 @@ distinct_clause1:
 			ALL								        { $$ = NIL; }
 			| DISTINCT								{ $$ = list_make1(NIL); }
 			| DISTINCTROW						    { $$ = list_make1(NIL); }
+		;
+
+opt_calc_found_rows_clause:
+			SQL_CALC_FOUND_ROWS				{ $$ = true; }
+			| /*EMPTY*/							{ $$ = false; }
 		;
 
 opt_cache_clause:

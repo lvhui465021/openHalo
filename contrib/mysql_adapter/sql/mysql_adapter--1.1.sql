@@ -29,8 +29,11 @@ CREATE DOMAIN mysql."mediumint unsigned" AS pg_catalog.int4 CHECK ((0 <= VALUE) 
 CREATE DOMAIN mysql."int signed" AS pg_catalog.int4;
 CREATE DOMAIN mysql."int unsigned" AS pg_catalog.int8 CHECK ((0 <= VALUE) AND (VALUE <= 4294967295));
 
+CREATE DOMAIN mysql.int AS pg_catalog.int4;
+CREATE DOMAIN mysql.integer AS pg_catalog.int4;
+
 CREATE DOMAIN mysql."bigint signed" AS pg_catalog.int8;
-CREATE DOMAIN mysql."bigint unsigned" AS pg_catalog.int8 CHECK (0 <= VALUE);
+CREATE DOMAIN mysql."bigint unsigned" AS pg_catalog.int8 CHECK ((0 <= VALUE) AND (VALUE <= 9223372036854775807));
 
 CREATE DOMAIN mysql.real AS pg_catalog.float8;
 CREATE DOMAIN mysql.double AS pg_catalog.float8;
@@ -45,6 +48,12 @@ CREATE DOMAIN mysql.year_ AS pg_catalog.int4 CHECK ((1901 <= VALUE) AND (VALUE <
 
 -- -----------------------------------------------------------------------------
 -- Cast overrides: pg_catalog type casts for MySQL compatibility
+--
+-- NOTE: These UPDATE pg_cast statements change castcontext globally,
+-- affecting ALL databases, not just the current one.  This is necessary
+-- for MySQL WHERE-clause semantics (e.g. "WHERE int_col" treating
+-- non-zero as true).  The downgrade script (1.1->1.0) restores the
+-- original explicit-only castcontext.
 -- -----------------------------------------------------------------------------
 
 -- int -> boolean (MySQL: non-zero is true, zero is false)
@@ -631,8 +640,8 @@ LANGUAGE SQL;
 
 CREATE OR REPLACE FUNCTION mysql.rand(int4)
 RETURNS float8
-AS 'SELECT pg_catalog.setseed($1::float8 / 2147483647.0); SELECT pg_catalog.random()'
-LANGUAGE SQL;
+AS 'SELECT (((($1::int8 * 1103515245 + 12345) % 2147483647 + 2147483647) % 2147483647)::float8 / 2147483647.0)'
+LANGUAGE SQL IMMUTABLE STRICT;
 
 -- ROUND(X[, D])
 CREATE OR REPLACE FUNCTION mysql.round(numeric, int DEFAULT 0)
@@ -1017,3 +1026,9 @@ BEGIN
     RETURN rc;
 END;
 $$ LANGUAGE plpgsql;
+
+-- FOUND_ROWS()
+CREATE OR REPLACE FUNCTION mysql.found_rows()
+RETURNS int8
+AS 'SELECT pg_catalog.mys_found_rows()'
+LANGUAGE SQL;

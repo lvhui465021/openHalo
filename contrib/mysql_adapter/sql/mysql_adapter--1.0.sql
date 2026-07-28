@@ -29,8 +29,11 @@ CREATE DOMAIN mysql."mediumint unsigned" AS pg_catalog.int4 CHECK ((0 <= VALUE) 
 CREATE DOMAIN mysql."int signed" AS pg_catalog.int4;
 CREATE DOMAIN mysql."int unsigned" AS pg_catalog.int8 CHECK ((0 <= VALUE) AND (VALUE <= 4294967295));
 
+CREATE DOMAIN mysql.int AS pg_catalog.int4;
+CREATE DOMAIN mysql.integer AS pg_catalog.int4;
+
 CREATE DOMAIN mysql."bigint signed" AS pg_catalog.int8;
-CREATE DOMAIN mysql."bigint unsigned" AS pg_catalog.int8 CHECK (0 <= VALUE);
+CREATE DOMAIN mysql."bigint unsigned" AS pg_catalog.int8 CHECK ((0 <= VALUE) AND (VALUE <= 9223372036854775807));
 
 CREATE DOMAIN mysql.real AS pg_catalog.float8;
 CREATE DOMAIN mysql.double AS pg_catalog.float8;
@@ -45,6 +48,10 @@ CREATE DOMAIN mysql.year_ AS pg_catalog.int4 CHECK ((1901 <= VALUE) AND (VALUE <
 
 -- -----------------------------------------------------------------------------
 -- Cast overrides: pg_catalog type casts for MySQL compatibility
+--
+-- NOTE: These UPDATE pg_cast statements change castcontext globally,
+-- affecting ALL databases, not just the current one.  The downgrade
+-- script restores the original explicit-only castcontext.
 -- -----------------------------------------------------------------------------
 
 -- int -> boolean (MySQL: non-zero is true, zero is false)

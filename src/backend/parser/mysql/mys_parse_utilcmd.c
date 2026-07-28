@@ -5292,15 +5292,25 @@ mysProcessYearSetEnumForModifyColumn(CreateStmtContext *cxt, char *oldColName, C
     {
         if (strncmp(newTypeName, "enum", 4) == 0)
         {
-            // FIXME:
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("converting a regular column to ENUM via MODIFY/CHANGE is not yet supported"),
+                     errhint("Drop and recreate the column as an ENUM instead.")));
         }
         else if (strncmp(newTypeName, "set", 3) == 0)
         {
-            // FIXME:
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("converting a regular column to SET via MODIFY/CHANGE is not yet supported"),
+                     errhint("Drop and recreate the column as a SET instead.")));
         }
         else
         {
-            // FIXME:
+            /*
+             * Regular-to-regular type change (e.g. INT -> BIGINT).
+             * ATExecChangeColumn handles the catalog update at execution
+             * time; no extra parse-time transformation is needed here.
+             */
         }
     }
 

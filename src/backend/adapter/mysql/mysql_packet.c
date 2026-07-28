@@ -32,6 +32,7 @@ struct MysPacketState
     uint8       server_seq;         /* next server sequence number to send     */
     void       *auth_state;         /* MysAuthState during handshake, else NULL */
     uint32      client_capabilities; /* client capability flags from login     */
+    uint64      found_rows;         /* FOUND_ROWS() session counter            */
 };
 
 /* ----------------------------------------------------------------
@@ -374,5 +375,20 @@ mysql_packet_get_client_caps(MysPacketState *ps)
 {
     if (ps != NULL)
         return ps->client_capabilities;
+    return 0;
+}
+
+void
+mysql_packet_set_found_rows(MysPacketState *ps, uint64 count)
+{
+    if (ps != NULL)
+        ps->found_rows = count;
+}
+
+uint64
+mysql_packet_get_found_rows(MysPacketState *ps)
+{
+    if (ps != NULL)
+        return ps->found_rows;
     return 0;
 }

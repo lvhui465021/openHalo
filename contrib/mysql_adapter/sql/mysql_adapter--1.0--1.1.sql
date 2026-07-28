@@ -1,6 +1,30 @@
 -- \echo mysql_adapter extension upgrading 1.0 -> 1.1
 
 -- -----------------------------------------------------------------------------
+-- Domain fixes: complete CHECK constraints and add missing bare types
+-- -----------------------------------------------------------------------------
+
+-- KF-052: bigint unsigned missing upper-bound check
+DO $$
+DECLARE
+    con_name text;
+BEGIN
+    SELECT conname INTO con_name
+    FROM pg_catalog.pg_constraint
+    WHERE contypid = 'mysql."bigint unsigned"'::regtype
+    AND contype = 'c';
+    IF FOUND THEN
+        EXECUTE format('ALTER DOMAIN mysql."bigint unsigned" DROP CONSTRAINT %I', con_name);
+    END IF;
+END;
+$$;
+ALTER DOMAIN mysql."bigint unsigned" ADD CHECK ((0 <= VALUE) AND (VALUE <= 9223372036854775807));
+
+-- KF-053: add bare INT / INTEGER domains (MySQL alias for INT SIGNED)
+CREATE DOMAIN IF NOT EXISTS mysql.int AS pg_catalog.int4;
+CREATE DOMAIN IF NOT EXISTS mysql.integer AS pg_catalog.int4;
+
+-- -----------------------------------------------------------------------------
 -- MySQL-compatible scalar functions: v1.1 string functions
 -- -----------------------------------------------------------------------------
 
@@ -268,8 +292,8 @@ LANGUAGE SQL;
 
 CREATE OR REPLACE FUNCTION mysql.rand(int4)
 RETURNS float8
-AS 'SELECT pg_catalog.setseed($1::float8 / 2147483647.0); SELECT pg_catalog.random()'
-LANGUAGE SQL;
+AS 'SELECT (((($1::int8 * 1103515245 + 12345) % 2147483647 + 2147483647) % 2147483647)::float8 / 2147483647.0)'
+LANGUAGE SQL IMMUTABLE STRICT;
 
 -- ROUND(X[, D])
 CREATE OR REPLACE FUNCTION mysql.round(numeric, int DEFAULT 0)
@@ -654,3 +678,9 @@ BEGIN
     RETURN rc;
 END;
 $$ LANGUAGE plpgsql;
+
+-- FOUND_ROWS()
+CREATE OR REPLACE FUNCTION mysql.found_rows()
+RETURNS int8
+AS 'SELECT pg_catalog.mys_found_rows()'
+LANGUAGE SQL;

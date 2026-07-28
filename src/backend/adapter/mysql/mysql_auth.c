@@ -510,19 +510,26 @@ mysql_perform_authentication(MysPacketState *ps, Port *port)
             break;
     }
 
+    /*
+     * The initial auth response format depends on the server-advertised
+     * plugin (always caching_sha2_password), not the client's declared
+     * plugin name.  Detect by response length:
+     *
+     *   0 bytes  → client wants immediate AuthSwitch (e.g.
+     *              --default-auth=mysql_native_password)
+     *   20 bytes → mysql_native_password was used directly (legacy)
+     *   32 bytes → caching_sha2_password was used → AuthSwitch needed
+     */
     plugin_name = auth->client_auth_plugin_name;
-    if (plugin_name == NULL || strcmp(plugin_name, "mysql_native_password") == 0)
-    {
-        if (auth->initial_auth_response_len != MYSQL_SCRAMBLE_LEN)
-            ereport(FATAL,
-                    (errcode(ERRCODE_INVALID_PASSWORD),
-                     errmsg("MySQL authentication failed for user \"%s\"",
-                            port->user_name)));
 
+    if (auth->initial_auth_response_len == MYSQL_SCRAMBLE_LEN)
+    {
+        /* Client sent native password directly (legacy / older client). */
         auth_response = auth->initial_auth_response;
         auth_response_len = auth->initial_auth_response_len;
     }
-    else if (strcmp(plugin_name, "caching_sha2_password") == 0)
+    else if (auth->initial_auth_response_len == 0 ||
+             auth->initial_auth_response_len == SHA256_DIGEST_LENGTH)
     {
         char        switch_pkt[64];
         char       *switch_response;

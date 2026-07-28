@@ -43,6 +43,7 @@
 #include "utils/elog.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "fmgr.h"
 #include "utils/guc.h"
 #include "utils/syscache.h"
 
@@ -377,6 +378,7 @@ mysql_field_default_value(Relation rel, TupleDesc desc, Form_pg_attribute attr)
 	Oid		outputfunc;
 	bool		isvarlena;
 	char	   *result;
+	int		len;
 
 	if (!attr->atthasdef)
 		return NULL;
@@ -396,6 +398,20 @@ mysql_field_default_value(Relation rel, TupleDesc desc, Form_pg_attribute attr)
 		return NULL;
 	getTypeOutputInfo(constant->consttype, &outputfunc, &isvarlena);
 	result = OidOutputFunctionCall(outputfunc, constant->constvalue);
+
+	/*
+	 * PostgreSQL bpchar (CHAR) stores blank-padded values.  MySQL
+	 * COM_FIELD_LIST must return the default as declared in the DDL,
+	 * not the storage representation.  Strip trailing spaces for
+	 * bpchar defaults so that CHAR(8) DEFAULT 'fixed' surfaces as
+	 * 'fixed' rather than 'fixed   '.
+	 */
+	if (attr->atttypid == BPCHAROID)
+	{
+		len = strlen(result);
+		while (len > 0 && result[len - 1] == ' ')
+			result[--len] = '\0';
+	}
 	return result;
 }
 
@@ -1022,6 +1038,9 @@ mysql_end_command(const QueryCompletion *qc,
          */
         if (tag == CMDTAG_SELECT)
         {
+			/* Track row count for FOUND_ROWS() */
+			mysql_packet_set_found_rows(mysql_ps(), qc->nprocessed);
+
             if (caps & MYSQL_CAP_DEPRECATE_EOF)
             {
                 /*
@@ -1279,4 +1298,16 @@ void
 InitMySQLProtocolRoutine(void)
 {
     RegisterProtocolRoutine(&MySQLProtocolRoutine);
+}
+
+/* ----------------------------------------------------------------
+ *    SQL-callable helpers (registered in pg_proc.dat)
+ * ----------------------------------------------------------------
+ */
+PG_FUNCTION_INFO_V1(mys_found_rows);
+
+Datum
+mys_found_rows(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) mysql_packet_get_found_rows(mysql_ps()));
 }

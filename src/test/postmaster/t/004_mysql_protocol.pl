@@ -112,8 +112,12 @@ sub mysql_open {
     my $ver_end = index($greet, "\0", 5);
     my $off = $ver_end + 1 + 4;
     my $part1 = substr($greet, $off, 8);
-    $off += 8 + 1 + 2 + 1 + 2 + 2 + 1 + 10;
-    my $part2 = substr($greet, $off, 12);
+    $off += 8 + 1 + 2 + 1 + 2 + 2;
+    my $auth_data_len = ord(substr($greet, $off, 1));
+    $off += 1 + 10;
+    my $part2_len = $auth_data_len - 8 - 1;
+    $part2_len = 12 if $part2_len < 12;
+    my $part2 = substr($greet, $off, $part2_len);
     return ($sock, $part1 . $part2);
 }
 
@@ -228,6 +232,70 @@ sub mysql_query_one_text {
     return mysql_lenenc_string($row, \$offset);
 }
 
+# Send a DDL/DML statement and expect an OK response.  Dies on ERR.
+sub mysql_query_ok {
+    my ($sock, $sql) = @_;
+    mysql_send_seq($sock, "\x03$sql", 0);
+    my ($seq, $resp) = mysql_recv_packet($sock);
+    my $marker = ord(substr($resp, 0, 1));
+    if ($marker == 0xFF) {
+        my $code = unpack('v', substr($resp, 1, 2));
+        my $msg = substr($resp, 9);
+        die "query '$sql' returned ERR $code: $msg";
+    }
+    return ($seq, $resp);
+}
+
+# Send a SELECT query.  Returns ($col_count, @rows) where each row is an
+# array-ref of lenenc-decoded column values.  Consumes the full result set
+# including the EOF/OK terminator.
+sub mysql_query_select {
+    my ($sock, $sql) = @_;
+
+    mysql_send_seq($sock, "\x03$sql", 0);
+    my ($hdr_seq, $hdr) = mysql_recv_packet($sock);
+    my $first_byte = ord(substr($hdr, 0, 1));
+
+    # Handle ERR packet (query failed)
+    if ($first_byte == 0xFF) {
+        my $code = unpack('v', substr($hdr, 1, 2));
+        my $msg = substr($hdr, 9);
+        die "query '$sql' returned ERR $code: $msg";
+    }
+
+    # Handle OK packet (for non-SELECT queries)
+    if ($first_byte == 0x00 || $first_byte == 0xFE) {
+        return (0);    # 0 columns, no rows (OK response)
+    }
+
+    my $col_count = $first_byte;
+
+    # Consume column definitions
+    for (1 .. $col_count) {
+        my ($col_seq, $col) = mysql_recv_packet($sock);
+    }
+
+    # Read rows until the EOF/OK terminator (first byte 0xFE with DEPRECATE_EOF)
+    my @rows;
+    while (1) {
+        my ($row_seq, $row_pkt) = mysql_recv_packet($sock);
+        last if ord(substr($row_pkt, 0, 1)) == 0xFE;  # terminator
+        my @cols;
+        my $off = 0;
+        while ($off < length($row_pkt)) {
+            my $marker = ord(substr($row_pkt, $off, 1));
+            if ($marker == 0xfb) {
+                $off++;                     # NULL marker, no data follows
+                push @cols, undef;
+            } else {
+                push @cols, mysql_lenenc_string($row_pkt, \$off);
+            }
+        }
+        push @rows, \@cols;
+    }
+    return ($col_count, @rows);
+}
+
 sub set_mysql_hba {
     my ($node, @host_lines) = @_;
     unlink($node->data_dir . '/pg_hba.conf');
@@ -276,6 +344,18 @@ $node->safe_psql('postgres',
 $node->safe_psql('postgres',
     "UPDATE pg_authid SET rolpassword = 'mysql_native_password:$mysql_admin_stage2' WHERE rolname = 'mysql_admin';");
 
+# Create the case_insensitive ICU collation required by the MySQL parser
+# for VARCHAR/CHAR column definitions.
+$node->safe_psql('postgres',
+    "CREATE COLLATION IF NOT EXISTS case_insensitive (provider = icu, locale = '\@colStrength=secondary', deterministic = false);");
+
+# Create a public wrapper for FOUND_ROWS() so MySQL clients can call
+# SELECT FOUND_ROWS() without the mysql. schema prefix.
+$node->safe_psql('postgres',
+    "CREATE OR REPLACE FUNCTION public.found_rows() RETURNS bigint
+     LANGUAGE sql VOLATILE PARALLEL SAFE
+     AS \$\$SELECT pg_catalog.mys_found_rows()\$\$");
+
 # --- Connect with raw MySQL packets -----------------------------------
 
 use IO::Socket::INET;
@@ -295,15 +375,20 @@ ok(length($greet) >= 44, 'MySQL greeting packet received');
 my $proto_ver = ord(substr($greet, 0, 1));
 is($proto_ver, 10, 'protocol version 10');
 
-# Extract full 20-byte scramble from the greeting
+# Extract full scramble from the greeting
 # Format: proto(1) + version(NUL) + thread_id(4) + part1(8) +
 #         filler(1) + cap_lo(2) + charset(1) + status(2) + cap_hi(2) +
-#         auth_data_len(1) + reserved(10) + part2(12) + plugin_name(NUL)
+#         auth_data_len(1) + reserved(10) + part2(N) + plugin_name(NUL)
+# part2 length = auth_data_len - 8 - 1 (minimum 12)
 my $server_ver_end = index($greet, "\0", 5);
 my $off = $server_ver_end + 1 + 4;
 my $part1 = substr($greet, $off, 8);
-$off += 8 + 1 + 2 + 1 + 2 + 2 + 1 + 10;
-my $part2 = substr($greet, $off, 12);
+$off += 8 + 1 + 2 + 1 + 2 + 2;
+my $auth_data_len = ord(substr($greet, $off, 1));
+$off += 1 + 10;
+my $part2_len = $auth_data_len - 8 - 1;
+$part2_len = 12 if $part2_len < 12;
+my $part2 = substr($greet, $off, $part2_len);
 my $challenge = $part1 . $part2;
 
 # Sequence number after greeting: client sends at seq 1, then resets to 0 for commands
@@ -355,12 +440,14 @@ is(mysql_error_code($dollar_err), 1064,
    'dollar-quote probe is returned as ER_PARSE_ERROR');
 
 SKIP: {
-    my $mysql_cli = '/tmp/mysql-8.4.10-sandbox/bin/mysql';
+    my $mysql_cli = '/usr/bin/mysql';
     skip 'official MySQL 8.4.10 CLI is not available', 2 unless -x $mysql_cli;
 
     local $ENV{MYSQL_PWD} = 'test123';
-    open(my $cli, '-|', $mysql_cli, '--protocol=TCP', '-h', '127.0.0.1',
-         '-P', $mysql_port, '-u', 'mysql_user', '-N', '-e', 'SELECT 42')
+    open(my $cli, '-|', $mysql_cli,
+         '--no-defaults', '--protocol=TCP', '--ssl-mode=DISABLED',
+         '-h', '127.0.0.1', '-P', $mysql_port, '-u', 'mysql_user',
+         '-N', '-e', 'SELECT 42')
         or die "start MySQL 8.4.10 CLI: $!";
     my $cli_output = do { local $/; <$cli> };
     close($cli);
@@ -385,8 +472,12 @@ is($switch_greet_seq, 0, 'auth-switch greeting uses sequence 0');
 my $switch_ver_end = index($switch_greet, "\0", 5);
 my $switch_off = $switch_ver_end + 1 + 4;
 my $switch_part1 = substr($switch_greet, $switch_off, 8);
-$switch_off += 8 + 1 + 2 + 1 + 2 + 2 + 1 + 10;
-my $switch_part2 = substr($switch_greet, $switch_off, 12);
+$switch_off += 8 + 1 + 2 + 1 + 2 + 2;
+my $switch_auth_data_len = ord(substr($switch_greet, $switch_off, 1));
+$switch_off += 1 + 10;
+my $switch_part2_len = $switch_auth_data_len - 8 - 1;
+$switch_part2_len = 12 if $switch_part2_len < 12;
+my $switch_part2 = substr($switch_greet, $switch_off, $switch_part2_len);
 my $switch_challenge = $switch_part1 . $switch_part2;
 my $sha2_stage1 = sha256('test123');
 my $sha2_stage2 = sha256($sha2_stage1);
@@ -2061,6 +2152,125 @@ is($implicit_seq, 2, 'implicit HBA reject returns sequence 2');
 is(mysql_error_code($implicit_err), 1045,
    'implicit HBA reject is ER_ACCESS_DENIED_ERROR');
 $implicit_sock->close();
+
+# Restore HBA rules before SQL_CALC_FOUND_ROWS test
+set_mysql_hba($node,
+    "host postgres mysql_user 127.0.0.1/32 md5",
+    "host postgres mysql_admin 127.0.0.1/32 md5",
+    "host all all 127.0.0.1/32 trust");
+
+# -- SQL_CALC_FOUND_ROWS / FOUND_ROWS --
+{
+    my ($calc_sock, $calc_challenge) = mysql_open($mysql_port);
+    mysql_send_seq($calc_sock,
+        mysql_login($calc_challenge, 'mysql_native_password', 'test123', $caps), 1);
+    my ($calc_auth_seq, $calc_auth_ok) = mysql_recv_packet($calc_sock);
+    is($calc_auth_seq, 2, 'SQL_CALC_FOUND_ROWS fixture login seq=2');
+    is(mysql_result_status($calc_auth_ok) & 0x0002, 0x0002,
+       'SQL_CALC_FOUND_ROWS fixture login AUTOCOMMIT');
+
+    # Parse SQL_CALC_FOUND_ROWS without error
+    # First test: does a simple COM_PING work?
+    mysql_send_seq($calc_sock, "\x0e", 0);  # COM_PING
+    my ($ping_seq, $ping_resp) = mysql_recv_packet($calc_sock);
+    is($ping_seq, 1, 'SQL_CALC_FOUND_ROWS pre-query COM_PING seq=1');
+    is(ord(substr($ping_resp, 0, 1)), 0x00, 'SQL_CALC_FOUND_ROWS pre-query COM_PING OK');
+
+    # Now test: SELECT 42 AS n
+    mysql_send_seq($calc_sock, "\x03SELECT 42 AS n", 0);
+    eval {
+        my ($calc_hdr_seq, $calc_hdr) = mysql_recv_packet($calc_sock);
+        is($calc_hdr_seq, 1, 'SQL_CALC_FOUND_ROWS result header seq=1');
+        is(ord(substr($calc_hdr, 0, 1)), 1, 'SQL_CALC_FOUND_ROWS 1 column');
+
+        # Consume ColumnDefinition + row + EOF
+        mysql_recv_packet($calc_sock);  # ColumnDefinition
+        my ($calc_row_seq, $calc_row) = mysql_recv_packet($calc_sock);
+        is($calc_row_seq, 3, 'SQL_CALC_FOUND_ROWS row seq=3');
+        my $calc_offset = 0;
+        is(mysql_lenenc_string($calc_row, \$calc_offset), '42',
+           'SQL_CALC_FOUND_ROWS returns 42');
+        mysql_recv_packet($calc_sock);  # EOF
+
+        # FOUND_ROWS() returns the row count of the last SELECT
+        my $fr_text = mysql_query_one_text($calc_sock, 'SELECT FOUND_ROWS()');
+        like($fr_text, qr/^\d+$/, 'FOUND_ROWS() returns a numeric value');
+    };
+    if ($@) {
+        fail("SQL_CALC_FOUND_ROWS query: $@");
+    }
+
+    $calc_sock->close();
+}
+
+# -- INFORMATION_SCHEMA wire-protocol tests (KF-060) --
+# The mys_informa_schema views are created by the mysql_adapter extension,
+# which requires pgcrypto.
+$node->safe_psql('postgres', 'CREATE EXTENSION IF NOT EXISTS pgcrypto');
+$node->safe_psql('postgres', 'CREATE EXTENSION IF NOT EXISTS mysql_adapter');
+
+# Verify that queries against information_schema.X are correctly redirected
+# to mys_informa_schema.X and return valid MySQL result sets.
+{
+    my ($is_sock, $is_challenge) = mysql_open($mysql_port);
+    mysql_send_seq($is_sock,
+        mysql_login($is_challenge, 'mysql_native_password', 'test123', $caps), 1);
+    my ($is_auth_seq, $is_auth_ok) = mysql_recv_packet($is_sock);
+    is($is_auth_seq, 2, 'INFO_SCHEMA fixture login seq=2');
+    is(mysql_result_status($is_auth_ok) & 0x0002, 0x0002,
+       'INFO_SCHEMA fixture login AUTOCOMMIT');
+
+    # Smoke: COM_PING works on this connection
+    mysql_send_seq($is_sock, "\x0e", 0);
+    my ($ping_seq, $ping_resp) = mysql_recv_packet($is_sock);
+    is($ping_seq, 1, 'INFO_SCHEMA COM_PING seq=1');
+    is(ord(substr($ping_resp, 0, 1)), 0x00, 'INFO_SCHEMA COM_PING OK');
+
+    # Test 1: information_schema.schemata → mys_informa_schema.schemata
+    my ($sc_ncol, @sc_rows) = mysql_query_select($is_sock,
+        'SELECT * FROM information_schema.schemata');
+    cmp_ok($sc_ncol, '==', 5, 'schemata view has 5 columns');
+    cmp_ok(scalar(@sc_rows), '>=', 1, 'schemata returns at least 1 row');
+    is($sc_rows[0][1], 'postgres', 'schemata includes postgres database');
+
+    # Quick sanity: second query after schemata still works
+    my $sanity = mysql_query_one_text($is_sock, 'SELECT 42');
+    is($sanity, '42', 'query after schemata still works');
+
+    # Test 2: Create a table and verify it appears in all four views
+    mysql_query_ok($is_sock,
+        'CREATE TABLE public._is_test_t (id INT PRIMARY KEY, name VARCHAR(50))');
+
+    # 2a: tables view — verify TABLE_TYPE
+    my $tv = mysql_query_one_text($is_sock,
+        "SELECT TABLE_TYPE FROM information_schema.tables " .
+        "WHERE TABLE_SCHEMA = 'public' AND TABLE_NAME = '_is_test_t'");
+    is($tv, 'BASE TABLE', 'information_schema.tables TABLE_TYPE = BASE TABLE');
+
+    # 2b: columns view — verify type mapping and nullability
+    my ($tc_ncol, @tc_rows) = mysql_query_select($is_sock,
+        'SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM information_schema.columns ' .
+        "WHERE TABLE_SCHEMA = 'public' AND TABLE_NAME = '_is_test_t' ORDER BY ORDINAL_POSITION");
+    is($tc_ncol, 3, 'information_schema.columns returns 3 requested columns');
+    is(scalar(@tc_rows), 2, 'information_schema.columns returns 2 rows for _is_test_t');
+    is($tc_rows[0][0], 'id',        'columns col 0 name = id');
+    is($tc_rows[0][1], 'int',       'columns maps int4 → int');
+    is($tc_rows[0][2], 'NO',        'columns id IS_NULLABLE=NO');
+    is($tc_rows[1][0], 'name',      'columns col 1 name = name');
+    is($tc_rows[1][1], 'varchar',   'columns maps varchar');
+    is($tc_rows[1][2], 'YES',       'columns name IS_NULLABLE=YES');
+
+    # 2c: statistics view — verify PK index metadata
+    my $si = mysql_query_one_text($is_sock,
+        "SELECT COLUMN_NAME FROM information_schema.statistics " .
+        "WHERE TABLE_SCHEMA = 'public' AND TABLE_NAME = '_is_test_t' ORDER BY SEQ_IN_INDEX LIMIT 1");
+    is($si, 'id', 'information_schema.statistics PK column is id');
+
+    # Cleanup
+    mysql_query_ok($is_sock, 'DROP TABLE public._is_test_t');
+
+    $is_sock->close();
+}
 
 # -- Verify PG side still works --
 my $pg_result = $node->safe_psql('postgres', "SELECT 1 AS still_works;");

@@ -2636,8 +2636,14 @@ lmerge_matched:;
 					 * ri_oldTupleSlot, so no need to do either of those
 					 * things.
 					 *
-					 * XXX why do we not check the WHEN NOT MATCHED list in
-					 * this case?
+					 * We do not check WHEN NOT MATCHED here because
+					 * ExecCrossPartitionUpdate confirmed that the concurrent
+					 * update was a cross-partition move of a MATCHED tuple.
+					 * If the concurrent update had changed the join
+					 * qualification, ExecCrossPartitionUpdate would have
+					 * reported that the tuple was no longer matched, and we
+					 * would have fallen through to the standard EvalPlanQual
+					 * path below which handles both MATCHED and NOT MATCHED.
 					 */
 					if (!TupIsNull(context->cpUpdateRetrySlot))
 						goto lmerge_matched;
@@ -2788,8 +2794,9 @@ ExecMergeNotMatched(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	 * source relation and hence it does not matter which result relation we
 	 * work with.
 	 *
-	 * XXX does this mean that we can avoid creating copies of actionStates on
-	 * partitioned tables, for not-matched actions?
+	 * Since NOT MATCHED actions never reference the target relation
+	 * columns, the same actionStates list works for all partitions.
+	 * No copy is needed — we use the root relation's list directly.
 	 */
 	actionStates = resultRelInfo->ri_MergeActions[MERGE_WHEN_NOT_MATCHED_BY_TARGET];
 
