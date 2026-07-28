@@ -414,6 +414,7 @@ static const struct config_enum_entry plan_cache_mode_options[] = {
 
 static const struct config_enum_entry password_encryption_options[] = {
 	{"md5", PASSWORD_TYPE_MD5, false},
+	{"mysql_native_password", PASSWORD_TYPE_MYSQL_NATIVE_PASSWORD, false},
 	{"scram-sha-256", PASSWORD_TYPE_SCRAM_SHA_256, false},
 	{NULL, 0, false}
 };
