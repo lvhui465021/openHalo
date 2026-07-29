@@ -3733,7 +3733,7 @@ END;
 $$
 LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION mysql.round(numeric, integer)
+CREATE OR REPLACE FUNCTION mysql.round(numeric, integer DEFAULT 0)
 RETURNS numeric
 AS
 $$
@@ -6665,7 +6665,7 @@ $$
 strict language 'plpgsql';
 
 CREATE OR REPLACE FUNCTION mysql.rand()
-RETURNS numeric
+RETURNS float8
 AS
 $$
 BEGIN
@@ -6675,7 +6675,7 @@ $$
 language 'plpgsql';
 
 CREATE OR REPLACE FUNCTION mysql.rand(integer)
-RETURNS numeric
+RETURNS float8
 AS
 $$
 BEGIN
@@ -6685,7 +6685,7 @@ $$
 language 'plpgsql';
 
 CREATE OR REPLACE FUNCTION mysql.rand(bigint)
-RETURNS numeric
+RETURNS float8
 AS
 $$
 BEGIN
@@ -9133,7 +9133,7 @@ begin
 end;
 $function$;
 
-create function mysql.JSON_UNQUOTE(json)
+create or replace function mysql.JSON_UNQUOTE(json)
 returns text
 as
 $$
@@ -17863,12 +17863,12 @@ $$
 IMMUTABLE STRICT LANGUAGE 'plpgsql';
 
 CREATE OR REPLACE FUNCTION mysql.log2(double precision)
-RETURNS pg_catalog.numeric
+RETURNS double precision
 AS
 $$
 BEGIN
     if ($1 != 0) then
-        return pg_catalog.log(2, $1::pg_catalog.numeric);
+        return pg_catalog.log(2, $1::pg_catalog.numeric)::double precision;
     else
         return null;
     end if;
@@ -18220,4 +18220,3 @@ GRANT ALL PRIVILEGES ON ALL tables IN SCHEMA mysql TO public;
 GRANT ALL PRIVILEGES ON ALL tables IN SCHEMA mys_informa_schema TO public;
 GRANT ALL PRIVILEGES ON ALL tables IN SCHEMA sys TO public;
 GRANT ALL PRIVILEGES ON ALL tables IN SCHEMA mys_sys TO public;
-

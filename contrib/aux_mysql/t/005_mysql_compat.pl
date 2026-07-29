@@ -64,7 +64,7 @@ $node->restart;
 sleep 1;
 
 # --- create extension and test user ------------------------------------
-$node->safe_psql('postgres', 'CREATE EXTENSION mysql_adapter CASCADE');
+$node->safe_psql('postgres', 'CREATE EXTENSION aux_mysql CASCADE');
 $node->safe_psql(
     'postgres', q{
 SET password_encryption = 'mysql_native_password';

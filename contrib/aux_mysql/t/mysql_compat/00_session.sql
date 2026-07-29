@@ -1,12 +1,12 @@
 -- MySQL-protocol compatibility suite: session, database and variable semantics.
 -- Prerequisite: connect through the MySQL listener as a superuser to a database
--- that has mysql_adapter installed (normally a database cloned from template1).
+-- that has aux_mysql installed (normally a database cloned from template1).
 
 USE unvdb_mysqldb;
 
 SELECT 'extension_installed' AS test_name,
        COUNT(*) = 1 AND COALESCE(MAX(extversion), 'missing') <> 'missing' AS passed
-FROM pg_extension WHERE extname = 'mysql_adapter';
+FROM pg_extension WHERE extname = 'aux_mysql';
 SELECT 'protocol_listener_on' AS test_name,
        current_setting('mysql.listener_on') = 'on'
        AND current_setting('mysql.port') IS NOT NULL

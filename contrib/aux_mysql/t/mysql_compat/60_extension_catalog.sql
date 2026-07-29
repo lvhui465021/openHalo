@@ -1,4 +1,4 @@
--- MySQL-protocol compatibility suite: current mysql_adapter inventory.
+-- MySQL-protocol compatibility suite: current aux_mysql inventory.
 -- Runtime-based checks (PG18 baseline, not hardcoded UDB-TX numbers).
 -- The required API manifest contains user-visible function names;
 -- internal cast/operator helpers are covered by the signature counts.
@@ -35,7 +35,7 @@ INSERT INTO mysql_compat_required_api(function_name) VALUES
 -- Extension is installed with a valid version
 SELECT 'extension_version' AS test_name,
        extversion IS NOT NULL AND extversion::numeric >= 1.0 AS passed
-FROM pg_extension WHERE extname = 'mysql_adapter';
+FROM pg_extension WHERE extname = 'aux_mysql';
 
 -- mysql schema has a significant number of functions (>100)
 SELECT 'mysql_function_catalog_baseline' AS test_name,
@@ -64,7 +64,7 @@ WHERE n.nspname = 'mys_informa_schema'
   AND c.relkind IN ('r', 'v', 'm');
 
 DROP TEMPORARY TABLE mysql_compat_required_api;
--- MySQL-protocol compatibility suite: current mysql_adapter inventory.
+-- MySQL-protocol compatibility suite: current aux_mysql inventory.
 -- Counts are the PG16/UDB-TX 1.5 baseline, not the older OpenHalo aux_mysql
 -- numbers.  The required API manifest contains user-visible function names;
 -- internal cast/operator helpers are covered by the signature counts.
@@ -100,7 +100,7 @@ INSERT INTO mysql_compat_required_api(function_name) VALUES
 
 SELECT 'extension_version' AS test_name,
        extversion = '1.5' AS passed
-FROM pg_extension WHERE extname = 'mysql_adapter';
+FROM pg_extension WHERE extname = 'aux_mysql';
 
 SELECT 'mysql_function_catalog_baseline' AS test_name,
        COUNT(DISTINCT p.proname) = 590
@@ -120,7 +120,7 @@ SELECT 'mysql_type_operator_baseline' AS test_name,
 SELECT 'extension_member_baseline' AS test_name,
        COUNT(*) = 1783 AS passed
 FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid
-WHERE e.extname = 'mysql_adapter' AND d.deptype = 'e';
+WHERE e.extname = 'aux_mysql' AND d.deptype = 'e';
 
 SELECT 'required_public_api_present' AS test_name,
        COUNT(*) = 0 AS passed

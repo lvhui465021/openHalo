@@ -2204,10 +2204,10 @@ set_mysql_hba($node,
 }
 
 # -- INFORMATION_SCHEMA wire-protocol tests (KF-060) --
-# The mys_informa_schema views are created by the mysql_adapter extension,
+# The mys_informa_schema views are created by the aux_mysql extension,
 # which requires pgcrypto.
 $node->safe_psql('postgres', 'CREATE EXTENSION IF NOT EXISTS pgcrypto');
-$node->safe_psql('postgres', 'CREATE EXTENSION IF NOT EXISTS mysql_adapter');
+$node->safe_psql('postgres', 'CREATE EXTENSION IF NOT EXISTS aux_mysql');
 
 # Verify that queries against information_schema.X are correctly redirected
 # to mys_informa_schema.X and return valid MySQL result sets.

@@ -1,7 +1,8 @@
-# contrib/mysql_adapter/Makefile
+# contrib/aux_mysql/Makefile
 
-EXTENSION = mysql_adapter
-DATA = mysql_adapter--1.0.sql mysql_adapter--1.0--1.1.sql mysql_adapter--1.1--1.0.sql mysql_adapter--1.1.sql
+EXTENSION = aux_mysql
+DATA = aux_mysql--1.1.sql aux_mysql--1.1--1.2.sql aux_mysql--1.2--1.3.sql \
+	aux_mysql--1.3--1.4.sql aux_mysql--1.4--1.5.sql
 
 REGRESS = versioning
 
@@ -12,7 +13,7 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else
-subdir = contrib/mysql_adapter
+subdir = contrib/aux_mysql
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk

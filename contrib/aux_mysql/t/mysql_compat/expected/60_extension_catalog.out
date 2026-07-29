@@ -44,7 +44,7 @@ Query OK, 116 rows affected
 --------------
 SELECT 'extension_version' AS test_name,
        extversion = '1.5' AS passed
-FROM pg_extension WHERE extname = 'mysql_adapter'
+FROM pg_extension WHERE extname = 'aux_mysql'
 --------------
 
 test_name	passed
@@ -82,7 +82,7 @@ mysql_type_operator_baseline	1
 SELECT 'extension_member_baseline' AS test_name,
        COUNT(*) = 1783 AS passed
 FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid
-WHERE e.extname = 'mysql_adapter' AND d.deptype = 'e'
+WHERE e.extname = 'aux_mysql' AND d.deptype = 'e'
 --------------
 
 test_name	passed

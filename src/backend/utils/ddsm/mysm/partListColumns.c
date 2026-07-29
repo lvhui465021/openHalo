@@ -13,7 +13,7 @@
  *-------------------------------------------------------------------------
  */
 
-#include "unvdb.h"
+#include "mysm_compat.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -115,4 +115,3 @@ build_concat_foutcache(FunctionCallInfo fcinfo, int argidx)
 
 	return foutcache;
 }
-

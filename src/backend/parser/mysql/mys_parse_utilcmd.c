@@ -2469,7 +2469,7 @@ generateSetExtraStmts(CreateStmtContext *cxt, ColumnDef *column)
 	 * the domain: PostgreSQL performs domain checks before BEFORE triggers,
 	 * but a MySQL SET trigger must first canonicalize duplicate/out-of-order
 	 * input.  The check function is a pg_catalog builtin so DDL does not
-	 * depend on installing mysql_adapter first.
+	 * depend on installing aux_mysql first.
 	 */
 	typnamespace = RangeVarGetCreationNamespace(relation);
 	RangeVarAdjustRelationPersistence(relation, typnamespace);

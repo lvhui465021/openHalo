@@ -7,7 +7,7 @@
  * parser creates a schema-local domain and a table-level CHECK which invokes
  * mys_check_set() with the declared labels.  Keeping the functions in the
  * backend makes CREATE TABLE independent of whether the optional
- * mysql_adapter extension has already been installed.
+ * aux_mysql extension has already been installed.
  *
  *-------------------------------------------------------------------------
  */

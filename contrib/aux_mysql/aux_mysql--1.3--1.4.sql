@@ -1,5 +1,9 @@
 
+drop view if exists mys_informa_schema.statistics;
 drop table if exists mys_informa_schema.statistics;
+drop view if exists mys_informa_schema.schemata;
+drop view if exists mys_informa_schema.tables;
+drop view if exists mys_informa_schema.columns;
 create table mys_informa_schema.statistics(
     TABLE_CATALOG varchar(256),
     TABLE_SCHEMA varchar(256),
@@ -5586,11 +5590,10 @@ LANGUAGE C;
 
 DELETE FROM mys_informa_schema.base_variables WHERE variable_name = 'datadir';
 DELETE FROM mys_informa_schema.base_variables WHERE variable_name = 'character_sets_dir';
-INSERT INTO mys_informa_schema.base_variables VALUES ('datadir', mysql.getenv('PGDATA'), mysql.getenv('PGDATA'), 0, true, false, null, null, null);
-INSERT INTO mys_informa_schema.base_variables VALUES ('character_sets_dir', mysql.getenv('PGDATA'), mysql.getenv('PGDATA'), 0, true, false, null, null, null);
+INSERT INTO mys_informa_schema.base_variables VALUES ('datadir', current_setting('data_directory'), current_setting('data_directory'), 0, true, false, null, null, null);
+INSERT INTO mys_informa_schema.base_variables VALUES ('character_sets_dir', current_setting('data_directory'), current_setting('data_directory'), 0, true, false, null, null, null);
 
 GRANT ALL PRIVILEGES ON ALL tables IN SCHEMA mysql TO public;
 GRANT ALL PRIVILEGES ON ALL tables IN SCHEMA mys_informa_schema TO public;
 GRANT ALL PRIVILEGES ON ALL tables IN SCHEMA sys TO public;
 GRANT ALL PRIVILEGES ON ALL tables IN SCHEMA mys_sys TO public;
-

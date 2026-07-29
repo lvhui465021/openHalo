@@ -13,7 +13,7 @@
  *-------------------------------------------------------------------------
  */
 
-#include "unvdb.h"
+#include "mysm_compat.h"
 
 #include "fmgr.h"
 #include "datatype/timestamp.h"

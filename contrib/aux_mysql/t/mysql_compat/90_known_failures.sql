@@ -6,7 +6,7 @@
 -- SHOW DATABASES LIKE is not accepted by the current MySQL grammar.
 SHOW DATABASES LIKE 'mysql_compat_known_metadata';
 
--- SHOW STATUS variants translate to a relation not created by mysql_adapter 1.5.
+-- SHOW STATUS variants translate to a relation not created by aux_mysql 1.5.
 SHOW STATUS;
 SHOW SESSION STATUS;
 SHOW GLOBAL STATUS;
@@ -18,7 +18,7 @@ SELECT repeat('ab', 3);
 SELECT SQL_CALC_FOUND_ROWS oid FROM pg_class ORDER BY oid LIMIT 2;
 SELECT 'calc_found_rows' AS test_name, FOUND_ROWS() > 0 AS passed;
 
--- These MySQL encoding functions are not installed by mysql_adapter 1.5.
+-- These MySQL encoding functions are not installed by aux_mysql 1.5.
 SELECT UNHEX(CAST('616263' AS CHAR));
 SELECT TO_BASE64(CAST('abc' AS CHAR));
 SELECT FROM_BASE64(CAST('YWJj' AS CHAR));

@@ -13,7 +13,7 @@
  *-------------------------------------------------------------------------
  */
 
-#include "unvdb.h"
+#include "mysm_compat.h"
 
 #include "parser/scansup.h"
 #include "utils/builtins.h"

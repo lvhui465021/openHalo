@@ -13,9 +13,11 @@
  */
 
 
-#include "unvdb.h"
+#include "mysm_compat.h"
 
 #include "commands/sequence.h"
+
+extern void mys_setval3_oid(Oid seqOid, int64 next, bool isCalled);
 
 
 PG_FUNCTION_INFO_V1(mysSetval3Oid);
