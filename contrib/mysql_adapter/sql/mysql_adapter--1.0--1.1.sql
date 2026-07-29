@@ -879,13 +879,13 @@ LANGUAGE SQL;
 -- as SQL keywords.  Keep schema-qualified forms available to clients.
 CREATE OR REPLACE FUNCTION mysql.current_user()
 RETURNS text
-AS 'SELECT current_user'
-LANGUAGE SQL;
+AS '$libdir/mysm', 'getCurrentUser'
+LANGUAGE C STABLE;
 
-CREATE OR REPLACE FUNCTION mysql.session_user()
+CREATE OR REPLACE FUNCTION mysql."session_user"()
 RETURNS text
-AS 'SELECT session_user'
-LANGUAGE SQL;
+AS '$libdir/mysm', 'getSessionUser'
+LANGUAGE C STABLE;
 
 -- VERSION()
 CREATE OR REPLACE FUNCTION mysql.version()

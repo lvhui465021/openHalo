@@ -3,6 +3,7 @@ mysm_sources = files(
   'user_var.c',  
   'aggregates.c',
   'uuid_short.c',
+  'user.c',
   'texteq_mys.c',
   'mysm_globals.c',
   'uuid_stubs.c',
