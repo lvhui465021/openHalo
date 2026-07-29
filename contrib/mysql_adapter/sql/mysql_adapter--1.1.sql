@@ -1587,3 +1587,189 @@ insert into mys_informa_schema.base_variables values('query_alloc_block_size', '
 insert into mys_informa_schema.base_variables values('query_prealloc_size', '8192', '8192', 0, true, true, null, null, null);
 insert into mys_informa_schema.base_variables values('preload_buffer_size', '32768', '32768', 0, true, true, null, null, null);
 insert into mys_informa_schema.base_variables values('innodb_lock_wait_timeout', '50', '50', 0, true, true, null, null, null);
+
+-- =============================================================================
+-- M3: MySQL metadata query functions (ported from openHalo aux_mysql)
+-- =============================================================================
+
+-- show_table_columns: SHOW COLUMNS / SHOW FIELDS implementation
+-- Returns SETOF RECORD; column definition provided by grammar caller.
+CREATE OR REPLACE FUNCTION mysql.show_table_columns(
+    schema_name pg_catalog.text,
+    table_name pg_catalog.text)
+RETURNS SETOF RECORD
+AS $$
+DECLARE
+    sch_oid pg_catalog.Oid;
+    tab_oid pg_catalog.Oid;
+    rec RECORD;
+    def_val pg_catalog.text;
+    is_nullable pg_catalog.text;
+    col_key pg_catalog.text;
+    col_extra pg_catalog.text;
+    col_type pg_catalog.text;
+BEGIN
+    IF schema_name IS NOT NULL THEN
+        SELECT oid INTO sch_oid FROM pg_catalog.pg_namespace WHERE nspname = schema_name;
+    ELSE
+        SELECT oid INTO sch_oid FROM pg_catalog.pg_namespace WHERE nspname = pg_catalog.current_schema();
+    END IF;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'invalid schema name: %', schema_name;
+    END IF;
+    SELECT oid INTO tab_oid FROM pg_catalog.pg_class
+        WHERE relname = table_name AND relnamespace = sch_oid AND oid >= 16384;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Table ''%.%'' does not exist', schema_name, table_name;
+    END IF;
+
+    FOR rec IN
+        SELECT
+            a.attname::varchar(256) AS "Field",
+            pg_catalog.format_type(a.atttypid, a.atttypmod)::varchar(64) AS "Type",
+            CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END::varchar(8) AS "Null",
+            CASE WHEN pk.attname IS NOT NULL THEN 'PRI'
+                 WHEN uq.attname IS NOT NULL THEN 'UNI'
+                 WHEN ix.attname IS NOT NULL THEN 'MUL'
+                 ELSE '' END::varchar(256) AS "Key",
+            pg_catalog.pg_get_expr(d.adbin, d.adrelid)::text AS "Default",
+            CASE WHEN a.attidentity != '' THEN 'auto_increment'
+                 WHEN d.adbin IS NOT NULL AND pg_catalog.pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval%'
+                      THEN 'auto_increment'
+                 ELSE '' END::varchar(256) AS "Extra"
+        FROM pg_catalog.pg_attribute a
+        LEFT JOIN pg_catalog.pg_attrdef d ON (d.adrelid = a.attrelid AND d.adnum = a.attnum)
+        LEFT JOIN (
+            SELECT ic.relname, ia.attname
+            FROM pg_catalog.pg_index i
+            JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+            JOIN pg_catalog.pg_attribute ia ON (ia.attrelid = i.indrelid AND ia.attnum = ANY(i.indkey))
+            WHERE i.indisprimary AND i.indrelid = tab_oid
+            LIMIT 1
+        ) pk ON pk.attname = a.attname
+        LEFT JOIN (
+            SELECT ia.attname
+            FROM pg_catalog.pg_index i
+            JOIN pg_catalog.pg_attribute ia ON (ia.attrelid = i.indrelid AND ia.attnum = ANY(i.indkey))
+            WHERE i.indisunique AND NOT i.indisprimary AND i.indrelid = tab_oid
+            LIMIT 1
+        ) uq ON uq.attname = a.attname AND pk.attname IS NULL
+        LEFT JOIN (
+            SELECT ia.attname
+            FROM pg_catalog.pg_index i
+            JOIN pg_catalog.pg_attribute ia ON (ia.attrelid = i.indrelid AND ia.attnum = ANY(i.indkey))
+            WHERE NOT i.indisunique AND i.indrelid = tab_oid
+            LIMIT 1
+        ) ix ON ix.attname = a.attname AND pk.attname IS NULL AND uq.attname IS NULL
+        WHERE a.attrelid = tab_oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    LOOP
+        RETURN NEXT rec;
+    END LOOP;
+    RETURN;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- show_table_indexs: SHOW INDEX / SHOW KEYS implementation
+-- Returns SETOF RECORD; column definition provided by grammar caller.
+CREATE OR REPLACE FUNCTION mysql.show_table_indexs(
+    schema_name pg_catalog.text,
+    table_name pg_catalog.text)
+RETURNS SETOF RECORD
+AS $$
+DECLARE
+    sch_oid pg_catalog.Oid;
+    tab_oid pg_catalog.Oid;
+    rec RECORD;
+    idx_rec RECORD;
+    keys pg_catalog.int2[];
+    key_idx pg_catalog.int4;
+    seq_num pg_catalog.int4;
+    col_name pg_catalog.text;
+BEGIN
+    IF schema_name IS NOT NULL THEN
+        SELECT oid INTO sch_oid FROM pg_catalog.pg_namespace WHERE nspname = schema_name;
+    ELSE
+        SELECT oid INTO sch_oid FROM pg_catalog.pg_namespace WHERE nspname = pg_catalog.current_schema();
+    END IF;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Table ''%.%'' does not exist', schema_name, table_name;
+    END IF;
+    SELECT oid INTO tab_oid FROM pg_catalog.pg_class
+        WHERE relname = table_name AND relnamespace = sch_oid AND oid >= 16384;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Table ''%.%'' does not exist', schema_name, table_name;
+    END IF;
+
+    FOR idx_rec IN
+        SELECT
+            ic.relname AS index_name,
+            i.indisunique,
+            i.indisprimary,
+            i.indkey,
+            am.amname AS index_type
+        FROM pg_catalog.pg_index i
+        JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+        JOIN pg_catalog.pg_am am ON am.oid = ic.relam
+        WHERE i.indrelid = tab_oid
+    LOOP
+        keys := idx_rec.indkey;
+        seq_num := 1;
+        FOR key_idx IN 1..array_length(keys, 1) LOOP
+            SELECT attname INTO col_name FROM pg_catalog.pg_attribute
+                WHERE attrelid = tab_oid AND attnum = keys[key_idx];
+            SELECT
+                (SELECT c.relname FROM pg_catalog.pg_class c WHERE c.oid = tab_oid)::varchar(256),
+                CASE WHEN idx_rec.indisunique THEN 0 ELSE 1 END,
+                CASE WHEN idx_rec.indisprimary THEN 'PRIMARY' ELSE idx_rec.index_name END::varchar(256),
+                seq_num,
+                col_name::varchar(256),
+                'A'::varchar(256),
+                0,
+                NULL::int4,
+                NULL::varchar(256),
+                ''::varchar(8),
+                idx_rec.index_type::varchar(256),
+                ''::varchar(512),
+                ''::varchar(512)
+            INTO rec;
+            RETURN NEXT rec;
+            seq_num := seq_num + 1;
+        END LOOP;
+    END LOOP;
+    RETURN;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- timestampadd: MySQL TIMESTAMPADD(unit, interval, datetime)
+CREATE OR REPLACE FUNCTION mysql.timestampadd(
+    unit pg_catalog.text,
+    count_val pg_catalog.int4,
+    dt timestamp without time zone)
+RETURNS timestamp without time zone
+AS $$
+    SELECT CASE lower($1)
+        WHEN 'second' THEN $3 + ($2 || ' seconds')::pg_catalog.interval
+        WHEN 'minute' THEN $3 + ($2 || ' minutes')::pg_catalog.interval
+        WHEN 'hour'   THEN $3 + ($2 || ' hours')::pg_catalog.interval
+        WHEN 'day'    THEN $3 + ($2 || ' days')::pg_catalog.interval
+        WHEN 'week'   THEN $3 + ($2 * 7 || ' days')::pg_catalog.interval
+        WHEN 'month'  THEN $3 + ($2 || ' months')::pg_catalog.interval
+        WHEN 'quarter' THEN $3 + ($2 * 3 || ' months')::pg_catalog.interval
+        WHEN 'year'   THEN $3 + ($2 || ' years')::pg_catalog.interval
+        ELSE $3 + ($2 || ' days')::pg_catalog.interval
+    END
+$$ LANGUAGE SQL IMMUTABLE STRICT;
+
+-- str_to_date: basic implementation — casts to timestamp, ignores format
+CREATE OR REPLACE FUNCTION mysql.str_to_date(
+    str pg_catalog.text,
+    fmt pg_catalog.text)
+RETURNS timestamp without time zone
+AS $$
+BEGIN
+    RETURN str::timestamp without time zone;
+EXCEPTION WHEN OTHERS THEN
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE STRICT;
