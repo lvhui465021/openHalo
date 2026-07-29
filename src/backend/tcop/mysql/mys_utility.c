@@ -219,6 +219,10 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_MysVariableSetStmt:
 			return COMMAND_OK_IN_RECOVERY | COMMAND_OK_IN_READ_ONLY_TXN;
 
+		/* SELECT ... INTO @var reads a query result into session state. */
+		case T_MysSelectIntoStmt:
+			return COMMAND_IS_STRICTLY_READ_ONLY;
+
 		case T_ClusterStmt:
 		case T_ReindexStmt:
 		case T_VacuumStmt:
@@ -2042,11 +2046,11 @@ MysExecSetVariableStmt(ParseState *pstate, MysVariableSetStmt *parsetree, ParamL
         if (IsA(assignment, SelectStmt))
         {
             SelectStmt *select_stmt = castNode(SelectStmt, assignment);
+			ListCell   *target_cell;
 
-            if (list_length(select_stmt->targetList) == 1)
+			foreach(target_cell, select_stmt->targetList)
             {
-                ResTarget *target = linitial_node(ResTarget,
-                                                   select_stmt->targetList);
+				ResTarget *target = lfirst_node(ResTarget, target_cell);
 
                 if (IsA(target->val, FuncCall))
                 {
@@ -2057,6 +2061,9 @@ MysExecSetVariableStmt(ParseState *pstate, MysVariableSetStmt *parsetree, ParamL
                         strcmp(strVal(linitial(call->funcname)), "pg_catalog") == 0 &&
                         strcmp(strVal(lsecond(call->funcname)),
                                "mys_set_user_var") == 0;
+
+					if (user_variable_assignment)
+						break;
                 }
             }
         }

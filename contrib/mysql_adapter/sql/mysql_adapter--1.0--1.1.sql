@@ -1,5 +1,12 @@
 -- \echo mysql_adapter extension upgrading 1.0 -> 1.1
 
+-- Keep upgrades self-contained: MySQL DDL lowering expects these collations
+-- to be available through the mysql schema search-path entry.
+CREATE COLLATION mysql.case_insensitive
+    (provider = icu, locale = '@colStrength=secondary', deterministic = false);
+CREATE COLLATION mysql.ignore_accents
+    (provider = icu, locale = 'und-u-ks-level1-kc-true', deterministic = false);
+
 -- -----------------------------------------------------------------------------
 -- Domain fixes: complete CHECK constraints and add missing bare types
 -- -----------------------------------------------------------------------------
@@ -27,6 +34,15 @@ CREATE DOMAIN IF NOT EXISTS mysql.integer AS pg_catalog.int4;
 -- -----------------------------------------------------------------------------
 -- MySQL-compatible scalar functions: v1.1 string functions
 -- -----------------------------------------------------------------------------
+
+-- CONCAT(str1, str2, ...).  Unlike PostgreSQL concat(), MySQL returns NULL
+-- whenever any argument is NULL.
+CREATE OR REPLACE FUNCTION mysql.concat(VARIADIC text[])
+RETURNS text
+AS $$SELECT CASE WHEN array_position($1, NULL) IS NULL
+                 THEN array_to_string($1, '')
+            END$$
+LANGUAGE SQL IMMUTABLE;
 
 -- CONCAT_WS(sep, str1, str2, ...)
 CREATE OR REPLACE FUNCTION mysql.concat_ws(text, VARIADIC text[])
@@ -67,23 +83,118 @@ LANGUAGE SQL IMMUTABLE STRICT;
 -- HEX(N_or_S) -- returns hexadecimal string
 CREATE OR REPLACE FUNCTION mysql.hex(int8)
 RETURNS text
-AS 'SELECT pg_catalog.to_hex($1)'
+AS 'SELECT pg_catalog.upper(pg_catalog.to_hex($1))'
 LANGUAGE SQL IMMUTABLE STRICT;
 
 CREATE OR REPLACE FUNCTION mysql.hex(int4)
 RETURNS text
-AS 'SELECT pg_catalog.to_hex($1)'
+AS 'SELECT pg_catalog.upper(pg_catalog.to_hex($1))'
 LANGUAGE SQL IMMUTABLE STRICT;
 
 CREATE OR REPLACE FUNCTION mysql.hex(bytea)
 RETURNS text
-AS 'SELECT pg_catalog.encode($1, ''hex'')'
+AS 'SELECT pg_catalog.upper(pg_catalog.encode($1, ''hex''))'
 LANGUAGE SQL IMMUTABLE STRICT;
 
 CREATE OR REPLACE FUNCTION mysql.hex(text)
 RETURNS text
-AS 'SELECT pg_catalog.encode($1::bytea, ''hex'')'
+AS 'SELECT pg_catalog.upper(pg_catalog.encode($1::bytea, ''hex''))'
 LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.bin(int8)
+RETURNS text
+AS $$WITH RECURSIVE bits(value, result) AS (
+         SELECT $1, ''::text
+         UNION ALL
+         SELECT value >> 1, result || (value & 1::int8)::text
+         FROM bits WHERE value > 0
+     )
+     SELECT CASE WHEN $1 = 0 THEN '0' ELSE reverse(result) END
+     FROM bits WHERE value = 0$$
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.bin(int4)
+RETURNS text
+AS 'SELECT mysql.bin($1::int8)'
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.bit_count(int8)
+RETURNS int
+AS $$SELECT count(*)::int
+     FROM generate_series(0, 63) AS g(bit)
+     WHERE ($1 & (1::int8 << bit)) <> 0$$
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.bit_count(int4)
+RETURNS int
+AS 'SELECT mysql.bit_count($1::int8)'
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.conv(text, int, int)
+RETURNS text
+AS $$WITH RECURSIVE parsed(position, value) AS (
+         SELECT 1, 0::int8
+         UNION ALL
+         SELECT position + 1,
+                value * $2 + strpos('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                                    upper(substr($1, position, 1))) - 1
+         FROM parsed
+         WHERE position <= length($1)
+     ), converted(value, result) AS (
+         SELECT value, ''::text
+         FROM parsed WHERE position = length($1) + 1
+         UNION ALL
+         SELECT value / $3,
+                substr('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                       (value % $3)::int + 1, 1) || result
+         FROM converted WHERE value > 0
+     )
+     SELECT CASE WHEN value = 0 AND result = '' THEN '0' ELSE result END
+     FROM converted WHERE value = 0$$
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.ifnull(anycompatible, anycompatible)
+RETURNS anycompatible
+AS 'SELECT COALESCE($1, $2)'
+LANGUAGE SQL IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION mysql.ifnull(int4, int4)
+RETURNS int4
+AS 'SELECT COALESCE($1, $2)'
+LANGUAGE SQL IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION mysql.if(boolean, anycompatible, anycompatible)
+RETURNS anycompatible
+AS 'SELECT CASE WHEN $1 THEN $2 ELSE $3 END'
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.if(int4, anycompatible, anycompatible)
+RETURNS anycompatible
+AS 'SELECT CASE WHEN $1 <> 0 THEN $2 ELSE $3 END'
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.if(int4, text, text)
+RETURNS text
+AS 'SELECT CASE WHEN $1 <> 0 THEN $2 ELSE $3 END'
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.isnull(anyelement)
+RETURNS int
+AS 'SELECT CASE WHEN $1 IS NULL THEN 1 ELSE 0 END'
+LANGUAGE SQL IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION mysql.isnull(text)
+RETURNS int
+AS 'SELECT CASE WHEN $1 IS NULL THEN 1 ELSE 0 END'
+LANGUAGE SQL IMMUTABLE;
+
+-- Kept compatible with the UDB-TX PG16 implementation.  JSON values are
+-- represented by PostgreSQL's json type, whose scalar-string text form is
+-- quoted; remove that outer quoting for MySQL JSON_UNQUOTE().
+CREATE OR REPLACE FUNCTION mysql.json_unquote(json)
+RETURNS text
+AS 'SELECT trim(''"'' FROM $1::text)'
+LANGUAGE SQL;
 
 -- INSTR(str, substr) -- returns position of first occurrence
 CREATE OR REPLACE FUNCTION mysql.instr(text, text)
@@ -93,6 +204,44 @@ SELECT CASE WHEN $2 = '' THEN 1
             WHEN pg_catalog.strpos($1, $2) = 0 THEN 0
             ELSE pg_catalog.strpos($1, $2) END
 $$
+LANGUAGE SQL IMMUTABLE STRICT;
+
+-- LEFT(str, len) and RIGHT(str, len)
+CREATE OR REPLACE FUNCTION mysql.left(text, int)
+RETURNS text
+AS $$SELECT CASE WHEN $2 <= 0 THEN ''
+                 ELSE pg_catalog.substr($1, 1, $2) END$$
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.right(text, int)
+RETURNS text
+AS $$SELECT CASE WHEN $2 <= 0 THEN ''
+                 WHEN $2 >= pg_catalog.char_length($1) THEN $1
+                 ELSE pg_catalog.substr($1, pg_catalog.char_length($1) - $2 + 1) END$$
+LANGUAGE SQL IMMUTABLE STRICT;
+
+-- SUBSTR(str, pos, len) uses one-based positions; negative positions count
+-- backwards from the end, as in MySQL.
+CREATE OR REPLACE FUNCTION mysql.substr(text, int, int)
+RETURNS text
+AS $$SELECT CASE WHEN $2 = 0 OR $3 <= 0 THEN ''
+                 WHEN $2 > 0 THEN pg_catalog.substr($1, $2, $3)
+                 ELSE pg_catalog.substr($1, pg_catalog.char_length($1) + $2 + 1, $3)
+            END$$
+LANGUAGE SQL IMMUTABLE STRICT;
+
+-- LOCATE(substr, str [, pos])
+CREATE OR REPLACE FUNCTION mysql.locate(text, text)
+RETURNS int
+AS 'SELECT mysql.locate($1, $2, 1)'
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.locate(text, text, int)
+RETURNS int
+AS $$SELECT CASE WHEN $3 <= 0 THEN 0
+                 WHEN pg_catalog.strpos(pg_catalog.substr($2, $3), $1) = 0 THEN 0
+                 ELSE $3 - 1 + pg_catalog.strpos(pg_catalog.substr($2, $3), $1)
+            END$$
 LANGUAGE SQL IMMUTABLE STRICT;
 
 -- LCASE(str)
@@ -161,6 +310,45 @@ SELECT CASE
     ELSE ''
 END
 $$
+LANGUAGE SQL IMMUTABLE STRICT;
+
+-- ELT(N, str1, str2, ...), FIELD(str, str1, str2, ...), and FIND_IN_SET.
+CREATE OR REPLACE FUNCTION mysql.elt(int, VARIADIC text[])
+RETURNS text
+AS $$SELECT CASE WHEN $1 BETWEEN 1 AND cardinality($2) THEN $2[$1] END$$
+LANGUAGE SQL IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION mysql.field(text, VARIADIC text[])
+RETURNS int
+AS $$SELECT COALESCE(array_position($2, $1), 0)$$
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.find_in_set(text, text)
+RETURNS int
+AS $$SELECT CASE WHEN $1 = '' THEN 0
+                 ELSE COALESCE(array_position(string_to_array($2, ','), $1), 0)
+            END$$
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.make_set(int8, VARIADIC text[])
+RETURNS text
+AS $$SELECT COALESCE(string_agg(value, ',' ORDER BY ordinality), '')
+     FROM unnest($2) WITH ORDINALITY AS u(value, ordinality)
+     WHERE ($1 & (1::int8 << ((ordinality - 1)::int))) <> 0$$
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.export_set(int8, text, text, text, int)
+RETURNS text
+AS $$SELECT string_agg(CASE WHEN ($1 & (1::int8 << (i::int))) <> 0 THEN $2 ELSE $3 END,
+                            $4 ORDER BY i)
+     FROM generate_series(0, GREATEST($5 - 1, 0)) AS g(i)$$
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.insert(text, int, int, text)
+RETURNS text
+AS $$SELECT CASE WHEN $2 < 1 OR $2 > char_length($1) THEN $1
+                 ELSE substr($1, 1, $2 - 1) || $4 || substr($1, $2 + GREATEST($3, 0))
+            END$$
 LANGUAGE SQL IMMUTABLE STRICT;
 
 -- TRIM with custom remstr (BOTH | LEADING | TRAILING)
@@ -378,6 +566,14 @@ RETURNS date
 AS 'SELECT ($1 + $2)::date'
 LANGUAGE SQL IMMUTABLE STRICT;
 
+-- PG16 UDB-TX supplies a text overload so an untyped MySQL date literal does
+-- not ambiguously match date and timestamp overloads.  PG18's native
+-- timestamp input accepts the ISO literal syntax used by MySQL clients.
+CREATE OR REPLACE FUNCTION mysql.date_add(text, pg_catalog.interval)
+RETURNS timestamp
+AS 'SELECT $1::pg_catalog.timestamp + $2'
+LANGUAGE SQL IMMUTABLE STRICT;
+
 -- DATE_SUB(date, INTERVAL expr unit) -- simplified: takes date/timestamp - interval
 CREATE OR REPLACE FUNCTION mysql.date_sub(timestamp, pg_catalog.interval)
 RETURNS timestamp
@@ -389,6 +585,23 @@ RETURNS date
 AS 'SELECT ($1 - $2)::date'
 LANGUAGE SQL IMMUTABLE STRICT;
 
+CREATE OR REPLACE FUNCTION mysql.date_sub(text, pg_catalog.interval)
+RETURNS timestamp
+AS 'SELECT $1::pg_catalog.timestamp - $2'
+LANGUAGE SQL IMMUTABLE STRICT;
+
+-- ADDDATE/SUBDATE are MySQL aliases with an integer-day form.  Retain the
+-- PG16 text-first dispatch so bare literals select a single overload.
+CREATE OR REPLACE FUNCTION mysql.adddate(text, integer)
+RETURNS timestamp
+AS 'SELECT $1::pg_catalog.timestamp + (''1 day''::pg_catalog.interval * $2)'
+LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.subdate(text, integer)
+RETURNS timestamp
+AS 'SELECT $1::pg_catalog.timestamp - (''1 day''::pg_catalog.interval * $2)'
+LANGUAGE SQL IMMUTABLE STRICT;
+
 -- DATEDIFF(expr1, expr2) -- returns expr1 - expr2 in days
 CREATE OR REPLACE FUNCTION mysql.datediff(date, date)
 RETURNS int
@@ -398,6 +611,13 @@ LANGUAGE SQL IMMUTABLE STRICT;
 CREATE OR REPLACE FUNCTION mysql.datediff(timestamp, timestamp)
 RETURNS int
 AS 'SELECT ($1::date - $2::date)'
+LANGUAGE SQL IMMUTABLE STRICT;
+
+-- Match the PG16 compatibility overload used for untyped MySQL date
+-- literals, while using PG18's native ISO date input conversion.
+CREATE OR REPLACE FUNCTION mysql.datediff(text, text)
+RETURNS int
+AS 'SELECT $1::pg_catalog.date - $2::pg_catalog.date'
 LANGUAGE SQL IMMUTABLE STRICT;
 
 -- DAY(date)
@@ -655,6 +875,18 @@ RETURNS text
 AS 'SELECT current_user'
 LANGUAGE SQL;
 
+-- CURRENT_USER() and SESSION_USER() are MySQL information functions as well
+-- as SQL keywords.  Keep schema-qualified forms available to clients.
+CREATE OR REPLACE FUNCTION mysql.current_user()
+RETURNS text
+AS 'SELECT current_user'
+LANGUAGE SQL;
+
+CREATE OR REPLACE FUNCTION mysql.session_user()
+RETURNS text
+AS 'SELECT session_user'
+LANGUAGE SQL;
+
 -- VERSION()
 CREATE OR REPLACE FUNCTION mysql.version()
 RETURNS text
@@ -691,3 +923,289 @@ CREATE OR REPLACE FUNCTION mysql.found_rows()
 RETURNS int8
 AS 'SELECT pg_catalog.mys_found_rows()'
 LANGUAGE SQL;
+-- PG16 UDB-TX DATE_FORMAT semantics, adapted to PG18's available week APIs.
+CREATE OR REPLACE FUNCTION mysql.date_format(timestamp without time zone, text)
+RETURNS text
+AS
+$$
+DECLARE
+    len int := pg_catalog.length($2);
+    i int := 1;
+    temp text := '';
+    c text;
+    n character;
+    res text;
+BEGIN
+    WHILE i <= len LOOP
+        c := substring($2 FROM i FOR 1);
+        IF c = '%' AND i != len THEN
+            n := (substring($2 FROM (i + 1) FOR 1))::character;
+            SELECT INTO res CASE
+                WHEN n = 'a' THEN pg_catalog.to_char($1, 'Dy')
+                WHEN n = 'b' THEN pg_catalog.to_char($1, 'Mon')
+                WHEN n = 'c' THEN pg_catalog.to_char($1, 'FMMM')
+                WHEN n = 'D' THEN pg_catalog.to_char($1, 'FMDDth')
+                WHEN n = 'd' THEN pg_catalog.to_char($1, 'DD')
+                WHEN n = 'e' THEN pg_catalog.to_char($1, 'FMDD')
+                WHEN n = 'f' THEN pg_catalog.to_char($1, 'US')
+                WHEN n = 'H' THEN pg_catalog.to_char($1, 'HH24')
+                WHEN n = 'h' THEN pg_catalog.to_char($1, 'HH12')
+                WHEN n = 'I' THEN pg_catalog.to_char($1, 'HH12')
+                WHEN n = 'i' THEN pg_catalog.to_char($1, 'MI')
+                WHEN n = 'j' THEN pg_catalog.to_char($1, 'DDD')
+                WHEN n = 'k' THEN pg_catalog.to_char($1, 'FMHH24')
+                WHEN n = 'l' THEN pg_catalog.to_char($1, 'FMHH12')
+                WHEN n = 'M' THEN pg_catalog.to_char($1, 'FMMonth')
+                WHEN n = 'm' THEN pg_catalog.to_char($1, 'MM')
+                WHEN n = 'p' THEN pg_catalog.to_char($1, 'AM')
+                WHEN n = 'r' THEN pg_catalog.to_char($1, 'HH12:MI:SS AM')
+                WHEN n = 'S' THEN pg_catalog.to_char($1, 'SS')
+                WHEN n = 's' THEN pg_catalog.to_char($1, 'SS')
+                WHEN n = 'T' THEN pg_catalog.to_char($1, 'HH24:MI:SS')
+                WHEN n = 'U' THEN pg_catalog.lpad(mysql.week($1::date, 0)::text, 2, '0')
+                WHEN n = 'u' THEN pg_catalog.lpad(mysql.week($1::date, 1)::text, 2, '0')
+                WHEN n = 'V' THEN pg_catalog.lpad(mysql.week($1::date, 2)::text, 2, '0')
+                WHEN n = 'v' THEN pg_catalog.lpad(mysql.week($1::date, 3)::text, 2, '0')
+                WHEN n = 'W' THEN pg_catalog.to_char($1, 'FMDay')
+                WHEN n = 'w' THEN EXTRACT(DOW FROM $1)::text
+                WHEN n = 'X' THEN pg_catalog.lpad(((_calc_mysql.week($1::date, _week_mode(2)))[2])::text, 4, '0')
+                WHEN n = 'x' THEN pg_catalog.lpad(((_calc_mysql.week($1::date, _week_mode(3)))[2])::text, 4, '0')
+                WHEN n = 'Y' THEN pg_catalog.to_char($1, 'YYYY')
+                WHEN n = 'y' THEN pg_catalog.to_char($1, 'YY')
+                WHEN n = '%' THEN pg_catalog.to_char($1, '%')
+                ELSE NULL
+            END;
+
+            if res is not null then
+                temp := temp operator(pg_catalog.||) res;
+                i := i + 2;
+            else
+                i := i + 1;
+            end if;
+        ELSE
+            temp := temp operator(pg_catalog.||) c;
+            i := i + 1;
+        END IF;
+    END LOOP;
+    RETURN temp;
+END
+$$
+IMMUTABLE STRICT LANGUAGE PLPGSQL;
+
+CREATE OR REPLACE FUNCTION mysql.date_format(text, text)
+RETURNS text
+AS $$SELECT mysql.date_format($1::timestamp without time zone, $2)$$
+LANGUAGE SQL IMMUTABLE STRICT;
+
+-- PG16 UDB-TX system-variable catalogue.  The backend system-variable
+-- implementation reads this relation during MySQL parser initialization.
+create table mys_informa_schema.base_variables(
+    variable_name varchar(128),
+    def_value varchar(1024),
+    conf_value varchar(1024),
+    sess_global_type int,
+    -- sess_global_type 0: global & session, 1:global only, 2:session only, 3:session only but can select global
+    sess_def_val_from_global bool,
+    is_read_write bool,
+    valid_result varchar(256),
+    select_result_rule varchar(256),
+    show_result_rule varchar(256),
+    primary key(variable_name)
+);
+insert into mys_informa_schema.base_variables values('autocommit', '1', '1', 0, true, true, '0|1', null, 'OFF|ON');
+insert into mys_informa_schema.base_variables values('auto_increment_increment', '1', '1', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('auto_increment_offset', '1', '1', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('big_tables', '0', '0', 0, true, true, '0|1', null, 'OFF|ON');
+insert into mys_informa_schema.base_variables values('character_set_client', 'utf8mb4', 'utf8mb4', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('character_set_connection', 'utf8mb4', 'utf8mb4', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('character_set_results', 'utf8mb4', 'utf8mb4', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('character_set_server', 'utf8mb4', 'utf8mb4', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('character_set_database', 'utf8mb4', 'utf8mb4', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('collation_connection', 'utf8mb4_general_ci', 'utf8mb4_general_ci', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('collation_server', 'utf8mb4_general_ci', 'utf8mb4_general_ci', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('default_storage_engine', 'InnoDB', 'InnoDB', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('enforce_gtid_consistency', '0', '0', 1, true, true, '0|1', 'OFF|ON', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('explicit_defaults_for_timestamp', '0', '1', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('foreign_key_checks', '1', '1', 0, false, true, null, null, null);
+insert into mys_informa_schema.base_variables values('ft_max_word_len', '84', '84', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('have_profiling', 'YES', 'YES', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('init_connect', '', '', 1, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_buffer_pool_chunk_size', '134217728', '134217728', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_buffer_pool_dump_at_shutdown', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('innodb_buffer_pool_dump_now', '0', '0', 1, false, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('innodb_buffer_pool_dump_pct', '25', '25', 1, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_buffer_pool_filename', 'ib_buffer_pool', 'ib_buffer_pool', 1, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_buffer_pool_instances', '8', '8', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_buffer_pool_load_abort', '0', '0', 1, false, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('innodb_buffer_pool_load_at_startup', '1', '1', 1, true, false, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('innodb_buffer_pool_load_now', '0', '0', 1, false, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('innodb_buffer_pool_size', '1073741824', '1073741824', 1, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_checksums', '1', '1', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_flush_log_at_trx_commit', '1', '2', 1, true, true, '0|1|2', '0|1|2', '0|1|2');
+insert into mys_informa_schema.base_variables values('innodb_log_buffer_size', '2097152', '2097152', 1, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_log_file_size', '33554432', '33554432', 1, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_log_files_in_group', '3', '3', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_sort_buffer_size', '1048576', '1048576', 1, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_strict_mode', '1', '1', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_thread_concurrency', '0', '0', 1, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_thread_sleep_delay', '10000', '10000', 1, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('interactive_timeout', '28800', '20000', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('join_buffer_size', '262144', '8388608', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('last_insert_id', '0', '0', 2, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('license', 'GPL', 'GPL', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('long_query_time', '10', '10', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('lower_case_file_system', '0', '0', 0, true, false, '0|1', null, 'OFF|ON');
+insert into mys_informa_schema.base_variables values('lower_case_table_names', '1', '1', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('max_allowed_packet', '4194304', '536870912', 1, false, true, null, null, null);
+insert into mys_informa_schema.base_variables values('max_connections', '151', '100', 1, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('max_length_for_sort_data', '1024', '1024', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('max_seeks_for_key', '18446744073709551615', '18446744073709551615', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('max_sp_recursion_depth', '0', '0', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('max_user_connections', '0', '0', 1, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('myisam_sort_buffer_size', '8388608', '8388608', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('myisam_stats_method', '0', '0', 0, true, true, '0|1|2', 'nulls_unequal|nulls_equal|nulls_ignored', 'nulls_unequal|nulls_equal|nulls_ignored');
+insert into mys_informa_schema.base_variables values('net_buffer_length', '16384', '16384', 1, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('net_write_timeout', '60', '60', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('optimizer_prune_level', '1', '1', 0, true, true, '0|1', null, '0|1');
+insert into mys_informa_schema.base_variables values('optimizer_switch', 'index_merge=on,index_merge_union=on,index_merge_sort_union=on,index_merge_intersection=on,engine_condition_pushdown=on,index_condition_pushdown=on,mrr=on,mrr_cost_based=on,block_nested_loop=on,batched_key_access=off,materialization=on,semijoin=on,loosescan=on,firstmatch=on,duplicateweedout=on,subquery_materialization_cost_based=on,use_index_extensions=on,condition_fanout_filter=on,derived_merge=on', 'index_merge=on,index_merge_union=on,index_merge_sort_union=on,index_merge_intersection=on,engine_condition_pushdown=on,index_condition_pushdown=on,mrr=on,mrr_cost_based=on,block_nested_loop=on,batched_key_access=off,materialization=on,semijoin=on,loosescan=on,firstmatch=on,duplicateweedout=on,subquery_materialization_cost_based=on,use_index_extensions=on,condition_fanout_filter=on,derived_merge=on', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('parser_max_mem_size', '18446744073709551615', '18446744073709551615', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('performance_schema', '0', '0', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('profiling_history_size', '15', '15', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('profiling', '0', '0', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('query_cache_limit', '1048576', '1048576', 1, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('query_cache_min_res_unit', '4096', '4096', 1, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('query_cache_size', '1048576', '1048576', 1, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('query_cache_type', '0', '1', 0, true, true, '0|1|2', 'OFF|ON|DEMAND', 'OFF|ON|DEMAND');
+insert into mys_informa_schema.base_variables values('query_cache_wlock_invalidate', '0', '1', 0, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('range_alloc_block_size', '4096', '4096', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('range_optimizer_max_mem_size', '8388608', '8388608', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('rbr_exec_mode', '0', '0', 3, true, true, '0|1', 'STRICT|IDEMPOTENT', 'STRICT|IDEMPOTENT');
+insert into mys_informa_schema.base_variables values('read_buffer_size', '131072', '2097152', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('require_secure_transport', '0', '0', 1, true, true, '0|1', null, 'OFF|ON');
+insert into mys_informa_schema.base_variables values('secure_file_priv', '', '', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('session_track_gtids', '0', '0', 0, true, true, '0|1|2', 'OFF|OWN_GTID|ALL_GTIDS', 'OFF|OWN_GTID|ALL_GTIDS');
+insert into mys_informa_schema.base_variables values('session_track_schema', '1', '1', 0, true, true, '0|1', null, 'OFF|ON');
+insert into mys_informa_schema.base_variables values('session_track_state_change', '0', '0', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('session_track_system_variables', 'time_zone,autocommit,character_set_client,character_set_results,character_set_connection', 'time_zone,autocommit,character_set_client,character_set_results,character_set_connection', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('session_track_transaction_info', '0', '0', 0, true, true, '0|1', 'OFF|ON', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('show_create_table_verbosity', '0', '0', 0, true, true, '0|1', null, 'OFF|ON');
+insert into mys_informa_schema.base_variables values('sort_buffer_size', '262144', '8388608', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('sql_auto_is_null', '0', '0', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('sql_mode', 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION', 'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('sql_notes', '1', '1', 0, true, true, '0|1', null, 'OFF|ON');
+insert into mys_informa_schema.base_variables values('sql_quote_show_create', '1', '1', 0, true, true, '0|1', null, 'OFF|ON');
+insert into mys_informa_schema.base_variables values('sql_safe_updates', '0', '0', 0, true, true, '0|1', null, 'OFF|ON');
+insert into mys_informa_schema.base_variables values('sql_select_limit', '18446744073709551615', '18446744073709551615', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('system_time_zone', 'CST', 'CST', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('thread_cache_size', '9', '8', 1, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('time_zone', 'SYSTEM', 'SYSTEM', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('transaction_isolation', 'REPEATABLE-READ', 'REPEATABLE-READ', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('transaction_read_only', '0', '0', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('tx_isolation', 'REPEATABLE-READ', 'REPEATABLE-READ', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('tx_read_only', '0', '0', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('unique_checks', 'on', 'on', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('version_comment', 'MySQL Server (GPL)', 'MySQL Server (GPL)', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('wait_timeout', '28800', '20000', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_default_row_format', '2', '2', 1, true, true, '0|1|2|3', 'redundant|compact|dynamic|compressed', 'redundant|compact|dynamic|compressed');
+insert into mys_informa_schema.base_variables values('innodb_file_format', '1', '1', 1, true, true, '0|1', 'Antelope|Barracuda', 'Antelope|Barracuda');
+insert into mys_informa_schema.base_variables values('innodb_file_format_check', '1', '1', 0, true, false, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('innodb_file_format_max', '0', '1', 1, true, true, '0|1', 'Antelope|Barracuda', 'Antelope|Barracuda');
+insert into mys_informa_schema.base_variables values('innodb_file_per_table', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('collation_database', 'utf8mb4_general_ci', 'utf8mb4_general_ci', 0, true, true, null, null, null);
+INSERT INTO mys_informa_schema.base_variables VALUES ('datadir', '/data/unvdb/', '/data/unvdb/', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('unvdb_mysql_dummy_stmt_return_ok', '1', '1', 0, true, true, '0|1', '0|1', '0|1');
+insert into mys_informa_schema.base_variables values('have_query_cache', '1', '1', 1, true, false, '0|1', 'NO|YES', 'NO|YES');
+insert into mys_informa_schema.base_variables values('automatic_sp_privileges', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('check_proxy_users', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('completion_type', '0', '0', 1, true, true, '0|1|2', 'NO_CHAIN|CHAIN|RELEASE', 'NO_CHAIN|CHAIN|RELEASE');
+insert into mys_informa_schema.base_variables values('concurrent_insert', '1', '1', 1, true, true, '0|1|2', 'NEVER|AUTO|ALWAYS', 'NEVER|AUTO|ALWAYS');
+insert into mys_informa_schema.base_variables values('connect_timeout', '10', '10', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('core_file', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('default_authentication_plugin', '0', '0', 1, true, true, '0|1', 'mysql_native_password|sha256_password', 'mysql_native_password|sha256_password');
+insert into mys_informa_schema.base_variables values('default_password_lifetime', '0', '0', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('default_tmp_storage_engine', '0', '0', 1, true, true, '0|1|2|3|4|5|6|7', 'InnoDB|MRG_MYISAM|MyISAM|BLACKHOLE|CSV|mem|ARCHIVE|FEDERATED', 'InnoDB|MRG_MYISAM|MyISAM|BLACKHOLE|CSV|mem|ARCHIVE|FEDERATED');
+insert into mys_informa_schema.base_variables values('default_week_format', '0', '0', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('disabled_storage_engines', '0', '0', 1, true, true, '0|1', '0|1', ' | ');
+insert into mys_informa_schema.base_variables values('disconnect_on_expired_password', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('block_encryption_mode', '0', '0', 1, true, true, '0|1|2|3|4|5', 'aes-128-ecb|aes-192-ecb|aes-256-ecb|aes-128-cbc|aes-192-cbc|aes-256-cbc', 'aes-128-ecb|aes-192-ecb|aes-256-ecb|aes-128-cbc|aes-192-cbc|aes-256-cbc');
+insert into mys_informa_schema.base_variables values('bulk_insert_buffer_size', '8388608', '8388608', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('binlog_cache_size', '1048576', '1048576', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('binlog_checksum', '1', '1', 1, true, true, '0|1', 'NONE|CRC32', 'NONE|CRC32');
+insert into mys_informa_schema.base_variables values('binlog_error_action', '1', '1', 1, true, true, '0|1', 'IGNORE_ERROR|ABORT_SERVER', 'IGNORE_ERROR|ABORT_SERVER');
+insert into mys_informa_schema.base_variables values('binlog_format', '1', '1', 1, true, true, '0|1|2', 'STATEMENT|ROW|MIXED', 'STATEMENT|ROW|MIXED');
+insert into mys_informa_schema.base_variables values('binlog_group_commit_sync_delay', '0', '0', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('binlog_group_commit_sync_no_delay_count', '0', '0', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('binlog_gtid_simple_recovery', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('binlog_order_commits', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('binlog_row_image', '0', '0', 1, true, true, '0|1|2', 'FULL|MINIMAL|NOBLOB', 'FULL|MINIMAL|NOBLOB');
+insert into mys_informa_schema.base_variables values('binlog_rows_query_log_events', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('binlog_stmt_cache_size', '32768', '32768', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('character_set_filesystem', '0', '0', 1, true, true, '0|1|2', 'binary|utf8|ascii', 'binary|utf8|ascii');
+insert into mys_informa_schema.base_variables values('character_set_system', '1', '1', 1, true, true, '0|1|2', 'binary|utf8|ascii', 'binary|utf8|ascii');
+INSERT INTO mys_informa_schema.base_variables VALUES('character_sets_dir', '/data/unvdb/', '/data/unvdb/', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('delay_key_write', '0', '0', 1, true, true, '0|1|2', 'ON|OFF|ALL', 'ON|OFF|ALL');
+insert into mys_informa_schema.base_variables values('div_precision_increment', '4', '4', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('end_markers_in_json', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('eq_range_index_dive_limit', '200', '200', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('event_scheduler', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('expire_logs_days', '1', '1', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('flush', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('flush_time', '0', '0', 0, true, true, null, null, null);
+INSERT INTO mys_informa_schema.base_variables VALUES('ft_boolean_syntax', '+ -&gt;&lt;()~*:""&amp;|', '+ -&gt;&lt;()~*:""&amp;|', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('ft_min_word_len', '4', '4', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('ft_query_expansion_limit', '20', '20', 0, true, true, null, null, null);
+INSERT INTO mys_informa_schema.base_variables VALUES('ft_stopword_file', '(built-in)', '(built-in)', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('general_log', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+INSERT INTO mys_informa_schema.base_variables VALUES('general_log_file', '/var/lib/mysql/data/hostname.log', '/var/lib/mysql/data/hostname.log', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('group_concat_max_len', '1024', '1024', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('gtid_executed_compression_period', '1000', '1000', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('gtid_mode', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|ON');
+INSERT INTO mys_informa_schema.base_variables VALUES('gtid_next', 'AUTOMATIC', 'AUTOMATIC', 0, true, false, null, null, null);
+INSERT INTO mys_informa_schema.base_variables VALUES('gtid_owned', '', '', 0, true, false, null, null, null);
+INSERT INTO mys_informa_schema.base_variables VALUES('gtid_purged', '', '', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('host_cache_size', '228', '228', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('internal_tmp_disk_storage_engine', '0', '0', 1, true, true, '0|1', 'INNODB|MYISAM', 'INNODB|MYISAM');
+insert into mys_informa_schema.base_variables values('keep_files_on_create', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('key_buffer_size', '4194304', '4194304', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('updatable_views_with_limit', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|YES');
+insert into mys_informa_schema.base_variables values('thread_handling', '0', '0', 1, true, true, '0|1|2', 'one-thread-per-connection|one-thread-for-all-connections|pool-of-threads', 'one-thread-per-connection|one-thread-for-all-connections|pool-of-threads');
+insert into mys_informa_schema.base_variables values('thread_stack', '262144', '262144', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('tmp_table_size', '16777216', '16777216', 0, true, true, null, null, null);
+INSERT INTO mys_informa_schema.base_variables VALUES('tmpdir', '/tmp', '/tmp', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('transaction_alloc_block_size', '8192', '8192', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('transaction_prealloc_size', '4096', '4096', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('transaction_write_set_extraction', '0', '0', 1, true, true, '0|1|2', 'OFF|MURMUR32|XXHASH6', 'OFF|MURMUR32|XXHASH6');
+insert into mys_informa_schema.base_variables values('table_definition_cache', '464', '464', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('table_open_cache', '128', '128', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('table_open_cache_instances', '16', '16', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('sync_binlog', '1', '1', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('sync_master_info', '10000', '10000', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('sync_relay_log', '10000', '10000', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('sync_relay_log_info', '10000', '10000', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('sync_frm', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('super_read_only', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('stored_program_cache', '256', '256', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('sql_big_selects', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('sql_buffer_result', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('sql_log_bin', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('sql_log_off', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('sql_slave_skip_counter', '0', '0', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('sql_warnings', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+INSERT INTO mys_informa_schema.base_variables VALUES('socket', '/tmp/mysql.sock', '/tmp/mysql.sock', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('slow_launch_time', '2', '2', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('slow_query_log', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|ON');
+INSERT INTO mys_informa_schema.base_variables VALUES('slow_query_log_file', '/var/lib/mysql/data/slow.log', '/var/lib/mysql/data/slow.log', 0, true, false, null, null, null);
+insert into mys_informa_schema.base_variables values('skip_external_locking', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('skip_name_resolve', '1', '1', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('skip_networking', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('skip_show_database', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('show_compatibility_56', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('sha256_password_proxy_users', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('server_id', '1', '1', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('server_id_bits', '32', '32', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('read_only', '0', '0', 1, true, true, '0|1', '0|1', 'OFF|ON');
+insert into mys_informa_schema.base_variables values('read_rnd_buffer_size', '8388608', '8388608', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('query_alloc_block_size', '8192', '8192', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('query_prealloc_size', '8192', '8192', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('preload_buffer_size', '32768', '32768', 0, true, true, null, null, null);
+insert into mys_informa_schema.base_variables values('innodb_lock_wait_timeout', '50', '50', 0, true, true, null, null, null);

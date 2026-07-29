@@ -151,6 +151,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, InjectionPointShmemSize());
 	size = add_size(size, SlotSyncShmemSize());
 	size = add_size(size, AioShmemSize());
+	size = add_size(size, GlobalSystemVariablesShmemSize());
 	size = add_size(size, MysTimeZoneShmemSize());
 
 	/* include additional requested shmem from preload libraries */
@@ -347,6 +348,7 @@ CreateOrAttachShmemStructs(void)
 	WaitEventCustomShmemInit();
 	InjectionPointShmemInit();
 	AioShmemInit();
+	GlobalSystemVariablesShmemInit();
 	MysTimeZoneShmemInit();
 }
 

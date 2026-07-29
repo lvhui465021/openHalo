@@ -14,6 +14,7 @@
 #include "parser/parser.h"            /* raw_parser, RawParseMode    */
 #include "parser/parserapi.h"         /* ParserRoutine               */
 #include "parser/parsereng.h"
+#include "parser/mysql/mys_analyze.h"
 #include "parser/mysql/mys_parser.h"  /* mys_raw_parser              */
 #include "parser/mysql/mys_expr_transform.h"  /* mys_transform_expr_node */
 
@@ -34,7 +35,8 @@ static const ParserRoutine StandardParserRoutine = {
  * (mys_gram.y) will replace this delegation incrementally.
  */
 const ParserRoutine MySQLParserRoutine = {
-    .raw_parse = mys_raw_parser,
+	.raw_parse = mys_raw_parser,
+	.transformOptionalSelectInto = mys_transformOptionalSelectInto,
     .transform_expr_node = mys_transform_expr_node,
 	.figure_colname = mys_figure_colname,
 };

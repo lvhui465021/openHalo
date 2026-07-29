@@ -4,12 +4,15 @@
 #include "nodes/pg_list.h"
 #include "nodes/value.h"
 #include "nodes/mysql/mys_parsenodes.h"
+#include "commands/mysql/mys_uservar.h"
 #include "parser/parserapi.h"
+#include "parser/parse_coerce.h"
 #include "parser/parse_expr.h"
 #include "parser/parse_node.h"
 #include "parser/mysql/mys_expr_transform.h"
 #include "adapter/mysql/systemVar.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 
 static Node *
 mys_transform_user_var_call(ParseState *pstate, const char *function_name,
@@ -27,7 +30,20 @@ mys_transform_user_var_call(ParseState *pstate, const char *function_name,
 
 	args = list_make1(name);
 	if (value != NULL)
+	{
+		if (IsA(value, A_Const) &&
+			(castNode(A_Const, value)->isnull ||
+			 castNode(A_Const, value)->val.node.type == T_String))
+		{
+			TypeCast *cast = makeNode(TypeCast);
+
+			cast->arg = value;
+			cast->typeName = makeTypeName(pstrdup("text"));
+			cast->location = location;
+			value = (Node *) cast;
+		}
 		args = lappend(args, value);
+	}
 
 	call = makeFuncCall(list_make2(makeString("pg_catalog"),
 								 makeString(pstrdup(function_name))),
@@ -169,16 +185,102 @@ mys_transform_expr_node(ParseState *pstate, Node *expr, Node **result)
 	case T_UserVarRef:
 		{
 			UserVarRef *uv = (UserVarRef *) expr;
+			Oid		valueType;
 
 			*result = mys_transform_user_var_call(pstate,
 											"mys_get_user_var", uv->userVarName,
 											NULL, uv->location);
+			valueType = mysGetUserVarTypeInternal(uv->userVarName);
+			if (OidIsValid(valueType))
+			{
+				Node *coerced = coerce_to_target_type(pstate, *result,
+															TEXTOID, getBaseType(valueType), -1,
+															COERCION_EXPLICIT,
+															COERCE_EXPLICIT_CAST,
+															uv->location);
+
+				if (coerced == NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_CANNOT_COERCE),
+							 errmsg("cannot coerce MySQL user variable")));
+				*result = coerced;
+			}
 			return true;
+		}
+
+	case T_A_Expr:
+		{
+			A_Expr *aexpr = (A_Expr *) expr;
+
+			/* MySQL <=> is SQL's null-safe equality operator. */
+			if (aexpr->kind == AEXPR_OP && list_length(aexpr->name) == 1 &&
+				strcmp(strVal(linitial(aexpr->name)), "<=>") == 0)
+			{
+				aexpr->kind = AEXPR_NOT_DISTINCT;
+				aexpr->name = list_make1(makeString("="));
+				*result = transformExpr(pstate, (Node *) aexpr,
+										pstate->p_expr_kind);
+				return true;
+			}
+			break;
 		}
 
 	case T_FuncCall:
 		{
 			FuncCall *fn = (FuncCall *) expr;
+			bool		is_mysql_concat = false;
+
+			/*
+			 * PG16 routed function resolution through mys_ParseFuncOrColumn(),
+			 * which renamed these MySQL spellings before catalog lookup.  PG18's
+			 * ParserRoutine exposes the earlier expression hook instead, so do
+			 * the same raw-name lowering here and let normal resolution continue.
+			 */
+			if (list_length(fn->funcname) == 1)
+			{
+				char *fname = strVal(linitial(fn->funcname));
+
+				if (pg_strcasecmp(fname, "json_object") == 0)
+					fn->funcname = list_make1(makeString("mys_json_object"));
+				else if (pg_strcasecmp(fname, "json_array") == 0)
+					fn->funcname = list_make1(makeString("json_build_array"));
+			}
+
+			if (fn->args != NIL && fn->agg_order == NIL &&
+				fn->agg_filter == NULL && fn->over == NULL &&
+				!fn->agg_star && !fn->agg_distinct)
+			{
+				if (list_length(fn->funcname) == 1)
+					is_mysql_concat =
+						pg_strcasecmp(strVal(linitial(fn->funcname)), "concat") == 0;
+				else if (list_length(fn->funcname) == 2)
+					is_mysql_concat =
+						pg_strcasecmp(strVal(linitial(fn->funcname)), "mysql") == 0 &&
+						pg_strcasecmp(strVal(lsecond(fn->funcname)), "concat") == 0;
+			}
+
+			/*
+			 * MySQL CONCAT converts every argument to text before concatenating.
+			 * A VARIADIC text[] extension function cannot request those explicit
+			 * casts itself, so preserve the raw call and cast each argument here.
+			 */
+			if (is_mysql_concat)
+			{
+				List	   *args = NIL;
+				ListCell   *lc;
+
+				foreach(lc, fn->args)
+				{
+					TypeCast *cast = makeNode(TypeCast);
+
+					cast->arg = lfirst(lc);
+					cast->typeName = makeTypeName(pstrdup("text"));
+					cast->location = fn->location;
+					args = lappend(args, cast);
+				}
+				fn->args = args;
+				return false;
+			}
 
 			/*
 			 * Intercept VERSION() in MySQL protocol: return the MySQL

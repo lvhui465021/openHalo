@@ -789,13 +789,19 @@ mysql_session_initialize(Port *port)
 	 * Align search_path with openHalo's adapter.c for MySQL connections.
 	 *
 	 * openHalo sets:
-	 *   search_path = "<dbname>, mysql, pg_catalog, \"$user\", public"
+	 *   search_path = "<dbname>, \"$user\", public, mysql, pg_catalog"
 	 *
 	 * where <dbname> is the PostgreSQL database the MySQL backend is
 	 * pinned to (mysql.backend_database, default "postgres").  This
-	 * ensures MySQL compatibility functions (DATABASE(), SCHEMA(),
-	 * VERSION(), etc.) are resolvable without schema qualification
-	 * while keeping the backend database as the default namespace.
+	 * keeps the backend database as the default namespace.  A PostgreSQL
+	 * database does not normally imply a same-named schema, so put writable
+	 * user namespaces before mysql and pg_catalog.  Otherwise an initial
+	 * unqualified CREATE TABLE would select the mysql schema (when installed)
+	 * or pg_catalog (when it is not), rather than public.
+	 *
+	 * mysql remains on the path for unqualified compatibility functions, after
+	 * application namespaces in the same way a selected MySQL database takes
+	 * precedence over built-ins.
 	 *
 	 * psql connections are unaffected — they use the standard PG
 	 * protocol routine which does not have a session_initialize
@@ -806,7 +812,7 @@ mysql_session_initialize(Port *port)
 		char	new_search_path[1024];
 
 		snprintf(new_search_path, sizeof(new_search_path),
-				 "%s, mysql, pg_catalog, \"$user\", public",
+				 "%s, \"$user\", public, mysql, pg_catalog",
 				 port->database_name);
 		(void) set_config_option("search_path", new_search_path,
 								 PGC_USERSET, PGC_S_SESSION,

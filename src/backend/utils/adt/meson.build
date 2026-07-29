@@ -123,6 +123,8 @@ backend_sources += files(
   'xml.c',
 )
 
+subdir('mysql')
+
 
 jsonpath_scan = custom_target('jsonpath_scan',
   input: 'jsonpath_scan.l',

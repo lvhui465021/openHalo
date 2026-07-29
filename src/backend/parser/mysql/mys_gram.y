@@ -1559,13 +1559,27 @@ character_set_collate:
 mysql_user_variable:
             MysqlUserVariableName plassign_equals a_expr
                 {
-                    ResTarget *result = makeNode(ResTarget);
-                    List *funcName = list_make2(makeString(pstrdup("pg_catalog")),
-                                                makeString(pstrdup("mys_set_user_var")));
-                    List *argList = list_make2(mys_makeStringConst($1, @1), $3);
-                    Node *funcCall = (Node *) makeFuncCall(funcName, argList,
-								            			   COERCE_EXPLICIT_CALL,
-											               @1);
+					ResTarget *result = makeNode(ResTarget);
+					List *funcName = list_make2(makeString(pstrdup("pg_catalog")),
+											makeString(pstrdup("mys_set_user_var")));
+					Node *value = $3;
+					List *argList;
+					Node *funcCall;
+
+					/*
+					 * mys_set_user_var's polymorphic value parameter needs
+					 * a concrete type.  MySQL string and NULL literals are
+					 * otherwise "unknown" at this point in parse analysis.
+					 */
+					if (IsA(value, A_Const) &&
+						(castNode(A_Const, value)->isnull ||
+						 castNode(A_Const, value)->val.node.type == T_String))
+						value = mys_makeTypeCast(value, SystemTypeName("text"), -1);
+
+					argList = list_make2(mys_makeStringConst($1, @1), value);
+					funcCall = (Node *) makeFuncCall(funcName, argList,
+											 COERCE_EXPLICIT_CALL,
+											 @1);
                     result->name = NULL;
 					result->indirection = NIL;
 					result->val = funcCall;
@@ -15905,10 +15919,42 @@ MysUpdateStmt:
 			where_or_current_clause
 				{
 					UpdateStmt *n = makeNode(UpdateStmt);
+					ListCell   *lc;
+					int			i = 0;
 
                     n->relation = $3;
-                    n->targetList = $9;
                     n->fromClause = $6;
+
+					/*
+					 * set_clause_for_mysql emits a two-element list for each
+					 * assignment: an optional table qualifier followed by the
+					 * ResTarget.  PG18's UpdateStmt.targetList must contain
+					 * ResTarget nodes only.  Passing the qualifiers through here
+					 * made parse analysis treat an A_Const as a ResTarget and
+					 * crash for UPDATE ... JOIN ... SET t.column = ... .
+					 */
+					foreach(lc, $9)
+					{
+						Node *node = lfirst(lc);
+
+						if ((i % 2) == 0)
+						{
+							if (node != NULL && !IsA(node, A_Const))
+								ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("syntax error in table name or alias after SET")));
+						}
+						else
+						{
+							if (!IsA(node, ResTarget))
+								ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("syntax error after SET")));
+							n->targetList = lappend(n->targetList, node);
+						}
+
+						i++;
+					}
 
                     if ($4 == JOIN_INNER || $4 == JOIN_LEFT || $4 == JOIN_RIGHT)
                     {
@@ -16139,10 +16185,11 @@ set_target_list:
                     VariableSetStmt *n = makeNode(VariableSetStmt);
 					n->kind = VAR_SET_VALUE;
 					n->name = pstrdup("search_path");
-					n->args = list_make4(mys_makeStringConst($2, @2),
-                                         mys_makeStringConst(pstrdup("mysql"), -1),
-                                         mys_makeStringConst(pstrdup("pg_catalog"), -1),
-                                         mys_makeStringConst(pstrdup("public"), -1));
+					n->args = list_make5(mys_makeStringConst($2, @2),
+										 mys_makeStringConst(pstrdup("$user"), -1),
+										 mys_makeStringConst(pstrdup("public"), -1),
+										 mys_makeStringConst(pstrdup("mysql"), -1),
+										 mys_makeStringConst(pstrdup("pg_catalog"), -1));
                     n->is_local = false;
 					$$ = (Node *)n;
                 }
@@ -20252,7 +20299,7 @@ func_expr_common_subexpr:
                 }
             | GROUP_CONCAT '(' array_agg_list separator_clause ')'
                 {
-                    $$ = (Node *) makeFuncCall(list_make1(makeString("array_to_string_for_mysql")),
+					$$ = (Node *) makeFuncCall(SystemFuncName("array_to_string"),
 											   list_make2($3, $4),
 											   COERCE_EXPLICIT_CALL,
 											   @1);
@@ -20382,14 +20429,14 @@ func_expr_common_subexpr:
 					/* mid(A from B for C) is converted to
 					 * mid(A, B, C) - thomas 2000-11-28
 					 */
-					$$ = (Node *) makeFuncCall(list_make1(makeString("mid")),
+					$$ = (Node *) makeFuncCall(SystemFuncName("substring"),
 											   $3,
 											   COERCE_SQL_SYNTAX,
 											   @1);
 				}
 			| MID '(' func_arg_list_opt ')'
 				{
-					$$ = (Node *) makeFuncCall(list_make1(makeString("mid")),
+					$$ = (Node *) makeFuncCall(SystemFuncName("substring"),
 											   $3,
 											   COERCE_EXPLICIT_CALL,
 											   @1);
@@ -20491,7 +20538,7 @@ func_expr_common_subexpr:
 				}
             | REPEAT '(' a_expr ',' a_expr ')'
                 {
-                    $$ = (Node *) makeFuncCall(list_make1(makeString("mys_repeat")),
+					$$ = (Node *) makeFuncCall(SystemFuncName("repeat"),
 											   list_make2($3, $5),
 											   COERCE_EXPLICIT_CALL,
 											   @1);

@@ -32,6 +32,7 @@ typedef struct MysqlUserVariableItem
     /* dynahash.c requires key to be first field */
     char varName[NAMEDATALEN];
     bytea *varValue;
+	Oid varValueType;
     bool isnull;
 } MysqlUserVariableItem;
 
@@ -182,6 +183,7 @@ mysSetUserVarInternal(char *userVarName, char *userVarValue, Oid varValueType, b
     }
 
     oldContext = MemoryContextSwitchTo(TopMemoryContext);
+	entry->varValueType = varValueType;
 
     if (!isNull)
     {
@@ -248,6 +250,7 @@ mysSetUserVarForPl(char *userVarName, Datum userVarValue, Oid varValueType, bool
     }
 
     oldContext = MemoryContextSwitchTo(TopMemoryContext);
+	entry->varValueType = varValueType;
 
     if (!isNull)
     {
@@ -318,6 +321,22 @@ mysGetUserVarValueInternal(char *userVarName)
     }
 
     return result;
+}
+
+Oid
+mysGetUserVarTypeInternal(char *userVarName)
+{
+	MysqlUserVariableItem *entry;
+	bool		found;
+
+	if (!mysql_user_variables)
+		return InvalidOid;
+
+	entry = (MysqlUserVariableItem *) hash_search(mysql_user_variables,
+													  userVarName,
+													  HASH_FIND,
+													  &found);
+	return found ? entry->varValueType : InvalidOid;
 }
 
 

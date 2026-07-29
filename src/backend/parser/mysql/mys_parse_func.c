@@ -1526,4 +1526,3 @@ FuncNameAsType(List *funcname)
 	ReleaseSysCache(typtup);
 	return result;
 }
-

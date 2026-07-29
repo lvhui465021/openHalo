@@ -68,6 +68,8 @@ static void rectifyColumnRef(RangeVar *relation, char *newVal, ColumnRef *column
 static void determineRecursiveColTypes(ParseState *pstate, Node *larg, List *nrtargetlist);
 static void rectifyHavingClause(SelectStmt *stmt);
 static void rectifyHavingAlias(HTAB *aliases, Node *expr);
+static Query *transformMysSelectIntoStmt(ParseState *pstate,
+									 MysSelectIntoStmt *stmt);
 
 
 /*
@@ -83,7 +85,43 @@ static void rectifyHavingAlias(HTAB *aliases, Node *expr);
 Query *
 mys_transformOptionalSelectInto(ParseState *pstate, Node *parseTree)
 {
-	return transformStmt(pstate, parseTree); /* M3: delegate to PG18 */
+	if (IsA(parseTree, SelectStmt))
+	{
+		SelectStmt *stmt = (SelectStmt *) parseTree;
+
+		/* INTO belongs to the leftmost leaf of a set-operation tree. */
+		while (stmt->op != SETOP_NONE)
+			stmt = stmt->larg;
+		Assert(stmt != NULL && stmt->larg == NULL);
+
+		if (stmt->intoClause != NULL)
+		{
+			MysSelectIntoStmt *into_stmt = makeNode(MysSelectIntoStmt);
+			ListCell   *lc;
+
+			/*
+			 * The MySQL grammar stores its INTO targets in colNames only to
+			 * reuse SelectStmt.  Do not pass that representation to the PG
+			 * SELECT INTO-to-CTAS path: it has no relation target.
+			 */
+			foreach(lc, stmt->intoClause->colNames)
+			{
+				if (!IsA(lfirst(lc), UserVarRef))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("SELECT INTO target must be a user variable")));
+			}
+
+			into_stmt->selectStmt = parseTree;
+			into_stmt->intoTarget = (Node *) stmt->intoClause->colNames;
+			into_stmt->location = -1;
+			stmt->intoClause = NULL;
+
+			return transformMysSelectIntoStmt(pstate, into_stmt);
+		}
+	}
+
+	return transformStmt(pstate, parseTree);
 }
 
 
@@ -1430,4 +1468,3 @@ determineRecursiveColTypes(ParseState *pstate, Node *larg, List *nrtargetlist)
 	/* Now build CTE's output column info using dummy targetlist */
 	analyzeCTETargetList(pstate, pstate->p_parent_cte, targetList);
 }
-

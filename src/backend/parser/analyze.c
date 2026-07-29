@@ -282,8 +282,13 @@ transformTopLevelStmt(ParseState *pstate, RawStmt *parseTree)
 {
 	Query	   *result;
 
-	/* We're at top level, so allow SELECT INTO */
-	result = transformOptionalSelectInto(pstate, parseTree->stmt);
+	/* We're at top level, so allow dialect-specific SELECT INTO handling. */
+	if (pstate->p_parser_routine != NULL &&
+		pstate->p_parser_routine->transformOptionalSelectInto != NULL)
+		result = pstate->p_parser_routine->transformOptionalSelectInto(pstate,
+																parseTree->stmt);
+	else
+		result = transformOptionalSelectInto(pstate, parseTree->stmt);
 
 	result->stmt_location = parseTree->stmt_location;
 	result->stmt_len = parseTree->stmt_len;

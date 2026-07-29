@@ -44,10 +44,14 @@ diag("using MySQL client: $version_stdout");
 # --- start cluster -----------------------------------------------------
 my $node = PostgreSQL::Test::Cluster->new('mysql_compat_suite');
 $node->init;
+
+# The initdb template already contains a broad localhost trust rule.  Replace
+# it so the MySQL login below actually exercises the native-password/md5 path.
+unlink($node->data_dir . '/pg_hba.conf');
 $node->append_conf('pg_hba.conf', "local all all trust");
-$node->append_conf('pg_hba.conf', "host all all 127.0.0.1/32 trust");
 $node->append_conf('pg_hba.conf',
     "host all mysql_compat_test 127.0.0.1/32 md5");
+$node->append_conf('pg_hba.conf', "host all all 127.0.0.1/32 trust");
 $node->start;
 
 my $mysql_port = PostgreSQL::Test::Cluster::get_free_port();

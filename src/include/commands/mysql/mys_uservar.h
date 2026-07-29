@@ -23,6 +23,6 @@ bool varValueIsDigit(Datum varValue, Oid varValueType);
 void mysSetUserVarInternal(char *userVarName, char *userVarValue, Oid varValueType, bool isDigit, bool isNull);
 void mysSetUserVarForPl(char *userVarName, Datum userVarValue, Oid varValueType, bool isNull);
 bytea *mysGetUserVarValueInternal(char *userVarName);
+Oid mysGetUserVarTypeInternal(char *userVarName);
 
 #endif                          /* MYS_USERVAR_H */
-
