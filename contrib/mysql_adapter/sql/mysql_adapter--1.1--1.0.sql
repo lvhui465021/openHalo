@@ -1,7 +1,3 @@
-DROP VIEW IF EXISTS mys_informa_schema.routines;
-DROP VIEW IF EXISTS mys_informa_schema.views;
-DROP VIEW IF EXISTS mys_informa_schema.indexs;
-
 -- \echo mysql_adapter extension downgrading 1.1 -> 1.0
 
 -- Restore original pg_cast castcontext for int<->bool casts

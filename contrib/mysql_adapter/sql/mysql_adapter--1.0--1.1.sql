@@ -879,13 +879,13 @@ LANGUAGE SQL;
 -- as SQL keywords.  Keep schema-qualified forms available to clients.
 CREATE OR REPLACE FUNCTION mysql.current_user()
 RETURNS text
-AS '$libdir/mysm', 'getCurrentUser'
-LANGUAGE C STABLE;
+AS 'SELECT current_user'
+LANGUAGE SQL;
 
-CREATE OR REPLACE FUNCTION mysql."session_user"()
+CREATE OR REPLACE FUNCTION mysql.session_user()
 RETURNS text
-AS '$libdir/mysm', 'getSessionUser'
-LANGUAGE C STABLE;
+AS 'SELECT session_user'
+LANGUAGE SQL;
 
 -- VERSION()
 CREATE OR REPLACE FUNCTION mysql.version()
@@ -902,14 +902,21 @@ LANGUAGE SQL;
 -- LAST_INSERT_ID()
 CREATE OR REPLACE FUNCTION mysql.last_insert_id()
 RETURNS int8
-AS 'SELECT pg_catalog.mys_last_insert_id()'
+AS 'SELECT pg_catalog.lastval()'
 LANGUAGE SQL;
 
--- ROW_COUNT() is tracked by the MySQL protocol completion path.
+-- ROW_COUNT() -- PG doesn't have a simple equivalent; use GET DIAGNOSTICS
+-- This provides a placeholder that returns -1 (caller should use pg_catalog.ROW_COUNT via plpgsql)
 CREATE OR REPLACE FUNCTION mysql.row_count()
 RETURNS int8
-AS 'SELECT pg_catalog.mys_row_count()'
-LANGUAGE SQL;
+AS $$
+DECLARE
+    rc int8;
+BEGIN
+    GET DIAGNOSTICS rc = ROW_COUNT;
+    RETURN rc;
+END;
+$$ LANGUAGE plpgsql;
 
 -- FOUND_ROWS()
 CREATE OR REPLACE FUNCTION mysql.found_rows()
@@ -1202,166 +1209,3 @@ insert into mys_informa_schema.base_variables values('query_alloc_block_size', '
 insert into mys_informa_schema.base_variables values('query_prealloc_size', '8192', '8192', 0, true, true, null, null, null);
 insert into mys_informa_schema.base_variables values('preload_buffer_size', '32768', '32768', 0, true, true, null, null, null);
 insert into mys_informa_schema.base_variables values('innodb_lock_wait_timeout', '50', '50', 0, true, true, null, null, null);
-
--- -----------------------------------------------------------------------------
--- Additional mys_informa_schema views (v1.1)
--- -----------------------------------------------------------------------------
-
--- View: mys_informa_schema.routines
-CREATE OR REPLACE VIEW mys_informa_schema.routines AS
-SELECT n.nspname AS routine_schema,
-       p.proname AS routine_name
-FROM pg_catalog.pg_proc p
-JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace;
-
--- View: mys_informa_schema.views
-CREATE OR REPLACE VIEW mys_informa_schema.views AS
-SELECT n.nspname AS table_schema,
-       c.relname AS table_name
-FROM pg_catalog.pg_class c
-JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relkind = 'v';
-
--- View: mys_informa_schema.indexs
-CREATE OR REPLACE VIEW mys_informa_schema.indexs AS
-SELECT n.nspname AS schema_name,
-       c.relname AS table_name,
-       c2.relname AS index_name,
-       i.indisunique AS is_unique,
-       i.indisprimary AS is_primary,
-       am.amname AS index_type
-FROM pg_catalog.pg_index i
-JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
-JOIN pg_catalog.pg_class c2 ON c2.oid = i.indexrelid
-JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_catalog.pg_am am ON am.oid = c2.relam
-WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast');
-
--- Fix mys_informa_schema.views: add table_type column
-DROP VIEW IF EXISTS mys_informa_schema.views;
-CREATE OR REPLACE VIEW mys_informa_schema.views AS
-SELECT n.nspname AS table_schema,
-       c.relname AS table_name,
-       'VIEW'::varchar(256) AS table_type
-FROM pg_catalog.pg_class c
-JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relkind = 'v';
-
--- Fix mys_informa_schema.indexs: add key_name alias
-DROP VIEW IF EXISTS mys_informa_schema.indexs;
-CREATE OR REPLACE VIEW mys_informa_schema.indexs AS
-SELECT n.nspname AS schema_name,
-       c.relname AS table_name,
-       c2.relname AS index_name,
-       c2.relname AS key_name,
-       i.indisunique AS is_unique,
-       i.indisprimary AS is_primary,
-       am.amname AS index_type
-FROM pg_catalog.pg_index i
-JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
-JOIN pg_catalog.pg_class c2 ON c2.oid = i.indexrelid
-JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_catalog.pg_am am ON am.oid = c2.relam
-WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast');
-
--- -----------------------------------------------------------------------------
--- MySQL metadata query functions (v1.1)
--- -----------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION mysql.show_table_columns(pg_catalog.text, pg_catalog.text) RETURNS SETOF RECORD AS $$
-DECLARE
-    sch_oid pg_catalog.Oid; tab_oid pg_catalog.Oid; rec RECORD;
-BEGIN
-    IF $1 IS NOT NULL THEN SELECT oid INTO sch_oid FROM pg_catalog.pg_namespace WHERE nspname = $1;
-    ELSE SELECT oid INTO sch_oid FROM pg_catalog.pg_namespace WHERE nspname = pg_catalog.current_schema(); END IF;
-    IF NOT FOUND THEN RAISE EXCEPTION 'invalid schema name: %', $1; END IF;
-    SELECT oid INTO tab_oid FROM pg_catalog.pg_class WHERE relname = $2 AND relnamespace = sch_oid AND oid >= 16384;
-    IF NOT FOUND THEN RAISE EXCEPTION 'Table %.% does not exist', $1, $2; END IF;
-    FOR rec IN
-        SELECT a.attname::varchar(256) AS "Field", pg_catalog.format_type(a.atttypid, a.atttypmod)::varchar(64) AS "Type",
-            CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END::varchar(8) AS "Null",
-            CASE WHEN pk.attname IS NOT NULL THEN 'PRI' WHEN uq.attname IS NOT NULL THEN 'UNI' WHEN ix.attname IS NOT NULL THEN 'MUL' ELSE '' END::varchar(256) AS "Key",
-            pg_catalog.pg_get_expr(d.adbin, d.adrelid)::text AS "Default",
-            CASE WHEN pg_catalog.pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval%' THEN 'auto_increment' ELSE '' END::varchar(256) AS "Extra"
-        FROM pg_catalog.pg_attribute a
-        LEFT JOIN pg_catalog.pg_attrdef d ON (d.adrelid = a.attrelid AND d.adnum = a.attnum)
-        LEFT JOIN (SELECT ia.attname FROM pg_catalog.pg_index i JOIN pg_catalog.pg_attribute ia ON ia.attrelid = i.indrelid AND ia.attnum = ANY(i.indkey) WHERE i.indisprimary AND i.indrelid = tab_oid LIMIT 1) pk ON pk.attname = a.attname
-        LEFT JOIN (SELECT ia.attname FROM pg_catalog.pg_index i JOIN pg_catalog.pg_attribute ia ON ia.attrelid = i.indrelid AND ia.attnum = ANY(i.indkey) WHERE i.indisunique AND NOT i.indisprimary AND i.indrelid = tab_oid LIMIT 1) uq ON uq.attname = a.attname AND pk.attname IS NULL
-        LEFT JOIN (SELECT ia.attname FROM pg_catalog.pg_index i JOIN pg_catalog.pg_attribute ia ON ia.attrelid = i.indrelid AND ia.attnum = ANY(i.indkey) WHERE NOT i.indisunique AND i.indrelid = tab_oid LIMIT 1) ix ON ix.attname = a.attname AND pk.attname IS NULL AND uq.attname IS NULL
-        WHERE a.attrelid = tab_oid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum
-    LOOP RETURN NEXT rec; END LOOP; RETURN;
-END; $$ LANGUAGE plpgsql STABLE;
-
-CREATE OR REPLACE FUNCTION mysql.show_table_indexs(pg_catalog.text, pg_catalog.text) RETURNS SETOF RECORD AS $$
-DECLARE
-    sch_oid pg_catalog.Oid; tab_oid pg_catalog.Oid; rec RECORD; idx_rec RECORD;
-    keys pg_catalog.int2[]; key_idx pg_catalog.int4; seq_num pg_catalog.int4; col_name pg_catalog.text;
-BEGIN
-    IF $1 IS NOT NULL THEN SELECT oid INTO sch_oid FROM pg_catalog.pg_namespace WHERE nspname = $1;
-    ELSE SELECT oid INTO sch_oid FROM pg_catalog.pg_namespace WHERE nspname = pg_catalog.current_schema(); END IF;
-    IF NOT FOUND THEN RAISE EXCEPTION 'Table %.% does not exist', $1, $2; END IF;
-    SELECT oid INTO tab_oid FROM pg_catalog.pg_class WHERE relname = $2 AND relnamespace = sch_oid AND oid >= 16384;
-    IF NOT FOUND THEN RAISE EXCEPTION 'Table %.% does not exist', $1, $2; END IF;
-    FOR idx_rec IN SELECT ic.relname AS index_name, i.indisunique, i.indisprimary, i.indkey, am.amname AS index_type
-        FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid JOIN pg_catalog.pg_am am ON am.oid = ic.relam WHERE i.indrelid = tab_oid
-    LOOP
-        keys := idx_rec.indkey; seq_num := 1;
-        FOR key_idx IN 1..array_length(keys, 1) LOOP
-            SELECT attname INTO col_name FROM pg_catalog.pg_attribute WHERE attrelid = tab_oid AND attnum = keys[key_idx];
-            SELECT (SELECT c.relname FROM pg_catalog.pg_class c WHERE c.oid = tab_oid)::varchar(256),
-                CASE WHEN idx_rec.indisunique THEN 0 ELSE 1 END,
-                CASE WHEN idx_rec.indisprimary THEN 'PRIMARY' ELSE idx_rec.index_name END::varchar(256),
-                seq_num, col_name::varchar(256), 'A'::varchar(256), 0, NULL::int4, NULL::varchar(256), ''::varchar(8),
-                idx_rec.index_type::varchar(256), ''::varchar(512), ''::varchar(512) INTO rec;
-            RETURN NEXT rec; seq_num := seq_num + 1;
-        END LOOP;
-    END LOOP; RETURN;
-END; $$ LANGUAGE plpgsql STABLE;
-
-CREATE OR REPLACE FUNCTION mysql.timestampadd(text, integer, timestamp without time zone) RETURNS timestamp without time zone
-AS $$ SELECT CASE lower($1) WHEN 'second' THEN $3 + ($2 || ' seconds')::interval WHEN 'minute' THEN $3 + ($2 || ' minutes')::interval WHEN 'hour' THEN $3 + ($2 || ' hours')::interval WHEN 'day' THEN $3 + ($2 || ' days')::interval WHEN 'week' THEN $3 + ($2 * 7 || ' days')::interval WHEN 'month' THEN $3 + ($2 || ' months')::interval WHEN 'quarter' THEN $3 + ($2 * 3 || ' months')::interval WHEN 'year' THEN $3 + ($2 || ' years')::interval ELSE $3 + ($2 || ' days')::interval END $$ LANGUAGE SQL IMMUTABLE STRICT;
-
-CREATE OR REPLACE FUNCTION mysql.str_to_date(text, text) RETURNS timestamp without time zone
-AS $$ BEGIN RETURN $1::timestamp without time zone; EXCEPTION WHEN OTHERS THEN RETURN NULL; END; $$ LANGUAGE plpgsql IMMUTABLE STRICT;
-
--- _week_mode
-CREATE OR REPLACE FUNCTION mysql._week_mode(integer) RETURNS integer AS $$
-DECLARE _WEEK_MONDAY_FIRST CONSTANT integer := 1; _WEEK_FIRST_WEEKDAY CONSTANT integer := 4;
-week_format integer := $1 & 7;
-BEGIN IF (week_format & _WEEK_MONDAY_FIRST)=0 THEN week_format := week_format # _WEEK_FIRST_WEEKDAY; END IF;
-RETURN week_format; END; $$ IMMUTABLE STRICT LANGUAGE PLPGSQL;
-
--- show_create_view
-CREATE OR REPLACE FUNCTION mysql.show_create_view(text, text) RETURNS SETOF RECORD AS $$
-DECLARE rec RECORD; found bool := false;
-BEGIN FOR rec IN SELECT $2::varchar(64) AS "View",
-    'CREATE ALGORITHM=UNDEFINED DEFINER='||COALESCE(v.viewowner,'unknown')||E'@% SQL SECURITY DEFINER VIEW `'||$2||'` AS '||v.definition AS "Create View",
-    'utf8mb4'::varchar(128) AS character_set_client, 'utf8mb4_general_ci'::varchar(128) AS collation_connection
-    FROM pg_views v WHERE v.schemaname=$1 AND v.viewname=$2
-LOOP found:=true; RETURN NEXT rec; END LOOP;
-IF NOT found THEN RAISE EXCEPTION 'VIEW %.% does not exist', $1, $2; END IF; RETURN; END;
-$$ LANGUAGE plpgsql STABLE;
-
--- show_create_table
-CREATE OR REPLACE FUNCTION mysql.show_create_table(text, text) RETURNS SETOF RECORD AS $$
-DECLARE sch_oid oid; tab_oid oid; rec RECORD; is_v bool:=false; col_defs text:=''; col RECORD;
-BEGIN
-    SELECT oid INTO sch_oid FROM pg_namespace WHERE nspname=$1;
-    IF NOT FOUND OR sch_oid=0 THEN RAISE EXCEPTION 'Table %.% does not exist', $1, $2; END IF;
-    PERFORM 1 FROM pg_views WHERE schemaname=$1 AND viewname=$2;
-    IF FOUND THEN FOR rec IN SELECT * FROM mysql.show_create_view($1,$2)
-        AS ("View" varchar(64),"Create View" text,character_set_client varchar(128),collation_connection varchar(128))
-    LOOP RETURN NEXT rec; END LOOP; RETURN; END IF;
-    SELECT oid INTO tab_oid FROM pg_class WHERE relname=$2 AND relnamespace=sch_oid AND oid>=16384;
-    IF NOT FOUND OR tab_oid=0 THEN RAISE EXCEPTION 'Table %.% does not exist', $1, $2; END IF;
-    FOR col IN SELECT a.attname, format_type(a.atttypid,a.atttypmod) AS col_type,
-        CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END AS nullable,
-        COALESCE(' DEFAULT '||pg_get_expr(d.adbin,d.adrelid),'') AS default_val
-        FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
-        WHERE a.attrelid=tab_oid AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum
-    LOOP IF col_defs!='' THEN col_defs:=col_defs||E',\n  '; END IF;
-        col_defs:=col_defs||'  `'||col.attname||'` '||col.col_type||col.nullable||col.default_val;
-    END LOOP;
-    SELECT $2::varchar(64) AS "Table",
-        'CREATE TABLE `'||$2||'` (\n'||col_defs||E'\n) ENGINE=InnoDB' AS "Create Table" INTO rec;
-    RETURN NEXT rec; RETURN;
-END; $$ LANGUAGE plpgsql STABLE;

@@ -1,0 +1,22 @@
+-- \echo mysql_adapter extension downgrading 1.2 -> 1.1
+DROP FUNCTION IF EXISTS mysql.show_create_function(text,text) CASCADE;
+DROP FUNCTION IF EXISTS mysql.show_create_procedure(text,text) CASCADE;
+DROP FUNCTION IF EXISTS mysql.show_create_view(text,text) CASCADE;
+DROP FUNCTION IF EXISTS mysql.show_create_table(text,text) CASCADE;
+DROP FUNCTION IF EXISTS mysql.show_table_columns(text,text) CASCADE;
+DROP FUNCTION IF EXISTS mysql.show_table_full_columns(text,text) CASCADE;
+DROP FUNCTION IF EXISTS mysql.show_table_indexs(text,text) CASCADE;
+DROP FUNCTION IF EXISTS mysql.get_func_def(text,text,oid,oidvector,text[],text) CASCADE;
+DROP FUNCTION IF EXISTS mysql.get_proc_def(text,text,oidvector,oid[],text[],text[],text) CASCADE;
+DROP FUNCTION IF EXISTS mysql._week_mode(integer) CASCADE;
+DROP FUNCTION IF EXISTS mysql.maketime(integer,integer,integer) CASCADE;
+DROP FUNCTION IF EXISTS mysql.concat("any") CASCADE;
+DROP FUNCTION IF EXISTS mysql.left(text,integer) CASCADE;
+DROP FUNCTION IF EXISTS mysql.right(text,integer) CASCADE;
+DROP FUNCTION IF EXISTS mysql.substr(text,integer,integer) CASCADE;
+DROP FUNCTION IF EXISTS mysql."session_user"() CASCADE;
+DROP VIEW IF EXISTS mys_informa_schema.functions;
+DROP VIEW IF EXISTS mys_informa_schema.procedures;
+DROP VIEW IF EXISTS mys_informa_schema.routines;
+DROP VIEW IF EXISTS mys_informa_schema.views;
+DROP VIEW IF EXISTS mys_informa_schema.indexs;
