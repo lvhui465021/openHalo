@@ -18566,36 +18566,24 @@ Character:  CharacterWithLength
 
 CharacterWithLength:  character '(' Iconst ')' opt_charset_with_opt_binary
 				{
-                    //$$ = NULL;
+					int			clen = $3;
 
-                    //if ($5 != NIL)
-                    //{
-                    //    Node *n = linitial($5);
-                    //    if (nodeTag(n) == T_String)
-                    //    {
-                    //        Value *v = (Value *)n;
-
-                    //        if (strncasecmp(strVal(v), "binary", 6) == 0)
-                    //        {
-                    //            $$ = SystemTypeName("bytea");
-                    //        }
-                    //    }
-                    //}
-
-                    //if ($$ == NULL)
-                    //{
-					//    $$ = SystemTypeName($1);
-					//    $$->typmods = list_make1(mys_makeIntConst($3, @3));
-                    //}
+					/* MySQL allows VARCHAR(0) / CHAR(0); PG requires >= 1 */
+					if (clen < 1)
+						clen = 1;
 
 					$$ = SystemTypeName($1);
-					$$->typmods = list_make1(mys_makeIntConst($3, @3));
+					$$->typmods = list_make1(mys_makeIntConst(clen, @3));
 					$$->location = @1;
 				}
                 | ncharacter '(' Iconst ')' opt_bin_mod
                 {
+					int			clen = $3;
+					if (clen < 1)
+						clen = 1;
+
                     $$ = SystemTypeName($1);
-					$$->typmods = list_make1(mys_makeIntConst($3, @3));
+					$$->typmods = list_make1(mys_makeIntConst(clen, @3));
 					$$->location = @1;
                 }
 		;

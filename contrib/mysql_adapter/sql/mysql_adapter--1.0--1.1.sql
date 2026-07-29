@@ -1236,3 +1236,30 @@ JOIN pg_catalog.pg_class c2 ON c2.oid = i.indexrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_catalog.pg_am am ON am.oid = c2.relam
 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast');
+
+-- Fix mys_informa_schema.views: add table_type column
+DROP VIEW IF EXISTS mys_informa_schema.views;
+CREATE OR REPLACE VIEW mys_informa_schema.views AS
+SELECT n.nspname AS table_schema,
+       c.relname AS table_name,
+       'VIEW'::varchar(256) AS table_type
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'v';
+
+-- Fix mys_informa_schema.indexs: add key_name alias
+DROP VIEW IF EXISTS mys_informa_schema.indexs;
+CREATE OR REPLACE VIEW mys_informa_schema.indexs AS
+SELECT n.nspname AS schema_name,
+       c.relname AS table_name,
+       c2.relname AS index_name,
+       c2.relname AS key_name,
+       i.indisunique AS is_unique,
+       i.indisprimary AS is_primary,
+       am.amname AS index_type
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+JOIN pg_catalog.pg_class c2 ON c2.oid = i.indexrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_am am ON am.oid = c2.relam
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast');
