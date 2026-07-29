@@ -253,6 +253,45 @@ transformExprRecurse(ParseState *pstate, Node *expr)
 						break;
 					}
 				}
+
+				/*
+				 * For numeric aggregates (SUM, AVG, BIT_AND, BIT_OR,
+				 * BIT_XOR), coerce boolean arguments to bigint so
+				 * MySQL-style SUM(p.prokind = 'f') works without
+				 * polluting pg_catalog with sum(boolean).
+				 */
+				if (fn->args != NIL && list_length(fn->funcname) == 1)
+				{
+					char *fname = strVal(linitial(fn->funcname));
+
+					if (pg_strcasecmp(fname, "sum") == 0 ||
+						pg_strcasecmp(fname, "avg") == 0 ||
+						pg_strcasecmp(fname, "bit_and") == 0 ||
+						pg_strcasecmp(fname, "bit_or") == 0 ||
+						pg_strcasecmp(fname, "bit_xor") == 0)
+					{
+						Node	   *last_srf = pstate->p_last_srf;
+						List	   *targs = NIL;
+						ListCell   *lc;
+
+						foreach(lc, fn->args)
+						{
+							Node *arg = transformExprRecurse(pstate, lfirst(lc));
+
+							if (exprType(arg) == BOOLOID)
+								arg = coerce_to_target_type(pstate, arg,
+									BOOLOID, INT8OID, -1,
+									COERCION_IMPLICIT,
+									COERCE_IMPLICIT_CAST, -1);
+							targs = lappend(targs, arg);
+						}
+
+						result = ParseFuncOrColumn(pstate, fn->funcname,
+							targs, last_srf, fn, false, fn->location);
+						break;
+					}
+				}
+
 				result = transformFuncCall(pstate, fn);
 				break;
 			}
