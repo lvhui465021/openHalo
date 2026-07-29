@@ -13,7 +13,8 @@
  *-------------------------------------------------------------------------
  */
 
-#include "unvdb.h"
+#include "postgres.h"
+#include "mysm_compat.h"
 
 #include <ctype.h>
 
@@ -24,10 +25,10 @@
 #include "utils/builtins.h"
 #include "utils/pg_locale.h"
 #include "miscadmin.h"
-#include "adapter/mysql/adapter.h"
+/* adapter.h replaced by mysql_packet.h via compat */
 
-#include "../../adt/like.c"
-#include "../../adt/varchar.c"
+/* like.c inline → use header */
+/* varchar.c inline → use header */
 
 PG_MODULE_MAGIC;
 

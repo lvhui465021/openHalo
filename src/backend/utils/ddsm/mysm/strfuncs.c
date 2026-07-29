@@ -13,7 +13,8 @@
  *-------------------------------------------------------------------------
  */
 
-#include "unvdb.h"
+#include "postgres.h"
+#include "mysm_compat.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -45,7 +46,7 @@
 #include "utils/sortsupport.h"
 #include "utils/varbit.h"
 #include "utils/varlena.h"
-#include "adapter/mysql/adapter.h"
+/* adapter.h replaced by mysql_packet.h via compat */
 
 
 typedef struct

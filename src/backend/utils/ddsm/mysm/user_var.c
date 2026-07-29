@@ -15,9 +15,9 @@
 
 #include "c.h"
 #include "nodes/nodes.h"
-#include "unvdb.h"
+#include "mysm_compat.h"
 
-#include "catalog/pg_type_d.h"
+/* pg_type_d.h → pg_type.h */
 #include "fmgr.h"
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
@@ -25,7 +25,7 @@
 #include "utils/date.h"
 #include "utils/datetime.h"
 #include "utils/float.h"
-#include "utils/int8.h"
+/* int8.h → builtins.h already included */
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/numeric.h"

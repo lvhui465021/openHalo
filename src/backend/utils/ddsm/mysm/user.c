@@ -13,7 +13,8 @@
  *-------------------------------------------------------------------------
  */
 
-#include "unvdb.h"
+#include "postgres.h"
+#include "mysm_compat.h"
 
 #include "fmgr.h"
 #include "utils/builtins.h"

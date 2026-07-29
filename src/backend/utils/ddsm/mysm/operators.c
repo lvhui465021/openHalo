@@ -13,7 +13,8 @@
  *-------------------------------------------------------------------------
  */
 
-#include "unvdb.h"
+#include "postgres.h"
+#include "mysm_compat.h"
 
 #include "fmgr.h"
 #include "adapter/mysql/systemVar.h"
@@ -21,7 +22,7 @@
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/datetime.h"
-#include "utils/fmgrprotos.h"
+/* fmgrprotos.h → fmgr.h already included */
 #include "utils/timestamp.h"
 #include "utils/mysql/mys_date.h"
 #include "utils/mysql/mys_timestamp.h"

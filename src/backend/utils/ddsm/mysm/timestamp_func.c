@@ -13,14 +13,15 @@
  *-------------------------------------------------------------------------
  */
 
-#include "unvdb.h"
+#include "postgres.h"
+#include "mysm_compat.h"
 
 #include "fmgr.h"
 #include "datatype/timestamp.h"
 #include "parser/scansup.h"
 #include "utils/datetime.h"
 #include "utils/float.h"
-#include "utils/fmgrprotos.h"
+/* fmgrprotos.h → fmgr.h already included */
 #include "utils/numeric.h"
 #include "utils/timestamp.h"
 #include "varatt.h"

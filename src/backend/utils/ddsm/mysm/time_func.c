@@ -13,11 +13,12 @@
  *-------------------------------------------------------------------------
  */
 
-#include "unvdb.h"
+#include "postgres.h"
+#include "mysm_compat.h"
 
 #include "fmgr.h"
 #include "utils/builtins.h"
-#include "utils/fmgrprotos.h"
+/* fmgrprotos.h → fmgr.h already included */
 #include "utils/mysql/mys_date.h"
 #include "utils/timestamp.h"
 #include "varatt.h"

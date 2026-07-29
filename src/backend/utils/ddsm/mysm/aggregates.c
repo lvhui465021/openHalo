@@ -13,11 +13,12 @@
  *-------------------------------------------------------------------------
  */
 
-#include "unvdb.h"
+#include "postgres.h"
+#include "mysm_compat.h"
 
 #include "fmgr.h"
 #include "utils/builtins.h"
-#include "utils/fmgrprotos.h"
+/* fmgrprotos.h → fmgr.h already included */
 
 
 PG_FUNCTION_INFO_V1(textAvgAccum);

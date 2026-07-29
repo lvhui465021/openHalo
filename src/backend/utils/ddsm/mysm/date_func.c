@@ -13,7 +13,8 @@
  *-------------------------------------------------------------------------
  */
 
-#include "unvdb.h"
+#include "postgres.h"
+#include "mysm_compat.h"
 
 #include "parser/scansup.h"
 #include "utils/builtins.h"

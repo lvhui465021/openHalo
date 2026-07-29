@@ -13,11 +13,12 @@
  *-------------------------------------------------------------------------
  */
 
-#include "unvdb.h"
+#include "postgres.h"
+#include "mysm_compat.h"
 
 #include "fmgr.h"
 #include "utils/builtins.h"
-#include "utils/int8.h"
+/* int8.h → builtins.h already included */
 #include "adapter/mysql/uuidShort.h"
 
 //#include <ctype.h>
