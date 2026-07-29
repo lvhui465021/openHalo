@@ -1890,3 +1890,69 @@ BEGIN
     RETURN;
 END;
 $$ LANGUAGE plpgsql STABLE;
+
+-- =============================================================================
+-- Additional MySQL functions from openHalo aux_mysql (migration omissions)
+-- =============================================================================
+
+-- maketime: MySQL MAKETIME(hour, minute, second)
+CREATE OR REPLACE FUNCTION mysql.maketime(integer, integer, integer)
+RETURNS pg_catalog.interval
+AS $$
+    SELECT ($1 || ':' || $2 || ':' || $3)::pg_catalog.interval
+$$ LANGUAGE SQL IMMUTABLE STRICT;
+
+-- left/right/substr: MySQL string functions (C impl in mysm.so)
+CREATE OR REPLACE FUNCTION mysql.left(text, integer) RETURNS text
+AS '$libdir/mysm', 'text_left' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION mysql.right(text, integer) RETURNS text
+AS '$libdir/mysm', 'text_right' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION mysql.substr(text, integer, integer) RETURNS text
+AS '$libdir/mysm', 'text_substr' LANGUAGE C IMMUTABLE STRICT;
+
+-- concat: MySQL CONCAT (C impl in mysm.so)
+CREATE OR REPLACE FUNCTION mysql.concat(VARIADIC pg_catalog."any") RETURNS text
+AS '$libdir/mysm', 'text_concat' LANGUAGE C STABLE PARALLEL SAFE;
+
+-- Replace current_user/session_user with C functions from mysm
+CREATE OR REPLACE FUNCTION mysql.current_user() RETURNS text
+AS '$libdir/mysm', 'getCurrentUser' LANGUAGE C STABLE;
+CREATE OR REPLACE FUNCTION mysql."session_user"() RETURNS text
+AS '$libdir/mysm', 'getSessionUser' LANGUAGE C STABLE;
+
+-- show_create_function/procedure metadata (replaces runtime patches)
+CREATE OR REPLACE FUNCTION mysql.get_func_def(funcName text, procOwner text, prorettype oid, proargtypes oidvector, proargnames text[], prosrc text) RETURNS text AS $$
+DECLARE ret text; argTypes int4[]; allArgNum int4; argIndex int4;
+BEGIN
+    ret := 'CREATE DEFINER=`' || procOwner || '`@`%` FUNCTION `' || funcName || '`(';
+    argTypes := string_to_array(proargtypes::text, ' '); allArgNum := array_length(argTypes, 1); argIndex := 1;
+    IF 0 < allArgNum THEN LOOP
+        IF 1 < argIndex THEN ret := ret || ', '; END IF;
+        IF proargnames IS NOT NULL AND array_length(proargnames, 1) >= argIndex THEN
+            ret := ret || proargnames[argIndex] || ' '; END IF;
+        ret := ret || argTypes[argIndex]::regtype::text;
+        argIndex := argIndex + 1; EXIT WHEN argIndex > allArgNum;
+    END LOOP; END IF;
+    ret := ret || ') RETURNS ' || prorettype::regtype::text || E'\n' || prosrc;
+    RETURN ret;
+END; $$ LANGUAGE plpgsql STABLE;
+
+CREATE OR REPLACE FUNCTION mysql.show_create_function(text, text) RETURNS SETOF RECORD AS $$
+DECLARE func RECORD; n int4 := 0;
+BEGIN
+    FOR func IN SELECT "Function", sql_mode, "Create Function", character_set_client, collation_connection, "Database Collation"
+        FROM mys_informa_schema.functions WHERE "Function" = $2
+    LOOP n := n + 1; RETURN NEXT func; END LOOP;
+    IF n = 0 THEN RAISE EXCEPTION 'FUNCTION % does not exist', $2; END IF; RETURN;
+END; $$ LANGUAGE plpgsql STABLE;
+
+-- mys_informa_schema.functions view
+CREATE OR REPLACE VIEW mys_informa_schema.functions AS
+SELECT pc.proname::varchar(256) AS "Function",
+    'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'::varchar(256) AS sql_mode,
+    mysql.get_func_def(pc.proname, (pc.proowner::regrole)::text, pc.prorettype,
+        pc.proargtypes, pc.proargnames, pc.prosrc)::text AS "Create Function",
+    'utf8mb4'::varchar(128) AS character_set_client,
+    'utf8mb4_general_ci'::varchar(128) AS collation_connection,
+    'utf8mb4_general_ci'::varchar(128) AS "Database Collation"
+FROM pg_proc pc WHERE pc.prokind = 'f' AND pc.pronamespace >= 16384;

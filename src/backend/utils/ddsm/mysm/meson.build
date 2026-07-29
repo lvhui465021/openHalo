@@ -7,6 +7,7 @@ mysm_sources = files(
   'texteq_mys.c',
   'mysm_globals.c',
   'uuid_stubs.c',
+  'mysm_stubs.c',
 )
 mysm = shared_module('mysm',
   mysm_sources,
