@@ -1773,3 +1773,120 @@ EXCEPTION WHEN OTHERS THEN
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE STRICT;
+
+-- =============================================================================
+-- MySQL date helper functions (from openHalo aux_mysql)
+-- =============================================================================
+
+-- _week_mode: compute MySQL WEEK() mode flags
+CREATE OR REPLACE FUNCTION mysql._week_mode(mode integer)
+RETURNS integer AS $$
+  DECLARE
+    _WEEK_MONDAY_FIRST  CONSTANT integer := 1;
+    _WEEK_FIRST_WEEKDAY CONSTANT integer := 4;
+    week_format integer := mode & 7;
+  BEGIN
+    IF (week_format & _WEEK_MONDAY_FIRST) = 0 THEN
+      week_format := week_format # _WEEK_FIRST_WEEKDAY;
+    END IF;
+    RETURN week_format;
+  END;
+$$ IMMUTABLE STRICT LANGUAGE PLPGSQL;
+
+-- show_create_view: SHOW CREATE VIEW wrapper
+CREATE OR REPLACE FUNCTION mysql.show_create_view(
+    sch_name pg_catalog.text, vw_name pg_catalog.text)
+RETURNS SETOF RECORD
+AS $$
+DECLARE
+    rec RECORD;
+    found bool := false;
+BEGIN
+    FOR rec IN
+        SELECT vw_name::varchar(64) AS "View",
+               'CREATE ALGORITHM=UNDEFINED DEFINER=' ||
+               COALESCE(v.viewowner, 'unknown') || '@%' ||
+               ' SQL SECURITY DEFINER VIEW `' || vw_name || '` AS ' ||
+               v.definition AS "Create View",
+               'utf8mb4'::varchar(128) AS character_set_client,
+               'utf8mb4_general_ci'::varchar(128) AS collation_connection
+        FROM pg_catalog.pg_views v
+        WHERE v.schemaname = sch_name AND v.viewname = vw_name
+    LOOP
+        found := true;
+        RETURN NEXT rec;
+    END LOOP;
+    IF NOT found THEN
+        RAISE EXCEPTION 'VIEW %.% does not exist', sch_name, vw_name;
+    END IF;
+    RETURN;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- show_create_table: SHOW CREATE TABLE wrapper
+CREATE OR REPLACE FUNCTION mysql.show_create_table(
+    sch_name pg_catalog.text, tab_name pg_catalog.text)
+RETURNS SETOF RECORD
+AS $$
+DECLARE
+    sch_oid pg_catalog.Oid;
+    tab_oid pg_catalog.Oid;
+    rec RECORD;
+    is_view bool := false;
+    col_defs text := '';
+    col RECORD;
+BEGIN
+    -- Resolve schema
+    IF sch_name IS NOT NULL THEN
+        SELECT oid INTO sch_oid FROM pg_catalog.pg_namespace WHERE nspname = sch_name;
+    ELSE
+        SELECT oid INTO sch_oid FROM pg_catalog.pg_namespace
+            WHERE nspname = pg_catalog.current_schema();
+    END IF;
+    IF NOT FOUND OR sch_oid = 0 THEN
+        RAISE EXCEPTION 'Table %.% does not exist', sch_name, tab_name;
+    END IF;
+
+    -- Check if it's a view
+    PERFORM 1 FROM pg_catalog.pg_views WHERE schemaname = sch_name AND viewname = tab_name;
+    IF FOUND THEN
+        -- Delegate to show_create_view
+        FOR rec IN SELECT * FROM mysql.show_create_view(sch_name, tab_name)
+            AS ("View" varchar(64), "Create View" text,
+                character_set_client varchar(128), collation_connection varchar(128))
+        LOOP
+            RETURN NEXT rec;
+        END LOOP;
+        RETURN;
+    END IF;
+
+    -- Resolve table
+    SELECT oid INTO tab_oid FROM pg_catalog.pg_class
+        WHERE relname = tab_name AND relnamespace = sch_oid AND oid >= 16384;
+    IF NOT FOUND OR tab_oid = 0 THEN
+        RAISE EXCEPTION 'Table %.% does not exist', sch_name, tab_name;
+    END IF;
+
+    -- Build column definitions
+    FOR col IN
+        SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) AS col_type,
+               CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END AS nullable,
+               COALESCE(' DEFAULT ' || pg_catalog.pg_get_expr(d.adbin, d.adrelid), '') AS default_val
+        FROM pg_catalog.pg_attribute a
+        LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+        WHERE a.attrelid = tab_oid AND a.attnum > 0 AND NOT a.attisdropped
+        ORDER BY a.attnum
+    LOOP
+        IF col_defs != '' THEN col_defs := col_defs || E',\n  '; END IF;
+        col_defs := col_defs || '  `' || col.attname || '` ' || col.col_type ||
+                    col.nullable || col.default_val;
+    END LOOP;
+
+    -- Return result
+    SELECT tab_name::varchar(64) AS "Table",
+           'CREATE TABLE `' || tab_name || '` (\n' || col_defs || E'\n) ENGINE=InnoDB' AS "Create Table"
+    INTO rec;
+    RETURN NEXT rec;
+    RETURN;
+END;
+$$ LANGUAGE plpgsql STABLE;

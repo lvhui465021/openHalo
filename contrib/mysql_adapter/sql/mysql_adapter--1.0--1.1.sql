@@ -1322,3 +1322,46 @@ AS $$ SELECT CASE lower($1) WHEN 'second' THEN $3 + ($2 || ' seconds')::interval
 
 CREATE OR REPLACE FUNCTION mysql.str_to_date(text, text) RETURNS timestamp without time zone
 AS $$ BEGIN RETURN $1::timestamp without time zone; EXCEPTION WHEN OTHERS THEN RETURN NULL; END; $$ LANGUAGE plpgsql IMMUTABLE STRICT;
+
+-- _week_mode
+CREATE OR REPLACE FUNCTION mysql._week_mode(integer) RETURNS integer AS $$
+DECLARE _WEEK_MONDAY_FIRST CONSTANT integer := 1; _WEEK_FIRST_WEEKDAY CONSTANT integer := 4;
+week_format integer := $1 & 7;
+BEGIN IF (week_format & _WEEK_MONDAY_FIRST)=0 THEN week_format := week_format # _WEEK_FIRST_WEEKDAY; END IF;
+RETURN week_format; END; $$ IMMUTABLE STRICT LANGUAGE PLPGSQL;
+
+-- show_create_view
+CREATE OR REPLACE FUNCTION mysql.show_create_view(text, text) RETURNS SETOF RECORD AS $$
+DECLARE rec RECORD; found bool := false;
+BEGIN FOR rec IN SELECT $2::varchar(64) AS "View",
+    'CREATE ALGORITHM=UNDEFINED DEFINER='||COALESCE(v.viewowner,'unknown')||E'@% SQL SECURITY DEFINER VIEW `'||$2||'` AS '||v.definition AS "Create View",
+    'utf8mb4'::varchar(128) AS character_set_client, 'utf8mb4_general_ci'::varchar(128) AS collation_connection
+    FROM pg_views v WHERE v.schemaname=$1 AND v.viewname=$2
+LOOP found:=true; RETURN NEXT rec; END LOOP;
+IF NOT found THEN RAISE EXCEPTION 'VIEW %.% does not exist', $1, $2; END IF; RETURN; END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- show_create_table
+CREATE OR REPLACE FUNCTION mysql.show_create_table(text, text) RETURNS SETOF RECORD AS $$
+DECLARE sch_oid oid; tab_oid oid; rec RECORD; is_v bool:=false; col_defs text:=''; col RECORD;
+BEGIN
+    SELECT oid INTO sch_oid FROM pg_namespace WHERE nspname=$1;
+    IF NOT FOUND OR sch_oid=0 THEN RAISE EXCEPTION 'Table %.% does not exist', $1, $2; END IF;
+    PERFORM 1 FROM pg_views WHERE schemaname=$1 AND viewname=$2;
+    IF FOUND THEN FOR rec IN SELECT * FROM mysql.show_create_view($1,$2)
+        AS ("View" varchar(64),"Create View" text,character_set_client varchar(128),collation_connection varchar(128))
+    LOOP RETURN NEXT rec; END LOOP; RETURN; END IF;
+    SELECT oid INTO tab_oid FROM pg_class WHERE relname=$2 AND relnamespace=sch_oid AND oid>=16384;
+    IF NOT FOUND OR tab_oid=0 THEN RAISE EXCEPTION 'Table %.% does not exist', $1, $2; END IF;
+    FOR col IN SELECT a.attname, format_type(a.atttypid,a.atttypmod) AS col_type,
+        CASE WHEN a.attnotnull THEN ' NOT NULL' ELSE '' END AS nullable,
+        COALESCE(' DEFAULT '||pg_get_expr(d.adbin,d.adrelid),'') AS default_val
+        FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+        WHERE a.attrelid=tab_oid AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum
+    LOOP IF col_defs!='' THEN col_defs:=col_defs||E',\n  '; END IF;
+        col_defs:=col_defs||'  `'||col.attname||'` '||col.col_type||col.nullable||col.default_val;
+    END LOOP;
+    SELECT $2::varchar(64) AS "Table",
+        'CREATE TABLE `'||$2||'` (\n'||col_defs||E'\n) ENGINE=InnoDB' AS "Create Table" INTO rec;
+    RETURN NEXT rec; RETURN;
+END; $$ LANGUAGE plpgsql STABLE;
