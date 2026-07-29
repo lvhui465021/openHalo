@@ -1,6 +1,6 @@
 # mysql_adapter extension
 comment = 'MySQL compatibility adapter for PostgreSQL'
-default_version = '1.2'
+default_version = '1.1'
 module_pathname = '$libdir/mysm'
 schema = mysql
 relocatable = false

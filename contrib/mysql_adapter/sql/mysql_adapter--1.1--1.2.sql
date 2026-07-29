@@ -6853,7 +6853,7 @@ AS
 $$
 BEGIN
     if ($1 is not null) then
-        return $1 operator(pg_catalog.||) $2;
+        return $1 || $2;
     else
         if $2::pg_catalog.int8 != 0 then
             return true;
@@ -6878,7 +6878,7 @@ AS
 $$
 BEGIN
     if ($2 is not null) then
-        return $1 operator(pg_catalog.||) $2;
+        return $1 || $2;
     else
         if $1::pg_catalog.int8 != 0 then
             return true;
@@ -8136,7 +8136,7 @@ AS
 $$
 BEGIN
     if ($1 is not null) then
-        return $1 operator(pg_catalog.||) $2;
+        return $1 || $2;
     else
         if $2::pg_catalog.int8 != 0 then
             return true;
@@ -8162,7 +8162,7 @@ AS
 $$
 BEGIN
     if ($2 is not null) then
-        return $1 operator(pg_catalog.||) $2;
+        return $1 || $2;
     else
         if $1::pg_catalog.int8 != 0 then
             return true;

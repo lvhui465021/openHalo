@@ -1559,7 +1559,6 @@ insert into mys_informa_schema.base_variables values('query_alloc_block_size', '
 insert into mys_informa_schema.base_variables values('query_prealloc_size', '8192', '8192', 0, true, true, null, null, null);
 insert into mys_informa_schema.base_variables values('preload_buffer_size', '32768', '32768', 0, true, true, null, null, null);
 insert into mys_informa_schema.base_variables values('innodb_lock_wait_timeout', '50', '50', 0, true, true, null, null, null);
-
 CREATE OR REPLACE FUNCTION mysql.is_and_eq(arg1 mysql.smallint, arg2 mysql.smallint)
 returns pg_catalog.bool
 AS
@@ -8414,7 +8413,7 @@ AS
 $$
 BEGIN
     if ($1 is not null) then
-        return $1 operator(pg_catalog.||) $2;
+        return $1 || $2;
     else
         if $2::pg_catalog.int8 != 0 then
             return true;
@@ -8439,7 +8438,7 @@ AS
 $$
 BEGIN
     if ($2 is not null) then
-        return $1 operator(pg_catalog.||) $2;
+        return $1 || $2;
     else
         if $1::pg_catalog.int8 != 0 then
             return true;
@@ -9697,7 +9696,7 @@ AS
 $$
 BEGIN
     if ($1 is not null) then
-        return $1 operator(pg_catalog.||) $2;
+        return $1 || $2;
     else
         if $2::pg_catalog.int8 != 0 then
             return true;
@@ -9723,7 +9722,7 @@ AS
 $$
 BEGIN
     if ($2 is not null) then
-        return $1 operator(pg_catalog.||) $2;
+        return $1 || $2;
     else
         if $1::pg_catalog.int8 != 0 then
             return true;
