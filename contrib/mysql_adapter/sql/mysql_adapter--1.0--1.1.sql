@@ -1202,3 +1202,37 @@ insert into mys_informa_schema.base_variables values('query_alloc_block_size', '
 insert into mys_informa_schema.base_variables values('query_prealloc_size', '8192', '8192', 0, true, true, null, null, null);
 insert into mys_informa_schema.base_variables values('preload_buffer_size', '32768', '32768', 0, true, true, null, null, null);
 insert into mys_informa_schema.base_variables values('innodb_lock_wait_timeout', '50', '50', 0, true, true, null, null, null);
+
+-- -----------------------------------------------------------------------------
+-- Additional mys_informa_schema views (v1.1)
+-- -----------------------------------------------------------------------------
+
+-- View: mys_informa_schema.routines
+CREATE OR REPLACE VIEW mys_informa_schema.routines AS
+SELECT n.nspname AS routine_schema,
+       p.proname AS routine_name
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace;
+
+-- View: mys_informa_schema.views
+CREATE OR REPLACE VIEW mys_informa_schema.views AS
+SELECT n.nspname AS table_schema,
+       c.relname AS table_name
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'v';
+
+-- View: mys_informa_schema.indexs
+CREATE OR REPLACE VIEW mys_informa_schema.indexs AS
+SELECT n.nspname AS schema_name,
+       c.relname AS table_name,
+       c2.relname AS index_name,
+       i.indisunique AS is_unique,
+       i.indisprimary AS is_primary,
+       am.amname AS index_type
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+JOIN pg_catalog.pg_class c2 ON c2.oid = i.indexrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_am am ON am.oid = c2.relam
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast');

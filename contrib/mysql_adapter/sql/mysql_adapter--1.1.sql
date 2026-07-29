@@ -374,6 +374,39 @@ WHERE cl.relkind IN ('r', 'p')
   AND ns.nspname !~ '^pg_'
 ORDER BY 1, 2, 3, 4, 7;
 
+-- View: mys_informa_schema.routines
+-- Maps PostgreSQL pg_proc entries to MySQL routine metadata.
+CREATE OR REPLACE VIEW mys_informa_schema.routines AS
+SELECT n.nspname AS routine_schema,
+       p.proname AS routine_name
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace;
+
+-- View: mys_informa_schema.views
+-- Maps PostgreSQL views to MySQL view metadata.
+CREATE OR REPLACE VIEW mys_informa_schema.views AS
+SELECT n.nspname AS table_schema,
+       c.relname AS table_name
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'v';
+
+-- View: mys_informa_schema.indexs
+-- Maps PostgreSQL indexes to MySQL index metadata.
+CREATE OR REPLACE VIEW mys_informa_schema.indexs AS
+SELECT n.nspname AS schema_name,
+       c.relname AS table_name,
+       c2.relname AS index_name,
+       i.indisunique AS is_unique,
+       i.indisprimary AS is_primary,
+       am.amname AS index_type
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+JOIN pg_catalog.pg_class c2 ON c2.oid = i.indexrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_am am ON am.oid = c2.relam
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast');
+
 -- -----------------------------------------------------------------------------
 -- Grants for mys_informa_schema
 -- -----------------------------------------------------------------------------
