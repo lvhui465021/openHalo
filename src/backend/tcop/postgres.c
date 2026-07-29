@@ -1519,6 +1519,13 @@ exec_simple_query(const char *query_string, const ParserRoutine *parser_routine)
 			 * error, not one and then the other.  Also, if we're using an
 			 * implicit transaction block, we must close that out first.
 			 */
+			/*
+			 * Let protocols capture session-local state (e.g. LAST_INSERT_ID)
+			 * before the transaction ends, while lastval() is still valid.
+			 */
+			if (protocol_routine != NULL &&
+				protocol_routine->capture_session_state != NULL)
+				protocol_routine->capture_session_state(&qc);
 			if (use_implicit_block)
 				EndImplicitTransactionBlock();
 			finish_xact_command();
@@ -1530,6 +1537,9 @@ exec_simple_query(const char *query_string, const ParserRoutine *parser_routine)
 			 * If this was a transaction control statement, commit it. We will
 			 * start a new xact command for the next command.
 			 */
+			if (protocol_routine != NULL &&
+				protocol_routine->capture_session_state != NULL)
+				protocol_routine->capture_session_state(&qc);
 			finish_xact_command();
 		}
 		else

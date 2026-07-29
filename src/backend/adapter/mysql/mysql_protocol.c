@@ -85,6 +85,7 @@ static bool mysql_allow_multi_statements(void);
 static bool mysql_simple_query_statement_ends_xact(void);
 static void mysql_set_simple_query_more_results(bool more);
 static void mysql_before_simple_query_statement(Node *stmt);
+static void mysql_capture_session_state(QueryCompletion *qc);
 
 /* State for the current result within one COM_QUERY message. */
 static bool mysql_simple_query_more_results = false;
@@ -135,16 +136,6 @@ mysql_set_simple_query_more_results(bool more)
 	mysql_simple_query_more_results = more;
 }
 
-static bool
-mysql_statement_starts_autocommit_off_transaction(Node *stmt)
-{
-	if (IsA(stmt, InsertStmt) || IsA(stmt, UpdateStmt) ||
-		IsA(stmt, DeleteStmt) || IsA(stmt, MergeStmt))
-		return true;
-	if (IsA(stmt, SelectStmt))
-		return castNode(SelectStmt, stmt)->fromClause != NIL;
-	return false;
-}
 
 static void
 mysql_before_simple_query_statement(Node *stmt)
@@ -168,11 +159,65 @@ mysql_before_simple_query_statement(Node *stmt)
 		return;
 	}
 
-	/* SET itself only changes session state; the first DML/read starts it. */
-	if (!MysAutocommitEnabled() && !IsTransactionBlock() &&
-		!IsA(stmt, MysVariableSetStmt) &&
-		mysql_statement_starts_autocommit_off_transaction(stmt))
+	/* SET itself only changes session state. */
+	if (IsA(stmt, MysVariableSetStmt))
+		return;
+
+	/*
+	 * All other statements require a transaction in PostgreSQL.  When
+	 * autocommit is off, start an implicit transaction block for any
+	 * statement — DDL included.  (MySQL DDL auto-commits, but PG DDL
+	 * needs a transaction for catalog access during sequence/trigger
+	 * creation, etc.)
+	 */
+	if (!MysAutocommitEnabled() && !IsTransactionBlock())
 		BeginTransactionBlock();
+}
+
+/*
+ * Called from exec_simple_query just before finish_xact_command(), while
+ * the transaction is still active.  Capture session-local state that
+ * depends on active-transaction resources (e.g. lastval() for sequences).
+ */
+static void
+mysql_capture_session_state(QueryCompletion *qc)
+{
+	CommandTag	tag = qc->commandTag;
+
+	/* ROW_COUNT() — simple passthrough from nprocessed. */
+	mysql_packet_set_row_count(mysql_ps(), qc->nprocessed);
+
+	/*
+	 * LAST_INSERT_ID(): derive the first generated AUTO_INCREMENT value
+	 * from lastval() while the transaction is still open.
+	 */
+	if (tag == CMDTAG_INSERT && qc->nprocessed > 0)
+	{
+		Datum		last_id_datum = (Datum) 0;
+		bool		have_last_id = false;
+		uint64		last_id = 0;
+
+		PG_TRY();
+		{
+			last_id_datum = lastval(NULL);
+			have_last_id = true;
+		}
+		PG_CATCH();
+		{
+			FlushErrorState();
+		}
+		PG_END_TRY();
+
+		if (have_last_id)
+		{
+			int64 value = DatumGetInt64(last_id_datum);
+
+			if (value > 0 && (uint64) value >= qc->nprocessed)
+				last_id = (uint64) value - qc->nprocessed + 1;
+		}
+
+		mysql_packet_set_last_insert_id(mysql_ps(), last_id);
+	}
 }
 
 /* COM_SET_OPTION only controls CLIENT_MULTI_STATEMENTS on this protocol. */
@@ -695,12 +740,9 @@ mysql_process_command(int *command, StringInfo inBuf)
             mysql_packet_set_server_seq(mysql_ps(), 1);
         }
         return PROTOCOL_COMMAND_HANDLED;
-
-
     case MYSQL_PSEUDO_QUIT:
         *command = 'X';
         return PROTOCOL_COMMAND_PASSTHROUGH;
-
     case MYSQL_PSEUDO_PING:
         {
             char ok[7];
@@ -716,44 +758,34 @@ mysql_process_command(int *command, StringInfo inBuf)
             mysql_packet_set_server_seq(mysql_ps(), 1);
         }
         return PROTOCOL_COMMAND_HANDLED;
-
     case MYSQL_PSEUDO_STMT_PREPARE:
         mysql_stmt_prepare(mysql_ps(), inBuf);
         return PROTOCOL_COMMAND_HANDLED;
-
     case MYSQL_PSEUDO_STMT_CLOSE:
         mysql_stmt_close(mysql_ps(), inBuf);
         return PROTOCOL_COMMAND_HANDLED;
-
     case MYSQL_PSEUDO_STMT_RESET:
         mysql_stmt_reset(mysql_ps(), inBuf);
         return PROTOCOL_COMMAND_HANDLED;
-
     case MYSQL_PSEUDO_STMT_EXECUTE:
         mysql_stmt_execute(mysql_ps(), inBuf);
         return PROTOCOL_COMMAND_HANDLED;
-
     case MYSQL_PSEUDO_STMT_SEND_LONG_DATA:
         mysql_stmt_send_long_data(mysql_ps(), inBuf);
         return PROTOCOL_COMMAND_HANDLED;
-
     case MYSQL_PSEUDO_STMT_FETCH:
         mysql_stmt_fetch(mysql_ps(), inBuf);
         return PROTOCOL_COMMAND_HANDLED;
-
     case MYSQL_PSEUDO_SET_OPTION:
         mysql_set_option(inBuf);
         return PROTOCOL_COMMAND_HANDLED;
-
     case MYSQL_PSEUDO_FIELD_LIST:
         mysql_field_list(inBuf);
         return PROTOCOL_COMMAND_HANDLED;
-
     default:
         return PROTOCOL_COMMAND_PASSTHROUGH;
     }
 }
-
 static void
 mysql_comm_reset(void)
 {
@@ -765,27 +797,23 @@ mysql_comm_reset(void)
      * Resetting here would break the sequence for end_command's EOF/OK.
      */
 }
-
 static bool
 mysql_is_reading_msg(void)
 {
     /* MySQL clients don't have a "message in progress" state like PG. */
     return false;
 }
-
 static void
 mysql_send_backend_key_data_noop(int pid, const uint8 *key, int keylen)
 {
     /* MySQL protocol does not use PG cancel-key packets. */
 }
-
 static void
 mysql_session_initialize(Port *port)
 {
     /* Backend processes normally serve one session, but reset explicitly. */
     MysSetAutocommit(true);
 	MysInitSessionTimeZone();
-
 	/*
 	 * Align search_path with openHalo's adapter.c for MySQL connections.
 	 *
@@ -811,7 +839,6 @@ mysql_session_initialize(Port *port)
 	if (port->database_name && strlen(port->database_name) > 0)
 	{
 		char	new_search_path[1024];
-
 		snprintf(new_search_path, sizeof(new_search_path),
 				 "%s, \"$user\", public, mysql, pg_catalog",
 				 port->database_name);
@@ -820,7 +847,6 @@ mysql_session_initialize(Port *port)
 								 GUC_ACTION_SET, true, 0, false);
 	}
 }
-
 static void
 mysql_set_remote_dest_receiver_params(DestReceiver *receiver,
                                        struct PortalData *portal)
@@ -835,7 +861,6 @@ mysql_set_remote_dest_receiver_params(DestReceiver *receiver,
     (void) receiver;
     (void) portal;
 }
-
 /* ----------------------------------------------------------------
  *    DestReceiver callbacks
  * ----------------------------------------------------------------
@@ -853,20 +878,16 @@ typedef struct MysDRState
     bool         started;       /* rStartup called */
     int          ncols;         /* number of columns */
 } MysDRState;
-
 static bool
 mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
 {
     MysDRState *dr = (MysDRState *) self;
     int         ncols;
     int         i;
-
     ncols = slot->tts_tupleDescriptor->natts;
-
     if (!dr->started)
     {
         uint32 caps = mysql_negotiated_caps(dr->ps);
-
 		/*
 		 * With CLIENT_OPTIONAL_RESULTSET_METADATA, the result-set header
 		 * contains column_count followed by metadata_follows (1 for the full
@@ -896,13 +917,11 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
 				colhdr[pos++] = 1;    /* RESULTSET_METADATA_FULL */
             mysql_packet_write_ok(dr->ps, colhdr, (size_t) pos, 0x00);
         }
-
         for (i = 0; i < ncols; i++)
         {
             Form_pg_attribute attr = TupleDescAttr(slot->tts_tupleDescriptor, i);
             StringInfoData colbuf;
             initStringInfo(&colbuf);
-
             /*
              * MySQL ColumnDefinition41 packet (text protocol).
              * All string fields are length-encoded.
@@ -1165,47 +1184,13 @@ mysql_end_command(const QueryCompletion *qc,
              */
             char ok[256];
             int  pos = 0;
-            uint64 last_id = 0;
-
-            /* Track ROW_COUNT() for connection-local state. */
-            mysql_packet_set_row_count(mysql_ps(), qc->nprocessed);
-
             /*
-             * Compute LAST_INSERT_ID() for INSERT commands.  Derive the
-             * first generated AUTO_INCREMENT value from the last sequence
-             * value and row count, mirroring openHalo's adapter.c endCommand.
-             *
-             * Limitation: explicit IDs, ON DUPLICATE KEY, triggers and
-             * sequence gaps can distort this derivation.  Full fidelity
-             * requires tracking the first allocated sequence value in the
-             * AUTO_INCREMENT trigger path (P1 enhancement).
+             * LAST_INSERT_ID() and ROW_COUNT() were captured before
+             * finish_xact_command() via capture_session_state, while
+             * the transaction (and lastval()) is still valid.
              */
-            if (tag == CMDTAG_INSERT && qc->nprocessed > 0)
-            {
-                Datum       last_id_datum = (Datum) 0;
-                bool        have_last_id = false;
+            uint64 last_id = mysql_packet_get_last_insert_id(mysql_ps());
 
-                PG_TRY();
-                {
-                    last_id_datum = lastval(NULL);
-                    have_last_id = true;
-                }
-                PG_CATCH();
-                {
-                    FlushErrorState();
-                }
-                PG_END_TRY();
-
-                if (have_last_id)
-                {
-                    int64 value = DatumGetInt64(last_id_datum);
-
-                    if (value > 0 && (uint64) value >= qc->nprocessed)
-                        last_id = (uint64) value - qc->nprocessed + 1;
-                }
-            }
-
-            mysql_packet_set_last_insert_id(mysql_ps(), last_id);
 
 			ok[pos++] = 0x00;                    /* OK header */
 			pos += mysql_write_lenenc_uint64(ok + pos, qc->nprocessed);
@@ -1463,6 +1448,7 @@ static const ProtocolRoutine MySQLProtocolRoutine = {
     .simple_query_statement_ends_xact = mysql_simple_query_statement_ends_xact,
     .set_simple_query_more_results = mysql_set_simple_query_more_results,
     .before_simple_query_statement = mysql_before_simple_query_statement,
+    .capture_session_state = mysql_capture_session_state,
 
     .send_error = mysql_send_error,
     .report_parameter_status = mysql_report_parameter_status,

@@ -83,6 +83,7 @@ typedef struct ProtocolRoutine
     bool        (*simple_query_statement_ends_xact)(void);
     void        (*set_simple_query_more_results)(bool more);
     void        (*before_simple_query_statement)(struct Node *stmt);
+    void        (*capture_session_state)(QueryCompletion *qc);
 
     /* --- error / GUC hooks --- */
     void        (*send_error)(struct ErrorData *edata);
