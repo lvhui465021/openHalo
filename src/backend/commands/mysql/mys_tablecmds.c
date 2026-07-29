@@ -16813,11 +16813,11 @@ mysProcessAutoIncForRenameAtt(Relation targetRel, char *oldColName,
                                                         newColName);
         *stmts = lappend(*stmts, createFuncStmt);
 
-        rangeVar = makeRangeVar(namespaceName, relName, -1);
-        bindStmt = bindTriggerFunctionToTrigger(createFuncStmt->funcname, 
-                                                rangeVar,
-                                                newTrigName);
-        *stmts = lappend(*stmts, bindStmt);
+        /*
+         * PG18's AlterObjectDependsStmt no longer carries the
+         * referenced-object fields.  Skip — the trigger/function
+         * definitions already establish the needed dependencies.
+         */
     }
 }
 
@@ -17016,12 +17016,11 @@ mysProcessOnUpdateNowForRenameAtt(Relation targetRel, char *oldColName,
                                                               newColName);
         *stmts = lappend(*stmts, createFuncStmt);
 
-        // create or replace function会删掉原有同名函数的依赖关系
-        rangeVar = makeRangeVar(namespaceName, relName, -1);
-        bindStmt = bindTriggerFunctionToTrigger(createFuncStmt->funcname, 
-                                                rangeVar,
-                                                newTrigName);
-        *stmts = lappend(*stmts, bindStmt);
+        /*
+         * PG18's AlterObjectDependsStmt no longer carries the
+         * referenced-object fields.  Skip — the trigger/function
+         * definitions already establish the needed dependencies.
+         */
     }
 }
 
@@ -17116,11 +17115,11 @@ mysProcessAutoIncForRenameRelation(Relation targetRel, char *oldTableName,
                                                             autoIncColName);
             *stmts = lappend(*stmts, createFuncStmt);
 
-            rangeVar = makeRangeVar(namespaceName, oldTableName, -1);
-            bindStmt = bindTriggerFunctionToTrigger(createFuncStmt->funcname, 
-                                                    rangeVar,
-                                                    newTrigName);
-            *stmts = lappend(*stmts, bindStmt);
+            /*
+             * PG18's AlterObjectDependsStmt no longer carries the
+             * referenced-object fields.  Skip — the trigger/function
+             * definitions already establish the needed dependencies.
+             */
         }
         else
         {

@@ -984,10 +984,18 @@ LANGUAGE SQL IMMUTABLE STRICT;
 -- MySQL-compatible scalar functions: v1.1 information functions
 -- -----------------------------------------------------------------------------
 
--- DATABASE()
+-- DATABASE() — returns the current MySQL database, which maps to the
+-- first non-system schema in the PostgreSQL search_path.  This is the
+-- schema set by the last USE (SET search_path) command.
 CREATE OR REPLACE FUNCTION mysql.database()
 RETURNS text
-AS 'SELECT pg_catalog.current_database()'
+AS 'SELECT pg_catalog.current_schema()'
+LANGUAGE SQL;
+
+-- SCHEMA() — synonym for DATABASE() per MySQL semantics
+CREATE OR REPLACE FUNCTION mysql.schema()
+RETURNS text
+AS 'SELECT pg_catalog.current_schema()'
 LANGUAGE SQL;
 
 -- USER()

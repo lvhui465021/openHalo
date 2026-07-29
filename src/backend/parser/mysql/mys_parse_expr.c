@@ -40,6 +40,7 @@
 #include "utils/syscache.h"
 #include "utils/xml.h"
 #include "utils/guc.h"
+#include "adapter/mysql/systemVar.h"
 
 static Node *transformExprRecurse(ParseState *pstate, Node *expr);
 static Node *transformParamRef(ParseState *pstate, ParamRef *pref);
@@ -961,6 +962,32 @@ transformSysVarRef(ParseState *pstate, SysVarRef *sysVarRef)
         val = mysql_server_version;
     else if (pg_strcasecmp(sysVarRef->sysVarName, "version") == 0)
         val = mysql_server_version;
+    else if (pg_strcasecmp(sysVarRef->sysVarName, "autocommit") == 0 ||
+             pg_strcasecmp(sysVarRef->sysVarName, "session.autocommit") == 0 ||
+             pg_strcasecmp(sysVarRef->sysVarName, "local.autocommit") == 0)
+        val = MysAutocommitEnabled() ? "1" : "0";
+    else if (pg_strcasecmp(sysVarRef->sysVarName, "character_set_client") == 0 ||
+             pg_strcasecmp(sysVarRef->sysVarName, "character_set_connection") == 0 ||
+             pg_strcasecmp(sysVarRef->sysVarName, "character_set_results") == 0 ||
+             pg_strcasecmp(sysVarRef->sysVarName, "character_set_server") == 0)
+        val = "utf8mb4";
+    else if (pg_strcasecmp(sysVarRef->sysVarName, "collation_connection") == 0 ||
+             pg_strcasecmp(sysVarRef->sysVarName, "session.collation_connection") == 0)
+        val = "utf8mb4_general_ci";
+    else if (pg_strcasecmp(sysVarRef->sysVarName, "collation_server") == 0)
+        val = "utf8mb4_general_ci";
+    else if (pg_strcasecmp(sysVarRef->sysVarName, "collation_database") == 0)
+        val = "utf8mb4_general_ci";
+    else if (pg_strcasecmp(sysVarRef->sysVarName, "max_allowed_packet") == 0)
+        val = "16777216";
+    else if (pg_strcasecmp(sysVarRef->sysVarName, "sql_mode") == 0 ||
+             pg_strcasecmp(sysVarRef->sysVarName, "session.sql_mode") == 0)
+        val = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,"
+              "NO_ZERO_IN_DATE,NO_ZERO_DATE,"
+              "ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
+    else if (pg_strcasecmp(sysVarRef->sysVarName, "wait_timeout") == 0 ||
+             pg_strcasecmp(sysVarRef->sysVarName, "interactive_timeout") == 0)
+        val = "28800";
     else
         val = sysVarRef->sysVarName;
 

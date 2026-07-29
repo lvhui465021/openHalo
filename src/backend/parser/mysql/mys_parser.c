@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "mb/pg_wchar.h"
+#include "parser/parser.h"
 #include "parser/scansup.h"
 #include "parser/mysql/mys_gramparse.h"
 #include "parser/mysql/mys_parser.h"
@@ -405,6 +406,8 @@ mys_raw_parser(const char *str, RawParseMode mode)
 	core_yyscan_t yyscanner;
 	mys_yy_extra_type yyextra;
 	int			yyresult;
+	List	   *result = NIL;
+	ListCell   *lc;
 
 	/* initialize the flex scanner */
 	yyscanner = mys_scanner_init(str, &yyextra.core_yy_extra,
@@ -442,5 +445,21 @@ mys_raw_parser(const char *str, RawParseMode mode)
 	if (yyresult)				/* error */
 		return NIL;
 
-	return yyextra.parsetree;
+	/*
+	 * A few MySQL grammar actions lower directly to standard PostgreSQL SQL
+	 * text.  Reparse those replacement strings with the standard parser
+	 * before handing the raw parse list to analysis/utility dispatch.
+	 */
+	foreach(lc, yyextra.parsetree)
+	{
+		RawStmt    *rawstmt = lfirst_node(RawStmt, lc);
+
+		if (IsA(rawstmt->stmt, String))
+			result = list_concat(result,
+							 raw_parser(strVal(rawstmt->stmt), RAW_PARSE_DEFAULT));
+		else
+			result = lappend(result, rawstmt);
+	}
+
+	return result;
 }

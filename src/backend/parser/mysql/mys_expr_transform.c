@@ -137,6 +137,13 @@ mys_transform_expr_node(ParseState *pstate, Node *expr, Node **result)
 					 pg_strcasecmp(sv->sysVarName, "character_set_results") == 0 ||
 					 pg_strcasecmp(sv->sysVarName, "character_set_server") == 0)
 				val = "utf8mb4";
+			else if (pg_strcasecmp(sv->sysVarName, "collation_connection") == 0 ||
+					 pg_strcasecmp(sv->sysVarName, "session.collation_connection") == 0)
+				val = "utf8mb4_general_ci";
+			else if (pg_strcasecmp(sv->sysVarName, "collation_server") == 0)
+				val = "utf8mb4_general_ci";
+			else if (pg_strcasecmp(sv->sysVarName, "collation_database") == 0)
+				val = "utf8mb4_general_ci";
 			else if (pg_strcasecmp(sv->sysVarName, "max_allowed_packet") == 0)
 				val = "16777216";
 			else if (pg_strcasecmp(sv->sysVarName, "sql_mode") == 0 ||

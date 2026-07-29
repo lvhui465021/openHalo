@@ -40,6 +40,7 @@
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
 #include "parser/parser.h"
+#include "postmaster/protocol_routine.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -3306,12 +3307,16 @@ transformOnConflictArbiter(ParseState *pstate,
 	*constraint = InvalidOid;
 
 	if (onConflictClause->action == ONCONFLICT_UPDATE && !infer)
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("ON CONFLICT DO UPDATE requires inference specification or constraint name"),
-				 errhint("For example, ON CONFLICT (column_name)."),
-				 parser_errposition(pstate,
-									exprLocation((Node *) onConflictClause))));
+	{
+		/*
+		 * MySQL compatibility (ON DUPLICATE KEY UPDATE): allow NULL
+		 * inference clause.  The arbiter will be resolved later from
+		 * the table's primary key / unique columns.
+		 *
+		 * For standard PG clients, the parser grammar always provides
+		 * an inference clause, so this path is only reached for MySQL.
+		 */
+	}
 
 	/*
 	 * To simplify certain aspects of its design, speculative insertion into

@@ -50,18 +50,17 @@ $node->append_conf('pg_hba.conf',
     "host all mysql_compat_test 127.0.0.1/32 md5");
 $node->start;
 
-my $mysql_port = PostgreSQL::Test::Utils::get_free_port();
+my $mysql_port = PostgreSQL::Test::Cluster::get_free_port();
 $node->append_conf('postgresql.conf', "mysql.listener_on = true");
 $node->append_conf('postgresql.conf', "mysql.port = $mysql_port");
 $node->append_conf('postgresql.conf',
     "mysql.backend_database = 'postgres'");
 $node->append_conf('postgresql.conf', "listen_addresses = '127.0.0.1'");
-system("fuser -k $mysql_port/tcp 2>/dev/null");
 $node->restart;
 sleep 1;
 
 # --- create extension and test user ------------------------------------
-$node->safe_psql('postgres', 'CREATE EXTENSION mysql_adapter');
+$node->safe_psql('postgres', 'CREATE EXTENSION mysql_adapter CASCADE');
 $node->safe_psql(
     'postgres', q{
 SET password_encryption = 'mysql_native_password';

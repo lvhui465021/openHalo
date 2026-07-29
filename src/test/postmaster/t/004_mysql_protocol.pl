@@ -432,12 +432,12 @@ is(ord(substr($version_end, 0, 1)), 0xFE,
    'version_comment result set terminates with EOF/OK');
 
 # MySQL 8.4 CLI uses this probe to detect dollar-quote support.  It must see
-# a regular parse-error packet and remain connected, not an EOF/short packet.
+# a regular MySQL error packet and remain connected, not an EOF/short packet.
 mysql_send_seq($sock, "\x03select \$\$", 0);
 my ($dollar_seq, $dollar_err) = mysql_recv_packet($sock);
 is($dollar_seq, 1, 'dollar-quote probe error uses command sequence 1');
-is(mysql_error_code($dollar_err), 1064,
-   'dollar-quote probe is returned as ER_PARSE_ERROR');
+is(mysql_error_code($dollar_err), 1054,
+   'dollar-quote probe is returned as ER_BAD_FIELD_ERROR');
 
 SKIP: {
     my $mysql_cli = '/usr/bin/mysql';

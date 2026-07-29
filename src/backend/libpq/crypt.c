@@ -159,7 +159,7 @@ encrypt_password(PasswordType target_type, const char *role,
 				break;
 
 			case PASSWORD_TYPE_MYSQL_NATIVE_PASSWORD:
-				elog(ERROR, "cannot select mysql_native_password with password_encryption");
+				encrypted_password = mysql_native_password_encrypt(password);
 				break;
 
 			case PASSWORD_TYPE_PLAINTEXT:

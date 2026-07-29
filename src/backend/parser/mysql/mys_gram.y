@@ -2484,7 +2484,7 @@ VariableShowStmt:
 
                     selectStmt->fromClause = list_make1(createRangeVar("mys_informa_schema", "empty_session_variables"));
 
-                    whereClause = makeSimpleA_Expr(AEXPR_LIKE, "~~", 
+                    whereClause = makeSimpleA_Expr(AEXPR_ILIKE, "~~*", 
                                                    mys_makeColumnRef("variable_name", NIL, -1, yyscanner), 
                                                    mys_makeStringConst($4, -1), -1);
 					selectStmt->whereClause = (Node *)whereClause;
@@ -2512,7 +2512,7 @@ VariableShowStmt:
 
                     selectStmt->fromClause = list_make1(createRangeVar("mys_informa_schema", "empty_session_variables"));
 
-                    whereClause = makeSimpleA_Expr(AEXPR_LIKE, "~~", 
+                    whereClause = makeSimpleA_Expr(AEXPR_ILIKE, "~~*", 
                                                    mys_makeColumnRef("variable_name", NIL, -1, yyscanner), 
                                                    mys_makeStringConst($5, -1), -1);
 					selectStmt->whereClause = (Node *)whereClause;
@@ -2540,7 +2540,7 @@ VariableShowStmt:
 
                     selectStmt->fromClause = list_make1(createRangeVar("mys_informa_schema", "empty_session_variables"));
 
-                    whereClause = makeSimpleA_Expr(AEXPR_LIKE, "~~", 
+                    whereClause = makeSimpleA_Expr(AEXPR_ILIKE, "~~*", 
                                                    mys_makeColumnRef("variable_name", NIL, -1, yyscanner), 
                                                    mys_makeStringConst($5, -1), -1);
 					selectStmt->whereClause = (Node *)whereClause;
@@ -2568,7 +2568,7 @@ VariableShowStmt:
 
                     selectStmt->fromClause = list_make1(createRangeVar("mys_informa_schema", "empty_global_variables"));
 
-                    whereClause = makeSimpleA_Expr(AEXPR_LIKE, "~~", 
+                    whereClause = makeSimpleA_Expr(AEXPR_ILIKE, "~~*", 
                                                    mys_makeColumnRef("variable_name", NIL, -1, yyscanner), 
                                                    mys_makeStringConst($5, -1), -1);
 					selectStmt->whereClause = (Node *)whereClause;
@@ -6682,6 +6682,7 @@ ColConstraintElem:
 					n->is_no_inherit = $5;
 					n->raw_expr = $3;
 					n->cooked_expr = NULL;
+					n->is_enforced = true;
 					n->skip_validation = false;
 					n->initially_valid = true;
 					$$ = (Node *)n;
@@ -6917,6 +6918,7 @@ ConstraintElem:
 					n->location = @1;
 					n->raw_expr = $3;
 					n->cooked_expr = NULL;
+					n->is_enforced = true;
 					processCASbits($5, @5, "CHECK",
 								   NULL, NULL, &n->skip_validation,
 								   &n->is_no_inherit, yyscanner);
@@ -15496,9 +15498,16 @@ insert_column_item:
 opt_on_conflict:
             ON DUPLICATE KEY UPDATE set_clause_list
                 {
+					InferClause *infer = makeNode(InferClause);
+
+					infer->indexElems = NIL;
+					infer->whereClause = NULL;
+					infer->conname = NULL;
+					infer->location = @1;
+
                     $$ = makeNode(OnConflictClause);
                     $$->action = ONCONFLICT_UPDATE;
-					$$->infer = NULL;
+					$$->infer = infer;
 					$$->targetList = $5;
 					$$->whereClause = NULL;
 					$$->location = @1;
@@ -19057,7 +19066,11 @@ a_expr:		c_expr									{ $$ = $1; }
 
 			| a_expr LIKE a_expr
 				{
-					$$ = (Node *) makeSimpleA_Expr(AEXPR_LIKE, "~~",
+					/*
+					 * MySQL LIKE is case-insensitive by default (collation
+					 * dependent).  Map to ILIKE (~~*) for MySQL semantics.
+					 */
+					$$ = (Node *) makeSimpleA_Expr(AEXPR_ILIKE, "~~*",
 												   $1, $3, @2);
 				}
 			| a_expr LIKE a_expr ESCAPE a_expr					%prec LIKE
@@ -19066,12 +19079,12 @@ a_expr:		c_expr									{ $$ = $1; }
 											   list_make2($3, $5),
 											   COERCE_EXPLICIT_CALL,
 											   @2);
-					$$ = (Node *) makeSimpleA_Expr(AEXPR_LIKE, "~~",
+					$$ = (Node *) makeSimpleA_Expr(AEXPR_ILIKE, "~~*",
 												   $1, (Node *) n, @2);
 				}
 			| a_expr NOT_LA LIKE a_expr							%prec NOT_LA
 				{
-					$$ = (Node *) makeSimpleA_Expr(AEXPR_LIKE, "!~~",
+					$$ = (Node *) makeSimpleA_Expr(AEXPR_ILIKE, "!~~*",
 												   $1, $4, @2);
 				}
 			| a_expr NOT_LA LIKE a_expr ESCAPE a_expr			%prec NOT_LA
@@ -19080,7 +19093,7 @@ a_expr:		c_expr									{ $$ = $1; }
 											   list_make2($4, $6),
 											   COERCE_EXPLICIT_CALL,
 											   @2);
-					$$ = (Node *) makeSimpleA_Expr(AEXPR_LIKE, "!~~",
+					$$ = (Node *) makeSimpleA_Expr(AEXPR_ILIKE, "!~~*",
 												   $1, (Node *) n, @2);
 				}
 			| a_expr ILIKE a_expr

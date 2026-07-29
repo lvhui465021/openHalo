@@ -685,8 +685,6 @@ mys_expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
                     AlterTableCmd *setDefault;
                     CreateFunctionStmt *createFuncStmt;
                     CreateTrigStmt *createTrigStmt;
-                    AlterObjectDependsStmt *alterDependStmt1;
-                    AlterObjectDependsStmt *alterDependStmt2;
 
                     Oid origSeqID;
                     char *origSeqName;
@@ -731,16 +729,12 @@ mys_expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
                     createTrigStmt = createAutoIncrementTrigger(namespaceName, relName);
                     result = lappend(result, createTrigStmt);
 
-                    alterDependStmt1 = bindTriggerFunctionToTrigger(createTrigStmt->funcname, 
-                                                                    createTrigStmt->relation, 
-                                                                    createTrigStmt->trigname);
-                    result = lappend(result, alterDependStmt1);
-
-                    alterDependStmt2 = bindTriggerToSeq(createTrigStmt->relation, 
-                                                        createTrigStmt->trigname, 
-                                                        namespaceName, 
-                                                        seqName);
-                    result = lappend(result, alterDependStmt2);
+                    /*
+                     * PG18's AlterObjectDependsStmt no longer carries the
+                     * referenced-object fields.  Skip -- the sequence OWNED
+                     * BY and trigger/function definitions already establish
+                     * the needed dependencies.
+                     */
                 }   // else of if (origSeqID == InvalidOid)
             }   // if (attribute->atthasdef || attribute->attgenerated)
         }   // create table tab_gen(id1 int, id2 int, id3 int generated always as (id1 + id2));
@@ -772,8 +766,6 @@ mys_expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
         {
             CreateFunctionStmt *createFuncStmt;
             CreateTrigStmt *createTrigStmt;
-            AlterObjectDependsStmt *alterDependStmt1;
-            AlterObjectDependsStmt *alterDependStmt2;
             char *relName;
             char *colName;
 
@@ -790,15 +782,12 @@ mys_expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
                                                               colName);
             result = lappend(result, createTrigStmt);
 
-            alterDependStmt1 = bindTriggerFunctionToTrigger(createTrigStmt->funcname, 
-                                                            createTrigStmt->relation, 
-                                                            createTrigStmt->trigname);
-            result = lappend(result, alterDependStmt1);
-
-            alterDependStmt2 = bindTriggerToColumn(createTrigStmt->relation, 
-                                                   createTrigStmt->trigname, 
-                                                   colName);
-            result = lappend(result, alterDependStmt2);
+            /*
+             * PG18's AlterObjectDependsStmt no longer carries the
+             * referenced-object fields.  Skip these nodes for ON UPDATE
+             * triggers as well — the trigger/function definitions
+             * already establish the needed dependencies.
+             */
         }
         else 
         {
@@ -2035,8 +2024,6 @@ MysProcessOnUpdateNow(CreateStmtContext *cxt, ColumnDef *colDef)
 {
     CreateFunctionStmt *createFuncStmt;
     CreateTrigStmt *createTrigStmt;
-    AlterObjectDependsStmt *alterObjectDependsStmt1;
-    AlterObjectDependsStmt *alterObjectDependsStmt2;
 
     RangeVar *relation;
     Oid namespaceid;
@@ -2057,16 +2044,12 @@ MysProcessOnUpdateNow(CreateStmtContext *cxt, ColumnDef *colDef)
                                                       colDef->colname);
     cxt->alist = lappend(cxt->alist, createTrigStmt);
 
-    alterObjectDependsStmt1 = bindTriggerFunctionToTrigger(createFuncStmt->funcname, 
-                                                           createTrigStmt->relation, 
-                                                           createTrigStmt->trigname);
-    cxt->alist = lappend(cxt->alist, alterObjectDependsStmt1);
-
-    alterObjectDependsStmt2 = bindTriggerToColumn(createTrigStmt->relation, 
-                                                  createTrigStmt->trigname, 
-                                                  colDef->colname);
-
-    cxt->alist = lappend(cxt->alist, alterObjectDependsStmt2);
+    /*
+     * PG18's AlterObjectDependsStmt no longer carries the
+     * referenced-object fields that the old UDB-TX helpers populated.
+     * The trigger and function definitions already establish the needed
+     * dependencies; skip the AlterObjectDependsStmt nodes.
+     */
 }
 
 /*

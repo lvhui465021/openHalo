@@ -784,7 +784,34 @@ mysql_session_initialize(Port *port)
     /* Backend processes normally serve one session, but reset explicitly. */
     MysSetAutocommit(true);
 	MysInitSessionTimeZone();
-    (void) port;
+
+	/*
+	 * Align search_path with openHalo's adapter.c for MySQL connections.
+	 *
+	 * openHalo sets:
+	 *   search_path = "<dbname>, mysql, pg_catalog, \"$user\", public"
+	 *
+	 * where <dbname> is the PostgreSQL database the MySQL backend is
+	 * pinned to (mysql.backend_database, default "postgres").  This
+	 * ensures MySQL compatibility functions (DATABASE(), SCHEMA(),
+	 * VERSION(), etc.) are resolvable without schema qualification
+	 * while keeping the backend database as the default namespace.
+	 *
+	 * psql connections are unaffected — they use the standard PG
+	 * protocol routine which does not have a session_initialize
+	 * callback and keeps the default "$user", public.
+	 */
+	if (port->database_name && strlen(port->database_name) > 0)
+	{
+		char	new_search_path[1024];
+
+		snprintf(new_search_path, sizeof(new_search_path),
+				 "%s, mysql, pg_catalog, \"$user\", public",
+				 port->database_name);
+		(void) set_config_option("search_path", new_search_path,
+								 PGC_USERSET, PGC_S_SESSION,
+								 GUC_ACTION_SET, true, 0, false);
+	}
 }
 
 static void
@@ -971,6 +998,24 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
                 getTypeOutputInfo(typid, &typoutput, &isvarlena);
                 fmgr_info(typoutput, &finfo);
                 str = OutputFunctionCall(&finfo, d);
+
+                /*
+                 * MySQL clients expect boolean values as 1/0, not t/f.
+                 * Convert PostgreSQL boolean output to MySQL format.
+                 */
+                if (typid == BOOLOID)
+                {
+                    if (str[0] == 't')
+                    {
+                        pfree(str);
+                        str = pstrdup("1");
+                    }
+                    else
+                    {
+                        pfree(str);
+                        str = pstrdup("0");
+                    }
+                }
                 slen = (int) strlen(str);
                 /* Length-encoded string */
                 if (slen < 251)
@@ -1192,6 +1237,19 @@ mysql_send_error(ErrorData *edata)
 		(strcmp(edata->message, "invalid value for MySQL ENUM") == 0 ||
 		 strcmp(edata->message, "invalid value for MySQL SET") == 0);
 
+	/*
+	 * Suppress non-error messages (NOTICE, WARNING, INFO) on the MySQL
+	 * protocol.  The MySQL wire protocol has no concept of a server-side
+	 * notice or warning frame independent of the command-completion OK
+	 * packet.  Sending every PG NOTICE as an ERR (0xFF) packet would
+	 * break IF [NOT] EXISTS semantics — the client would see ERROR
+	 * where MySQL would return a successful OK with a warning count.
+	 *
+	 * Only ERROR, FATAL, and PANIC severities produce a real ERR packet.
+	 */
+	if (edata->elevel < ERROR)
+		return;
+
     /* Map PG error codes to MySQL-compatible codes. */
 	if (mysql_label_duplicate)
 	{
@@ -1227,6 +1285,22 @@ mysql_send_error(ErrorData *edata)
     case ERRCODE_DUPLICATE_TABLE:
         errcode = 1050;
         sqlstate = "42S01";
+        break;
+    case ERRCODE_UNIQUE_VIOLATION:
+        errcode = 1062;         /* ER_DUP_ENTRY */
+        sqlstate = "23000";
+        break;
+    case ERRCODE_NOT_NULL_VIOLATION:
+        errcode = 1048;         /* ER_BAD_NULL_ERROR */
+        sqlstate = "23000";
+        break;
+    case ERRCODE_CHECK_VIOLATION:
+        errcode = 3819;         /* ER_CHECK_CONSTRAINT_VIOLATED */
+        sqlstate = "HY000";
+        break;
+    case ERRCODE_INVALID_DATETIME_FORMAT:
+        errcode = 1292;         /* ER_TRUNCATED_WRONG_VALUE */
+        sqlstate = "22007";
         break;
     case ERRCODE_SYNTAX_ERROR:
         errcode = 1064;
