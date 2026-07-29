@@ -33,6 +33,9 @@ struct MysPacketState
     void       *auth_state;         /* MysAuthState during handshake, else NULL */
     uint32      client_capabilities; /* client capability flags from login     */
     uint64      found_rows;         /* FOUND_ROWS() session counter            */
+    bool        result_set_started;  /* true once column metadata has been sent */
+    uint64      last_insert_id;     /* LAST_INSERT_ID() session value          */
+    uint64      row_count;          /* ROW_COUNT() session value (-1 = unset)  */
 };
 
 /* ----------------------------------------------------------------
@@ -390,5 +393,50 @@ mysql_packet_get_found_rows(MysPacketState *ps)
 {
     if (ps != NULL)
         return ps->found_rows;
+    return 0;
+}
+
+void
+mysql_packet_set_result_started(MysPacketState *ps, bool started)
+{
+    if (ps != NULL)
+        ps->result_set_started = started;
+}
+
+bool
+mysql_packet_get_result_started(MysPacketState *ps)
+{
+    if (ps != NULL)
+        return ps->result_set_started;
+    return false;
+}
+
+void
+mysql_packet_set_last_insert_id(MysPacketState *ps, uint64 value)
+{
+    if (ps != NULL)
+        ps->last_insert_id = value;
+}
+
+uint64
+mysql_packet_get_last_insert_id(MysPacketState *ps)
+{
+    if (ps != NULL)
+        return ps->last_insert_id;
+    return 0;
+}
+
+void
+mysql_packet_set_row_count(MysPacketState *ps, uint64 count)
+{
+    if (ps != NULL)
+        ps->row_count = count;
+}
+
+uint64
+mysql_packet_get_row_count(MysPacketState *ps)
+{
+    if (ps != NULL)
+        return ps->row_count;
     return 0;
 }

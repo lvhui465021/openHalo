@@ -82,6 +82,16 @@ extern uint32 mysql_packet_get_client_caps(MysPacketState *ps);
 extern void mysql_packet_set_found_rows(MysPacketState *ps, uint64 count);
 extern uint64 mysql_packet_get_found_rows(MysPacketState *ps);
 
+/* Track whether a result set has been started (column metadata sent). */
+extern void mysql_packet_set_result_started(MysPacketState *ps, bool started);
+extern bool mysql_packet_get_result_started(MysPacketState *ps);
+
+/* Store / retrieve MySQL connection-local LAST_INSERT_ID() and ROW_COUNT(). */
+extern void mysql_packet_set_last_insert_id(MysPacketState *ps, uint64 value);
+extern uint64 mysql_packet_get_last_insert_id(MysPacketState *ps);
+extern void mysql_packet_set_row_count(MysPacketState *ps, uint64 count);
+extern uint64 mysql_packet_get_row_count(MysPacketState *ps);
+
 /*
  * MySQL capability flags (subset relevant to our adapter).
  * Full list: https://dev.mysql.com/doc/dev/mysql-server/latest/group__group__cs__capabilities__flags.html

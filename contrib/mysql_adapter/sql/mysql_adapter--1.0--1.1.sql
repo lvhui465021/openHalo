@@ -902,21 +902,14 @@ LANGUAGE SQL;
 -- LAST_INSERT_ID()
 CREATE OR REPLACE FUNCTION mysql.last_insert_id()
 RETURNS int8
-AS 'SELECT pg_catalog.lastval()'
+AS 'SELECT pg_catalog.mys_last_insert_id()'
 LANGUAGE SQL;
 
--- ROW_COUNT() -- PG doesn't have a simple equivalent; use GET DIAGNOSTICS
--- This provides a placeholder that returns -1 (caller should use pg_catalog.ROW_COUNT via plpgsql)
+-- ROW_COUNT() is tracked by the MySQL protocol completion path.
 CREATE OR REPLACE FUNCTION mysql.row_count()
 RETURNS int8
-AS $$
-DECLARE
-    rc int8;
-BEGIN
-    GET DIAGNOSTICS rc = ROW_COUNT;
-    RETURN rc;
-END;
-$$ LANGUAGE plpgsql;
+AS 'SELECT pg_catalog.mys_row_count()'
+LANGUAGE SQL;
 
 -- FOUND_ROWS()
 CREATE OR REPLACE FUNCTION mysql.found_rows()

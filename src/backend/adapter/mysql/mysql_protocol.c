@@ -17,6 +17,7 @@
 
 #include "access/printtup.h"
 #include "access/relation.h"
+#include "commands/sequence.h"
 #include "access/xact.h"
 #include "adapter/mysql/mysql_auth.h"
 #include "adapter/mysql/mysql_command.h"
@@ -967,6 +968,12 @@ mysDR_receiveSlot(TupleTableSlot *slot, DestReceiver *self)
         dr->started = true;
 
         /*
+         * Track that a real result set (not CTAS via DestIntoRel) has begun.
+         * mysql_end_command uses this to send EOF (for SELECT) vs OK.
+         */
+        mysql_packet_set_result_started(dr->ps, true);
+
+        /*
          * Flush column metadata before sending row data.  MySQL CLI 8.4.10
          * pipelines the dollar-quote probe (select $$) immediately after
          * receiving column metadata for @@version_comment.  Without an
@@ -1115,8 +1122,12 @@ mysql_end_command(const QueryCompletion *qc,
          * Mirror openHalo's endCommand: SELECT → EOF, DML → OK.
          * The DestReceiver (mysDR_rShutdown) does NOT send the final
          * completion packet; we own it here.
+         *
+         * PG18 ExecCreateTableAs uses CMDTAG_SELECT for CTAS, but no
+         * result set was ever started (DestIntoRel).  Check
+         * result_set_started to send OK for CTAS, not EOF.
          */
-        if (tag == CMDTAG_SELECT)
+        if (tag == CMDTAG_SELECT && mysql_packet_get_result_started(mysql_ps()))
         {
 			/* Track row count for FOUND_ROWS() */
 			mysql_packet_set_found_rows(mysql_ps(), qc->nprocessed);
@@ -1154,10 +1165,51 @@ mysql_end_command(const QueryCompletion *qc,
              */
             char ok[256];
             int  pos = 0;
+            uint64 last_id = 0;
+
+            /* Track ROW_COUNT() for connection-local state. */
+            mysql_packet_set_row_count(mysql_ps(), qc->nprocessed);
+
+            /*
+             * Compute LAST_INSERT_ID() for INSERT commands.  Derive the
+             * first generated AUTO_INCREMENT value from the last sequence
+             * value and row count, mirroring openHalo's adapter.c endCommand.
+             *
+             * Limitation: explicit IDs, ON DUPLICATE KEY, triggers and
+             * sequence gaps can distort this derivation.  Full fidelity
+             * requires tracking the first allocated sequence value in the
+             * AUTO_INCREMENT trigger path (P1 enhancement).
+             */
+            if (tag == CMDTAG_INSERT && qc->nprocessed > 0)
+            {
+                Datum       last_id_datum = (Datum) 0;
+                bool        have_last_id = false;
+
+                PG_TRY();
+                {
+                    last_id_datum = lastval(NULL);
+                    have_last_id = true;
+                }
+                PG_CATCH();
+                {
+                    FlushErrorState();
+                }
+                PG_END_TRY();
+
+                if (have_last_id)
+                {
+                    int64 value = DatumGetInt64(last_id_datum);
+
+                    if (value > 0 && (uint64) value >= qc->nprocessed)
+                        last_id = (uint64) value - qc->nprocessed + 1;
+                }
+            }
+
+            mysql_packet_set_last_insert_id(mysql_ps(), last_id);
 
 			ok[pos++] = 0x00;                    /* OK header */
 			pos += mysql_write_lenenc_uint64(ok + pos, qc->nprocessed);
-			ok[pos++] = 0x00;                    /* last insert id = 0 */
+			pos += mysql_write_lenenc_uint64(ok + pos, last_id);
 			ok[pos++] = (char) (status & 0xff);
 			ok[pos++] = (char) (status >> 8);
             ok[pos++] = 0x00; ok[pos++] = 0x00;  /* warnings: 0 */
@@ -1173,6 +1225,7 @@ mysql_end_command(const QueryCompletion *qc,
 		{
 			mysql_packet_reset_seq(mysql_ps());
 			mysql_packet_set_server_seq(mysql_ps(), 1);
+			mysql_packet_set_result_started(mysql_ps(), false);
 		}
     }
     else
@@ -1305,8 +1358,27 @@ mysql_send_error(ErrorData *edata)
         sqlstate = "HY000";
         break;
     case ERRCODE_INVALID_DATETIME_FORMAT:
+    case ERRCODE_DATETIME_VALUE_OUT_OF_RANGE:
         errcode = 1292;         /* ER_TRUNCATED_WRONG_VALUE */
         sqlstate = "22007";
+        break;
+    case ERRCODE_INVALID_REGULAR_EXPRESSION:
+        errcode = 1139;         /* ER_REGEXP_ERROR */
+        sqlstate = "42000";
+        break;
+    case ERRCODE_UNDEFINED_FUNCTION:
+        errcode = 1305;         /* ER_SP_DOES_NOT_EXIST */
+        sqlstate = "42000";
+        break;
+    case ERRCODE_DATATYPE_MISMATCH:
+    case ERRCODE_CANNOT_COERCE:
+        errcode = 1210;         /* ER_WRONG_ARGUMENTS */
+        sqlstate = "HY000";
+        break;
+    case ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE:
+    case ERRCODE_INVALID_TEXT_REPRESENTATION:
+        errcode = 1210;         /* ER_WRONG_ARGUMENTS */
+        sqlstate = "HY000";
         break;
     case ERRCODE_SYNTAX_ERROR:
         errcode = 1064;
@@ -1347,6 +1419,7 @@ mysql_send_error(ErrorData *edata)
      */
     mysql_packet_reset_seq(mysql_ps());
     mysql_packet_set_server_seq(mysql_ps(), 1);
+    mysql_packet_set_result_started(mysql_ps(), false);
 }
 
 static void
@@ -1419,4 +1492,20 @@ Datum
 mys_found_rows(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64((int64) mysql_packet_get_found_rows(mysql_ps()));
+}
+
+PG_FUNCTION_INFO_V1(mys_last_insert_id);
+
+Datum
+mys_last_insert_id(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) mysql_packet_get_last_insert_id(mysql_ps()));
+}
+
+PG_FUNCTION_INFO_V1(mys_row_count);
+
+Datum
+mys_row_count(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) mysql_packet_get_row_count(mysql_ps()));
 }
