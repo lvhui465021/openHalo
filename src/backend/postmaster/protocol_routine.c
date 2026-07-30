@@ -12,6 +12,7 @@
  */
 #include "postgres.h"
 
+#include "adapter/mysql/mysql_protocol.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"               /* MyProcPort */
 #include "postmaster/protocol_routine.h"
@@ -30,6 +31,7 @@ static const ProtocolRoutine StandardProtocolRoutine = {
 
 static const ProtocolRoutine *protocol_routines[COMPAT_PROTOCOL_KIND_MAX] = {
     [COMPAT_PROTOCOL_POSTGRES] = &StandardProtocolRoutine,
+    [COMPAT_PROTOCOL_MYSQL]    = &MySQLProtocolRoutine,
 };
 
 /*

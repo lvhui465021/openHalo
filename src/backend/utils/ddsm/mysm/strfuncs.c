@@ -842,7 +842,7 @@ convertTextVarbitToBigint(PG_FUNCTION_ARGS)
             if (9223372036854775807 < ret)
             {
                 /* 
-                 * unvdb中没有无符号整数，
+                 * openHalo中没有无符号整数，
                  * 可能导致转换后的十进制溢出
                  */
                 PG_RETURN_NULL();
@@ -874,7 +874,7 @@ convertVarbitToBigint(PG_FUNCTION_ARGS)
             if (9223372036854775807 < ret)
             {
                 /* 
-                 * unvdb中没有无符号整数，
+                 * openHalo中没有无符号整数，
                  * 可能导致转换后的十进制溢出
                  */
                 PG_RETURN_NULL();
@@ -906,7 +906,7 @@ convertVarbitToInt(PG_FUNCTION_ARGS)
             if (2147483647 < ret)
             {
                 /* 
-                 * unvdb中没有无符号整数，
+                 * openHalo中没有无符号整数，
                  * 可能导致转换后的十进制溢出
                  */
                 PG_RETURN_NULL();
@@ -938,7 +938,7 @@ convertVarbitToSmallint(PG_FUNCTION_ARGS)
             if (32767 < ret)
             {
                 /* 
-                 * unvdb中没有无符号整数，
+                 * openHalo中没有无符号整数，
                  * 可能导致转换后的十进制溢出
                  */
                 PG_RETURN_NULL();
@@ -3139,7 +3139,7 @@ PG_FUNCTION_INFO_V1(mysVersion);
 Datum
 mysVersion(PG_FUNCTION_ARGS)
 {
-    PG_RETURN_TEXT_P(cstring_to_text(unvdb_mysql_version));
+    PG_RETURN_TEXT_P(cstring_to_text(halo_mysql_version));
 }
 
 PG_FUNCTION_INFO_V1(isValidBinary);

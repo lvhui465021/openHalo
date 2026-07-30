@@ -19,6 +19,15 @@
 #include "parser/mysql/mys_parser.h"  /* mys_raw_parser              */
 #include "parser/mysql/mys_expr_transform.h"  /* mys_transform_expr_node */
 
+#include "miscadmin.h"
+#include "libpq/libpq-be.h"
+
+/* GUC variable */
+int database_compat_mode = POSTGRESQL_COMPAT_MODE;
+
+/* Parser Engine Instance */
+const ParserRoutine *parserengine = NULL;
+
 /* ----------------------------------------------------------------
  *    StandardParserRoutine  –  PG dialect
  * ----------------------------------------------------------------
@@ -55,8 +64,40 @@ GetMySQLParserRoutine(void)
     return &MySQLParserRoutine;
 }
 
+/*
+ * InitParserEngine
+ *
+ * Selects the parser engine based on database_compat_mode.
+ * When running in MYSQL_COMPAT_MODE with an active MySQL protocol,
+ * the MySQL parser engine is installed; otherwise the standard
+ * PostgreSQL parser is used.  The switch is extensible: additional
+ * compat modes (Oracle, Sybase, etc.) can add their own cases.
+ */
 void
 InitParserEngine(void)
 {
-    /* placeholder for future dynamic registration */
+	switch (database_compat_mode)
+	{
+		case POSTGRESQL_COMPAT_MODE:
+			parserengine = GetStandardParserRoutine();
+			break;
+
+		case MYSQL_COMPAT_MODE:
+
+			if ((MyProcPort != NULL) &&
+				(MyProcPort->protocol_kind == COMPAT_PROTOCOL_MYSQL))
+			{
+				parserengine = GetMySQLParserRoutine();
+			}
+			else
+			{
+				parserengine = GetStandardParserRoutine();
+			}
+
+			break;
+
+		default:
+			parserengine = GetStandardParserRoutine();
+			break;
+	}
 }

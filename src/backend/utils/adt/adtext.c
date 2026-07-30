@@ -15,6 +15,7 @@
  */
 #include "postgres.h"
 
+#include "parser/parsereng.h"
 #include "utils/adtext.h"
 #include "utils/mysql/mys_adtext.h"
 
@@ -56,39 +57,36 @@ GetStandardADTExt(void)
 /*
  * InitADTExt
  *
- * Selects the ADT extension table.  When a MySQL protocol is active,
+ * Selects the ADT extension table based on database_compat_mode.
+ * When running in MYSQL_COMPAT_MODE with an active MySQL protocol,
  * the MySQL-specific ADT functions (mys_date_in, mys_timestamp_in, etc.)
  * are installed; otherwise the standard pass-through table is used.
- *
- * TODO: The MySQL protocol selection guard will be activated once
- *       the protocol-routine / database-mode infrastructure lands
- *       (e.g. unvdb_database_mode == MYSQL_COMPAT_MODE &&
- *        nodeTag(MyProcPort->protocol_handler) == T_MySQLProtocol).
- *       For now the code defaults to StandardADTExt, which is safe
- *       (no MySQL behaviour leaks through unless explicitly enabled).
  */
 void
 InitADTExt(void)
 {
-	/*
-	 * When the protocol-mode infrastructure is ready, uncomment the
-	 * selection logic below.
-	 *
-	 * For now always use the standard ADT extension.  The MySQL ADT
-	 * files compile and are available, but won't be invoked until
-	 * the mode switch is activated.
-	 */
+	switch (database_compat_mode)
+	{
+		case POSTGRESQL_COMPAT_MODE:
+			adtext = GetStandardADTExt();
+			break;
 
-#if defined(MYSQL_PROTOCOL_ENABLED)
-	if (MyProcPort != NULL &&
-		unvdb_database_mode == MYSQL_COMPAT_MODE &&
-		nodeTag(MyProcPort->protocol_handler) == T_MySQLProtocol)
-	{
-		adtext = GetMysADTExt();
-	}
-	else
-#endif
-	{
-		adtext = GetStandardADTExt();
+		case MYSQL_COMPAT_MODE:
+
+			if ((MyProcPort != NULL) &&
+				(MyProcPort->protocol_kind == COMPAT_PROTOCOL_MYSQL))
+			{
+				adtext = GetMysADTExt();
+			}
+			else
+			{
+				adtext = GetStandardADTExt();
+			}
+
+			break;
+
+		default:
+			adtext = GetStandardADTExt();
+			break;
 	}
 }

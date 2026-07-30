@@ -63,6 +63,7 @@
 #include "optimizer/planmain.h"
 #include "parser/parse_expr.h"
 #include "parser/parser.h"
+#include "parser/parsereng.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
@@ -498,6 +499,12 @@ static const struct config_enum_entry file_extend_method_options[] = {
 	{"posix_fallocate", FILE_EXTEND_METHOD_POSIX_FALLOCATE, false},
 #endif
 	{"write_zeros", FILE_EXTEND_METHOD_WRITE_ZEROS, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry database_compat_mode_options[] = {
+	{"postgresql", POSTGRESQL_COMPAT_MODE, false},
+	{"mysql", MYSQL_COMPAT_MODE, false},
 	{NULL, 0, false}
 };
 
@@ -5495,6 +5502,17 @@ struct config_enum ConfigureNamesEnum[] =
 		&io_method,
 		DEFAULT_IO_METHOD, io_method_options,
 		NULL, assign_io_method, NULL
+	},
+
+	{
+		{"database_compat_mode", PGC_POSTMASTER, CUSTOM_OPTIONS,
+			gettext_noop("Sets the database compatibility mode."),
+			NULL,
+			GUC_SUPERUSER_ONLY
+		},
+		&database_compat_mode,
+		POSTGRESQL_COMPAT_MODE, database_compat_mode_options,
+		NULL, NULL, NULL
 	},
 
 	/* End-of-list marker */

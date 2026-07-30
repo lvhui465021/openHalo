@@ -540,7 +540,7 @@ checkTargetlistEntrySQL92(ParseState *pstate, TargetEntry *tle,
  * This function supports the old SQL92 ORDER BY interpretation, where the
  * expression is an output column name or number.  If we fail to find a
  * match of that sort, we fall through to the SQL99 rules.  For historical
- * reasons, Unvdb also allows this interpretation for GROUP BY, though
+ * reasons, openHalo also allows this interpretation for GROUP BY, though
  * the standard never did.  However, for GROUP BY we prefer a SQL99 match.
  * This function is *not* used for WINDOW definitions.
  *
@@ -569,7 +569,7 @@ mys_findTargetlistEntrySQL92(ParseState *pstate, Node *node, List **tlist,
 	 *	  targetlist entries: according to SQL92, an identifier in GROUP BY
 	 *	  is a reference to a column name exposed by FROM, not to a target
 	 *	  list column.  However, many implementations (including pre-7.0
-	 *	  UnvdbTX) accept this anyway.  So for GROUP BY, we look first
+	 *	  openHalo) accept this anyway.  So for GROUP BY, we look first
 	 *	  to see if the identifier matches any FROM column name, and only
 	 *	  try for a targetlist name if it doesn't.  This ensures that we
 	 *	  adhere to the spec in the case where the name could be both.

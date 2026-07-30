@@ -190,7 +190,7 @@ extern void core_yyset_column(int column_no, yyscan_t yyscanner);
  *
  * NOTE a fine point: if there is no newline following --, we will absorb
  * everything to the end of the input as a comment.  This is correct.  Older
- * versions of Unvdb failed to recognize -- as a comment if the input
+ * versions of openHalo failed to recognize -- as a comment if the input
  * did not end with a newline.
  *
  * XXX perhaps \f (formfeed) should be treated as a newline as well?
@@ -410,7 +410,7 @@ other			.
  * Other quoted strings must allow some special characters such as single-quote
  *  and newline.
  * Embedded single-quotes are implemented both in the SQL standard
- *  style of two adjacent single quotes "''" and in the Unvdb/Java style
+ *  style of two adjacent single quotes "''" and in the openHalo/Java style
  *  of escaped-quote "\'".
  * Other embedded escaped characters are matched explicitly and the leading
  *  backslash is dropped from the string.

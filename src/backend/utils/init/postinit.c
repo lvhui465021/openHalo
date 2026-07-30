@@ -58,6 +58,8 @@
 #include "storage/sync.h"
 #include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
+#include "parser/parsereng.h"
+#include "utils/adtext.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -1259,6 +1261,12 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	/* Initialize this backend's session state. */
 	InitializeSession();
+
+	/* Initialize Parser Engine (selects PG or MySQL parser per compat mode) */
+	InitParserEngine();
+
+	/* Initialize ADT Extension (selects PG or MySQL type hooks per compat mode) */
+	InitADTExt();
 
 	/*
 	 * If this is an interactive session, load any libraries that should be

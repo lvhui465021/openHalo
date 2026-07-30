@@ -357,7 +357,7 @@ mys_standard_ProcessUtility(PlannedStmt *pstmt,
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;
 	pstate->p_queryEnv = queryEnv;
-	pstate->p_parser_routine = GetMySQLParserRoutine();
+	pstate->p_parser_routine = parserengine;
 
 	switch (nodeTag(parsetree))
 	{

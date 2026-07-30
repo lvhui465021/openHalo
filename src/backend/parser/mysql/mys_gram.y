@@ -1187,7 +1187,7 @@ CallStmt:	CALL func_application
 
 /*****************************************************************************
  *
- * Create a new Unvdb DBMS role
+ * Create a new openHalo DBMS role
  *
  *****************************************************************************/
 
@@ -1348,7 +1348,7 @@ CreateOptRoleElem:
 
 /*****************************************************************************
  *
- * Create a new Unvdb DBMS user (role with implied login ability)
+ * Create a new openHalo DBMS user (role with implied login ability)
  *
  *****************************************************************************/
 
@@ -1366,7 +1366,7 @@ CreateUserStmt:
 
 /*****************************************************************************
  *
- * Alter a unvdbtx DBMS role
+ * Alter a openHalo DBMS role
  *
  *****************************************************************************/
 
@@ -1432,7 +1432,7 @@ AlterRoleSetStmt:
 
 /*****************************************************************************
  *
- * Drop a unvdbtx DBMS role
+ * Drop a openHalo DBMS role
  *
  * XXX Ideally this would have CASCADE/RESTRICT options, but a role
  * might own objects in multiple databases, and there is presently no way to
@@ -1487,7 +1487,7 @@ DropRoleStmt:
 
 /*****************************************************************************
  *
- * Create a unvdbtx group (role without login ability)
+ * Create a openHalo group (role without login ability)
  *
  *****************************************************************************/
 
@@ -1505,7 +1505,7 @@ CreateGroupStmt:
 
 /*****************************************************************************
  *
- * Alter a unvdbtx group
+ * Alter a openHalo group
  *
  *****************************************************************************/
 
@@ -2173,7 +2173,7 @@ on_a_expr:
                 { 
                     if (IsA($1, SetToDefault))
                     {
-                        $$ = mys_makeStringConst("unvdb_mysql_system_var_default", @1);
+                        $$ = mys_makeStringConst("halo_mysql_system_var_default", @1);
                     }
                     else 
                     {
@@ -2335,7 +2335,7 @@ set_rest_more:	/* Generic SET syntaxes: */
 					n->args = list_make1(mys_makeStringConst($3 == XMLOPTION_DOCUMENT ? "DOCUMENT" : "CONTENT", @3));
 					$$ = n;
 				}
-			/* Special syntaxes invented by UnvdbTX: */
+			/* Special syntaxes invented by openHalo: */
 			| TRANSACTION SNAPSHOT Sconst
 				{
 					VariableSetStmt *n = makeNode(VariableSetStmt);
@@ -2758,7 +2758,7 @@ VariableShowStmt:
 			    {
                     ereport(ERROR,
                             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                             errmsg("Unvdb does not support 'show engine ** status'."),
+                             errmsg("openHalo does not support 'show engine ** status'."),
                              parser_errposition(@1)));
                 }
             | SHOW PLUGINS
@@ -4050,7 +4050,7 @@ LockUnLockStmt:
                     target->indirection = NIL;
                     funcName = list_make2(makeString(pstrdup("mysql")),
                                           makeString(pstrdup("set_system_session_variable")));
-                    argList = list_make2(mys_makeStringConst(pstrdup("unvdb_mysql_dummy_stmt_return_ok"), -1),
+                    argList = list_make2(mys_makeStringConst(pstrdup("halo_mysql_dummy_stmt_return_ok"), -1),
                                          mys_makeStringConst(pstrdup("1"), -1));
                     funcCall = (Node *) makeFuncCall(funcName,
                                                      argList,
@@ -4080,7 +4080,7 @@ LockUnLockStmt:
                     target->indirection = NIL;
                     funcName = list_make2(makeString(pstrdup("mysql")),
                                           makeString(pstrdup("set_system_session_variable")));
-                    argList = list_make2(mys_makeStringConst(pstrdup("unvdb_mysql_dummy_stmt_return_ok"), -1),
+                    argList = list_make2(mys_makeStringConst(pstrdup("halo_mysql_dummy_stmt_return_ok"), -1),
                                          mys_makeStringConst(pstrdup("0"), -1));
                     funcCall = (Node *) makeFuncCall(funcName,
                                                      argList,
@@ -6672,7 +6672,7 @@ storage_media:
         | MEMORY
     ;
 
-/* DEFAULT NULL is already the default for Unvdb.
+/* DEFAULT NULL is already the default for openHalo.
  * But define it here and carry it forward into the system
  * to make it explicit.
  * - thomas 1998-09-13
@@ -7023,8 +7023,8 @@ ConstraintElem:
 					Constraint *n = makeNode(Constraint);
 					n->contype = CONSTR_PRIMARY;
 					n->location = @1;
-                    // Mysql 主键名只能是"primary"，使用这种方法实现的话，Unvdb将会存在问题，
-                    // Unvdb约束与相关索引的名字相同，但索引的名字在同一个schema下唯一
+                    // Mysql 主键名只能是"primary"，使用这种方法实现的话，openHalo将会存在问题，
+                    // openHalo约束与相关索引的名字相同，但索引的名字在同一个schema下唯一
                     // n->conname = pstrdup("primary");
                     n->conname = $3;
                     //n->access_method = $4 != NULL ? $4 : $8;
@@ -13851,7 +13851,7 @@ transaction_mode_item:
 									   mys_makeIntConst(false, @1), @1); }
 		;
 
-/* Syntax with commas is SQL-spec, without commas is Unvdb historical */
+/* Syntax with commas is SQL-spec, without commas is openHalo historical */
 transaction_mode_list:
 			transaction_mode_item
 					{ $$ = list_make1($1); }
@@ -17819,7 +17819,7 @@ xml_namespace_el:
  *	Type syntax
  *		SQL introduces a large amount of type-specific syntax.
  *		Define individual clauses to handle these cases, and use
- *		 the generic case to handle regular type-extensible Unvdb syntax.
+ *		 the generic case to handle regular type-extensible openHalo syntax.
  *		- thomas 1997-10-10
  *
  *****************************************************************************/
@@ -19057,7 +19057,7 @@ a_expr:		c_expr									{ $$ = $1; }
                     //$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "^", $1, $3, @2);
                     //ereport(ERROR,
                     //        (errcode(ERRCODE_SYNTAX_ERROR),
-                    //         errmsg("Unvdb-MySQL does not support ^ operator"),
+                    //         errmsg("openHalo-MySQL does not support ^ operator"),
                     //         parser_errposition(@2)));
                 }
 			| a_expr XOR a_expr               %prec Op
@@ -19772,7 +19772,7 @@ b_expr:		c_expr
                   //$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "^", $1, $3, @2);
                   ereport(ERROR,
                           (errcode(ERRCODE_SYNTAX_ERROR),
-                           errmsg("Unvdb-MySQL does not support ^ operator"),
+                           errmsg("openHalo-MySQL does not support ^ operator"),
                            parser_errposition(@2)));
                 }
 			| b_expr '<' b_expr
@@ -21052,7 +21052,7 @@ MathOp:		 '+'									{ $$ = "+"; }
                                                       //$$ = "^";
                                                       ereport(ERROR,
                                                               (errcode(ERRCODE_SYNTAX_ERROR),
-                                                               errmsg("Unvdb-MySQL does not support ^ operator"),
+                                                               errmsg("openHalo-MySQL does not support ^ operator"),
                                                                parser_errposition(@1)));
                                                     }
 			| '<'									{ $$ = "<"; }
@@ -21953,7 +21953,7 @@ NonReservedWord:	IDENT							{ $$ = $1; }
 		;
 
 /* Column label --- allowed labels in "AS" clauses.
- * This presently includes *all* Unvdb keywords.
+ * This presently includes *all* openHalo keywords.
  */
 ColLabel:	IDENT									{ $$ = $1; }
 			| unreserved_keyword					{ $$ = pstrdup($1); }
@@ -21978,7 +21978,7 @@ BareColLabel:	IDENT								{ $$ = $1; }
 
 /*
  * Keyword category lists.  Generally, every keyword present in
- * the Unvdb grammar should appear in exactly one of these lists.
+ * the openHalo grammar should appear in exactly one of these lists.
  *
  * Put a new keyword into the first list that it can go into without causing
  * shift or reduce conflicts.  The earlier lists define "less reserved"
@@ -23699,7 +23699,7 @@ makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg)
  * Formerly, we did this here because the optimizer couldn't cope with
  * indexquals that looked like "var = -4" --- it wants "var = const"
  * and a unary minus operator applied to a constant didn't qualify.
- * As of Unvdb 7.0, that problem doesn't exist anymore because there
+ * As of openHalo 7.0, that problem doesn't exist anymore because there
  * is a constant-subexpression simplifier in the optimizer.  However,
  * there's still a good reason for doing this here, which is that we can
  * postpone committing to a particular internal representation for simple
@@ -24305,7 +24305,7 @@ mysqlMakeAdminNoopStmt(void)
 
 	funcname = list_make2(makeString("mysql"),
 						  makeString("set_system_session_variable"));
-	args = list_make2(mys_makeStringConst("unvdb_mysql_dummy_stmt_return_ok", -1),
+	args = list_make2(mys_makeStringConst("halo_mysql_dummy_stmt_return_ok", -1),
 					  mys_makeStringConst("1", -1));
 	target->val = (Node *) makeFuncCall(funcname, args,
 										COERCE_EXPLICIT_CALL, -1);

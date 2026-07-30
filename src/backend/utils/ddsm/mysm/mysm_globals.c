@@ -13,4 +13,4 @@ unsigned long foundRows = 0;
 unsigned long lastInsertID = 0;
 
 /* MySQL version string — mirrors mysql_server_version GUC */
-char *unvdb_mysql_version = "8.4.10-openhalo-1.0";
+char *halo_mysql_version = "8.4.10-openhalo-1.0";

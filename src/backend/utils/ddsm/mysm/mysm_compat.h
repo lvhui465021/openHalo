@@ -18,7 +18,7 @@
 #include "catalog/pg_type.h"
 
 /* openHalo custom includes → PG18 equivalents */
-/* unvdb.h → standard PG types already provided by postgres.h */
+/* openhalo.h → standard PG types already provided by postgres.h */
 /* adapter/mysql/adapter.h → session state accessors below */
 #include "adapter/mysql/mysql_packet.h"
 #include "adapter/mysql/mysql_protocol.h"
@@ -42,14 +42,14 @@
 
 /* openHalo-specific collation ID */
 #define caseInsensitiveId  DEFAULT_COLLATION_OID
-#define UNVDB_EPOCH_JDATE  UNIX_EPOCH_JDATE
+#define POSTGRES_EPOCH_JDATE  UNIX_EPOCH_JDATE
 
 /* openHalo session globals — preserved for API compatibility */
 /* These are used by rowCount/mysFoundRows/mysLastInsertId in strfuncs.c */
 extern long long affectedRows;
 extern unsigned long foundRows;
 extern unsigned long lastInsertID;
-extern char *unvdb_mysql_version;
+extern char *halo_mysql_version;
 
 /* PG14→PG18: functions moved to internal or renamed */
 /* interval_justify_hours exists in PG18 but has no public header */

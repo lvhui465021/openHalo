@@ -1247,7 +1247,7 @@ ldelete:;
 				 * current command, or by a later command in the current
 				 * transaction.  The former case is possible in a join DELETE
 				 * where multiple tuples join to the same target tuple. This
-				 * is somewhat questionable, but Unvdb has always allowed
+				 * is somewhat questionable, but openHalo has always allowed
 				 * it: we just ignore additional deletion attempts.
 				 *
 				 * The latter case arises if the tuple is modified by a
@@ -1396,7 +1396,7 @@ ldelete:;
 		 * Note: Normally one would think that we have to delete index tuples
 		 * associated with the heap tuple now...
 		 *
-		 * ... but in UNVDB, we have no need to do this because VACUUM will
+		 * ... but in openHalo, we have no need to do this because VACUUM will
 		 * take care of it later.  We can't delete index tuples immediately
 		 * anyway, since the tuple is still visible to other transactions.
 		 */
@@ -1973,7 +1973,7 @@ redo_act:
 				 * current command, or by a later command in the current
 				 * transaction.  The former case is possible in a join UPDATE
 				 * where multiple tuples join to the same target tuple. This
-				 * is pretty questionable, but Unvdb has always allowed it:
+				 * is pretty questionable, but openHalo has always allowed it:
 				 * we just execute the first update action and ignore
 				 * additional update attempts.
 				 *

@@ -104,7 +104,7 @@ mys_PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
 	 * particular, '?' is a MySQL parameter marker, so parsing it through the
 	 * standard PostgreSQL entry point loses the parameter before analysis.
 	 */
-	raw_parsetree_list = GetMySQLParserRoutine()->raw_parse(prepareStmt,
+	raw_parsetree_list = parserengine->raw_parse(prepareStmt,
 																 RAW_PARSE_DEFAULT);
 	if (list_length(raw_parsetree_list) != 1)
 		ereport(ERROR,
@@ -148,7 +148,7 @@ mys_PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
 	query = parse_analyze_varparams_with_routine(rawstmt, prepareStmt,
 																						 &argtypes, &nargs,
 																						 pstate->p_queryEnv,
-																						 GetMySQLParserRoutine());
+																						 parserengine);
     plansource->commandTag = CreateCommandTag((Node *)query);
 
 	/*

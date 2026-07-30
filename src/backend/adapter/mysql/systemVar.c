@@ -989,7 +989,7 @@ initSessionSystemVars(SystemVar *systemVars[], int systemVarsNum)
 
     hashctl.keysize = SYSTEM_VAR_NAME_MAX_LEN;
     hashctl.entrysize = sizeof(SystemVar);
-    sessionSystemVars = hash_create("Unvdb MySQL Session System Variables (914)", 
+    sessionSystemVars = hash_create("openHalo MySQL Session System Variables (914)", 
                                     SYSTEM_VAR_MAX_NUM, 
                                     &hashctl, 
                                     HASH_ELEM | HASH_STRINGS);
@@ -1397,7 +1397,7 @@ rectifySystemVarValue(const char *varName, char **varValue,
 {
     if (*varValue != NULL)
     {
-        if (strncmp(*varValue, "unvdb_mysql_system_var_default", 29) == 0)
+        if (strncmp(*varValue, "halo_mysql_system_var_default", 29) == 0)
         {
             getDefaultValue(varName, isSessionSystemVar, varValue);
             return;

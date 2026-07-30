@@ -12,6 +12,7 @@ backend_link_with += numeric_backend_lib
 
 backend_sources += files(
   'acl.c',
+  'adtext.c',
   'amutils.c',
   'array_expanded.c',
   'array_selfuncs.c',

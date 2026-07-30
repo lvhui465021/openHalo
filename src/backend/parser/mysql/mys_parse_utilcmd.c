@@ -225,340 +225,6 @@ mys_expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
 	 */
 	attmap = build_attrmap_by_name(RelationGetDescr(childrel), tupleDesc, false);
 
-    /*
-     * Process defaults, if required.
-     */
-    // if ((table_like_clause->options &
-    //      (CREATE_TABLE_LIKE_DEFAULTS | CREATE_TABLE_LIKE_GENERATED)) &&
-    //     constr != NULL)
-    // {
-    // if (table_like_clause->options && (constr != NULL))
-    // {
-    //     for (parent_attno = 1; parent_attno <= tupleDesc->natts; parent_attno++)
-    //     {
-    //         Form_pg_attribute attribute = TupleDescAttr(tupleDesc, 
-    //                                                     parent_attno - 1);
-
-    //         /*
-    //          * Ignore dropped columns in the parent.
-    //          */
-    //         if (attribute->attisdropped)
-    //             continue;
-
-    //         /*
-    //          * Copy default, if present and it should be copied.  We have
-    //          * separate options for plain default expressions and GENERATED
-    //          * defaults.
-    //          */
-    //         // if (attribute->atthasdef &&
-    //         //     (attribute->attgenerated ?
-    //         //      (table_like_clause->options & CREATE_TABLE_LIKE_GENERATED) :
-    //         //      (table_like_clause->options & CREATE_TABLE_LIKE_DEFAULTS)))
-    //         if (attribute->atthasdef || attribute->attgenerated)
-    //         {
-    //             Oid origSeqID;
-    //             Oid origNamespaceID;
-    //             char *origNamespaceName;
-    //             char origSeqName[1024];
-    //             RangeVar *origSeq;
-
-    //             origNamespaceID = RelationGetNamespace(relation);
-    //             origNamespaceName = get_namespace_name(origNamespaceID);
-    //             // 这里有一个隐含的条件：
-    //             // 在修改表的名称，或者自增序列对应的字段的名称时，
-    //             // 必须同步把自增序列的名称也改过来。
-    //             snprintf(origSeqName, 1024, "%s_%s_seq", 
-    //                      RelationGetRelationName(relation), attribute->attname.data);
-    //             origSeq = makeRangeVar(origNamespaceName, origSeqName, -1);
-    //             origSeqID = RangeVarGetRelid(origSeq, NoLock, true);
-    //             if (origSeqID == InvalidOid)
-    //             {
-    //                 Node	   *this_default = NULL;
-    //                 AttrDefault *attrdef = constr->defval;
-    //                 AlterTableCmd *atsubcmd;
-    //                 bool		found_whole_row;
-
-    //                 /* Find default in constraint structure */
-    //                 for (int i = 0; i < constr->num_defval; i++)
-    //                 {
-    //                     if (attrdef[i].adnum == parent_attno)
-    //                     {
-    //                         this_default = stringToNode(attrdef[i].adbin);
-    //                         break;
-    //                     }
-    //                 }
-    //                 if (this_default == NULL)
-    //                     elog(ERROR, "default expression not found for attribute %d of relation \"%s\"",
-    //                          parent_attno, RelationGetRelationName(relation));
-
-    //                 atsubcmd = makeNode(AlterTableCmd);
-    //                 atsubcmd->subtype = AT_CookedColumnDefault;
-    //                 atsubcmd->num = attmap->attnums[parent_attno - 1];
-    //                 atsubcmd->def = map_variable_attnos(this_default,
-    //                                                     1, 
-    //                                                     0,
-    //                                                     attmap,
-    //                                                     InvalidOid,
-    //                                                     &found_whole_row);
-
-    //                 /*
-    //                  * Prevent this for the same reason as for constraints below.
-    //                  * Note that defaults cannot contain any vars, so it's OK that
-    //                  * the error message refers to generated columns.
-    //                  */
-    //                 if (found_whole_row)
-    //                     ereport(ERROR,
-    //                             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-    //                              errmsg("cannot convert whole-row table reference"),
-    //                              errdetail("Generation expression for column \"%s\" contains a whole-row reference to table \"%s\".",
-    //                                        NameStr(attribute->attname),
-    //                                        RelationGetRelationName(relation))));
-
-    //                 atsubcmds = lappend(atsubcmds, atsubcmd);
-    //             }   // if (origSeqID == InvalidOid)
-    //             else 
-    //             {
-    //                 CreateSeqStmt *createSeqStmt;
-    //                 Oid namespaceID = RelationGetNamespace(childrel);
-    //                 char *namespaceName = get_namespace_name(namespaceID);
-    //                 char *seqName = ChooseRelationName(RelationGetRelationName(childrel), 
-    //                                                    attribute->attname.data, 
-    //                                                    "seq", 
-    //                                                    namespaceID, 
-    //                                                    false);
-    //                 List *seqOptions = sequence_options(origSeqID);
-
-    //                 AlterSeqStmt *altSeqStmt;
-    //                 List *attNameList;
-
-    //                 AlterTableStmt *altTableStmt;
-    //                 AlterTableCmd *setDefault;
-    //                 FuncCall *nextvalFuncCall;
-    //                 List *nextvalFuncName;
-    //                 List *nextvalFuncArgs;
-    //                 A_Const *nextvalFuncArg;
-    //                 char nextvalFuncArgStr[1024];
-
-    //                 CreateFunctionStmt *createFuncStmt;
-    //                 int newFuncNameSize = 256;
-    //                 char newFuncName[256];
-    //                 int funcOptsSize = 1024;
-    //                 char funcOpts[1024];
-    //                 CreateTrigStmt *createTrigStmt;
-    //                 int newTrigNameSize = 256;
-    //                 char newTrigName[256];
-    //                 RangeVar *rangeVar;
-
-    //                 createSeqStmt = makeNode(CreateSeqStmt);
-    //                 createSeqStmt->sequence = makeRangeVar(namespaceName, seqName, -1);
-    //                 createSeqStmt->options = seqOptions;
-    //                 createSeqStmt->options = lcons(makeDefElem("as", 
-    //                                                            (Node *) makeTypeNameFromOid(attribute->atttypid, -1), 
-    //                                                            -1), 
-    //                                                createSeqStmt->options);
-    //                 createSeqStmt->ownerId = InvalidOid; //createSeqStmt->ownerId = RelationGetRelid(relation);
-    //                 createSeqStmt->for_identity = false; //createSeqStmt->for_identity = true;
-    //                 result = lappend(result, createSeqStmt);
-
-    //                 altSeqStmt = makeNode(AlterSeqStmt);
-    //                 altSeqStmt->sequence = makeRangeVar(namespaceName, seqName, -1); 
-    //                 attNameList = list_make3(makeString(namespaceName), 
-    //                                          makeString(RelationGetRelationName(childrel)), 
-    //                                          makeString(attribute->attname.data));
-    //                 altSeqStmt->options = list_make1(makeDefElem("owned_by", 
-    //                                                              (Node *)attNameList, 
-    //                                                              -1));
-    //                 altSeqStmt->for_identity = false;
-    //                 result = lappend(result, altSeqStmt);
-
-    //                 altTableStmt = makeNode(AlterTableStmt);
-    //                 altTableStmt->relation = makeRangeVar(namespaceName, 
-    //                                                       RelationGetRelationName(childrel), 
-    //                                                       -1);
-    //                 altTableStmt->objtype = OBJECT_TABLE;
-    //                 altTableStmt->missing_ok = false;
-    //                 setDefault = makeNode(AlterTableCmd);
-    //                 setDefault->subtype = AT_ColumnDefault;
-    //                 setDefault->name = pstrdup(attribute->attname.data);
-    //                 nextvalFuncName = list_make1(makeString("nextval"));
-    //                 snprintf(nextvalFuncArgStr, 1024, "%s.%s", namespaceName, seqName);
-    //                 nextvalFuncArg = makeNode(A_Const);
-    //                 nextvalFuncArg->val.type = T_String;
-    //                 nextvalFuncArg->val.val.str = pstrdup(nextvalFuncArgStr);
-    //                 nextvalFuncArg->location = -1;
-    //                 nextvalFuncArgs = list_make1(nextvalFuncArg);
-    //                 nextvalFuncCall = makeFuncCall(nextvalFuncName, 
-    //                                                nextvalFuncArgs, 
-    //                                                COERCE_EXPLICIT_CALL, 
-    //                                                -1);
-    //                 setDefault->def = (Node*)nextvalFuncCall;
-    //                 altTableStmt->cmds = list_make1(setDefault);
-    //                 result = lappend(result, altTableStmt);
-
-    //                 // 处理自增跳空的触发器
-    //                 createFuncStmt = makeNode(CreateFunctionStmt);
-    //                 snprintf(newFuncName, 
-    //                          newFuncNameSize, 
-    //                          "func_reset_serial_for_%s", 
-    //                          seqName);
-    //                 createFuncStmt->funcname = list_make2(makeString(pstrdup(namespaceName)), 
-    //                                                       makeString(pstrdup(newFuncName)));
-    //                 createFuncStmt->is_procedure = false;
-    //                 createFuncStmt->replace = true;
-    //                 createFuncStmt->parameters = NULL;
-    //                 createFuncStmt->returnType = makeTypeName(pstrdup("trigger"));
-    //                 createFuncStmt->sql_body = NULL;
-    //                 snprintf(funcOpts, 
-    //                          funcOptsSize, 
-    //                          "BEGIN /
-    //                              IF NEW.%s is not null THEN /
-    //                                 if (select nextval('%s.%s')) <= New.%s then /
-    //                                     PERFORM setval('%s.%s', New.%s, true); /
-    //                                 else /
-    //                                     PERFORM setval('%s.%s', (select currval('%s.%s') - 1), true); /
-    //                                 end if; /
-    //                              ELSE /
-    //                                 New.%s = (select nextval('%s.%s')); /
-    //                              END IF; /
-    //                              RETURN NEW; /
-    //                          END;", 
-    //                          NameStr(tupleDesc->attrs[parent_attno - 1].attname), 
-    //                          namespaceName, seqName, NameStr(tupleDesc->attrs[parent_attno - 1].attname),
-    //                          namespaceName, seqName, NameStr(tupleDesc->attrs[parent_attno - 1].attname), 
-    //                          namespaceName, seqName, namespaceName, seqName,
-    //                          NameStr(tupleDesc->attrs[parent_attno - 1].attname), namespaceName, seqName);
-    //                 createFuncStmt->options = lappend(createFuncStmt->options, 
-    //                                                   makeDefElem("as", 
-    //                                                               (Node *)list_make1(makeString(pstrdup(funcOpts))), 
-    //                                                               -1));
-    //                 createFuncStmt->options = lappend(createFuncStmt->options, 
-    //                                                   makeDefElem("language", 
-    //                                                               (Node *)makeString(pstrdup("plpgsql")), 
-    //                                                               -1));
-    //                 result = lappend(result, createFuncStmt);
-
-    //                 createTrigStmt = makeNode(CreateTrigStmt);
-    //                 snprintf(newTrigName, 
-    //                          newTrigNameSize, 
-    //                          "trigger_reset_serial_for_%s", 
-    //                          seqName);
-    //                 createTrigStmt->trigname = pstrdup(newTrigName);
-    //                 createTrigStmt->replace = true;
-    //                 createTrigStmt->isconstraint = false;
-    //                 rangeVar = makeRangeVar(namespaceName, RelationGetRelationName(childrel), -1);
-    //                 createTrigStmt->relation = rangeVar;
-    //                 createTrigStmt->funcname = list_make2(makeString(pstrdup(namespaceName)), 
-    //                                                       makeString(pstrdup(newFuncName)));
-    //                 createTrigStmt->args = NULL;
-    //                 createTrigStmt->row = true;
-    //                 createTrigStmt->timing = TRIGGER_TYPE_BEFORE;
-    //                 createTrigStmt->events = TRIGGER_TYPE_INSERT;
-    //                 createTrigStmt->columns = NIL;
-    //                 createTrigStmt->whenClause = NULL;
-    //                 createTrigStmt->transitionRels = NIL;
-    //                 createTrigStmt->deferrable = true;
-    //                 createTrigStmt->initdeferred = false;
-    //                 createTrigStmt->constrrel = NULL;
-    //                 result = lappend(result, createTrigStmt);
-    //             }   // else of if (origSeqID == InvalidOid)
-    //         }   // if (attribute->atthasdef || attribute->attgenerated)
-    //     }   // create table tab_gen(id1 int, id2 int, id3 int generated always as (id1 + id2));
-    // }   // if (table_like_clause->options && (constr != NULL))
-
-    
-	// MySQL的create table like 没丢掉字段的check，但是MySQL的check机制实际是无效的
-	// Unvdb的create table like没丢掉字段的check，check机制有效
-	/*
-	 * Copy CHECK constraints if requested, being careful to adjust attribute
-	 * numbers so they match the child.
-	 */
-	//if ((table_like_clause->options & CREATE_TABLE_LIKE_CONSTRAINTS) &&
-	//	constr != NULL)
-	//{
-	//	int			ccnum;
-
-	//	for (ccnum = 0; ccnum < constr->num_check; ccnum++)
-	//	{
-	//		char	   *ccname = constr->check[ccnum].ccname;
-	//		char	   *ccbin = constr->check[ccnum].ccbin;
-	//		bool		ccnoinherit = constr->check[ccnum].ccnoinherit;
-	//		Node	   *ccbin_node;
-	//		bool		found_whole_row;
-	//		Constraint *n;
-	//		AlterTableCmd *atsubcmd;
-
-	//		ccbin_node = map_variable_attnos(stringToNode(ccbin),
-	//										 1, 0,
-	//										 attmap,
-	//										 InvalidOid, &found_whole_row);
-
-	//		/*
-	//		 * We reject whole-row variables because the whole point of LIKE
-	//		 * is that the new table's rowtype might later diverge from the
-	//		 * parent's.  So, while translation might be possible right now,
-	//		 * it wouldn't be possible to guarantee it would work in future.
-	//		 */
-	//		if (found_whole_row)
-	//			ereport(ERROR,
-	//					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-	//					 errmsg("cannot convert whole-row table reference"),
-	//					 errdetail("Constraint \"%s\" contains a whole-row reference to table \"%s\".",
-	//							   ccname,
-	//							   RelationGetRelationName(relation))));
-
-	//		n = makeNode(Constraint);
-	//		n->contype = CONSTR_CHECK;
-	//		n->conname = pstrdup(ccname);
-	//		n->location = -1;
-	//		n->is_no_inherit = ccnoinherit;
-	//		n->raw_expr = NULL;
-	//		n->cooked_expr = nodeToString(ccbin_node);
-
-	//		/* We can skip validation, since the new table should be empty. */
-	//		n->skip_validation = true;
-	//		n->initially_valid = true;
-
-	//		atsubcmd = makeNode(AlterTableCmd);
-	//		atsubcmd->subtype = AT_AddConstraint;
-	//		atsubcmd->def = (Node *) n;
-	//		atsubcmds = lappend(atsubcmds, atsubcmd);
-
-	//		/* Copy comment on constraint */
-	//		if ((table_like_clause->options & CREATE_TABLE_LIKE_COMMENTS) &&
-	//			(comment = GetComment(get_relation_constraint_oid(RelationGetRelid(relation),
-	//															  n->conname, false),
-	//								  ConstraintRelationId,
-	//								  0)) != NULL)
-	//		{
-	//			CommentStmt *stmt = makeNode(CommentStmt);
-
-	//			stmt->objtype = OBJECT_TABCONSTRAINT;
-	//			stmt->object = (Node *) list_make3(makeString(heapRel->schemaname),
-	//											   makeString(heapRel->relname),
-	//											   makeString(n->conname));
-	//			stmt->comment = comment;
-
-	//			result = lappend(result, stmt);
-	//		}
-	//	}
-	//}
-    
-
-	// /*
-	//  * If we generated any ALTER TABLE actions above, wrap them into a single
-	//  * ALTER TABLE command.  Stick it at the front of the result, so it runs
-	//  * before any CommentStmts we made above.
-	//  */
-	// if (atsubcmds)
-	// {
-	//     AlterTableStmt *atcmd = makeNode(AlterTableStmt);
-
-	//     atcmd->relation = copyObject(heapRel);
-	//     atcmd->cmds = atsubcmds;
-	//     atcmd->objtype = OBJECT_TABLE;
-	//     atcmd->missing_ok = false;
-	//     result = lcons(atcmd, result);
-	// }
 
 	/*
 	 * Process indexes if required.
@@ -1458,12 +1124,12 @@ mysEnsureEnumSetProfileCollation(CreateStmtContext *cxt, const char *profile,
 		return;
 	if (strcmp(profile, MYS_LABEL_PROFILE_AI) == 0)
 	{
-		name = "unvdb_mysql_utf8mb4_ai_ci";
+		name = "halo_mysql_utf8mb4_ai_ci";
 		locale = "und-u-ks-level1";
 	}
 	else
 	{
-		name = "unvdb_mysql_utf8mb4_as_cs";
+		name = "halo_mysql_utf8mb4_as_cs";
 		locale = "und-u-ks-level3";
 	}
 
@@ -1512,11 +1178,11 @@ mysEnumSetProfileCollate(const char *namespace_name, const char *profile,
 	collate->arg = NULL;
 	collate->location = location;
 	if (strcmp(profile, MYS_LABEL_PROFILE_AI) == 0)
-		name = "unvdb_mysql_utf8mb4_ai_ci";
+		name = "halo_mysql_utf8mb4_ai_ci";
 	else if (strcmp(profile, MYS_LABEL_PROFILE_BINARY) == 0)
 		collate->collname = list_make2(makeString("pg_catalog"), makeString("C"));
 	else
-		name = "unvdb_mysql_utf8mb4_as_cs";
+		name = "halo_mysql_utf8mb4_as_cs";
 	if (strcmp(profile, MYS_LABEL_PROFILE_BINARY) != 0)
 		collate->collname = list_make2(makeString(pstrdup(namespace_name)),
 											makeString(pstrdup(name)));
@@ -2405,7 +2071,7 @@ generateEnumExtraStmts(CreateStmtContext *cxt, ColumnDef *column)
 
 	constraint = makeNode(Constraint);
 	constraint->contype = CONSTR_CHECK;
-	constraint->conname = pstrdup("unvdb_enum_check");
+	constraint->conname = pstrdup("halo_enum_check");
 	constraint->is_enforced = true;
 	constraint->skip_validation = false;
 	constraint->initially_valid = true;
@@ -3650,7 +3316,7 @@ transformIndexConstraints(CreateStmtContext *cxt)
     /*
      * 下面这几行代码，用于检查自增序列必须首先是索引或主键的前提，
      * 这个前提是MySQL内核的要求，
-     * 在Unvdb内核中，并不需要这个前提，
+     * 在openHalo内核中，并不需要这个前提，
      * 同时下面这几行代码，会导致ud_sql下建表语句中无法直接使用“id bigserial”,
      * 为了方便DBA操作，将下面几行代码注释掉
      */
@@ -4468,7 +4134,7 @@ transformModifyColumnConstraints(CreateStmtContext *cxt, char *oldColName,
     //     {
     //         if (!column->is_not_null)
     //         {
-    //             // 自增列可为null, 表现与Mysql不一样(当没有显示的插入该字段的值时，Mysql的默认值为null或用户指定的其他值，Unvdb实现的默认值为nextval)
+    //             // 自增列可为null, 表现与Mysql不一样(当没有显示的插入该字段的值时，Mysql的默认值为null或用户指定的其他值，openHalo实现的默认值为nextval)
     //             elog (ERROR, "auto_increment column must be not null");
     //         }
 
@@ -4906,9 +4572,9 @@ mysEnumSetDomainProfile(Form_pg_type domain, const ColumnDef *column,
 		return mysEnumSetProfile(cxt, column);
 
 	collation_name = get_collation_name(domain->typcollation);
-	if (strcmp(collation_name, "unvdb_mysql_utf8mb4_ai_ci") == 0)
+	if (strcmp(collation_name, "halo_mysql_utf8mb4_ai_ci") == 0)
 		return MYS_LABEL_PROFILE_AI;
-	if (strcmp(collation_name, "unvdb_mysql_utf8mb4_as_cs") == 0)
+	if (strcmp(collation_name, "halo_mysql_utf8mb4_as_cs") == 0)
 		return MYS_LABEL_PROFILE_AS_CS;
 	if (strcmp(collation_name, "C") == 0)
 		return MYS_LABEL_PROFILE_BINARY;
@@ -4987,14 +4653,14 @@ mysProcessEnum2EnumForModifyColumn(CreateStmtContext *cxt, char *oldColName,
 
 	drop_cmd = makeNode(AlterTableCmd);
 	drop_cmd->subtype = AT_DropConstraint;
-	drop_cmd->name = pstrdup("unvdb_enum_check");
+	drop_cmd->name = pstrdup("halo_enum_check");
 	drop_cmd->behavior = DROP_RESTRICT;
 	drop_cmd->missing_ok = false;
 	cxt->mys_pre_alter_cmds = lappend(cxt->mys_pre_alter_cmds, drop_cmd);
 
 	check_constraint = makeNode(Constraint);
 	check_constraint->contype = CONSTR_CHECK;
-	check_constraint->conname = pstrdup("unvdb_enum_check");
+	check_constraint->conname = pstrdup("halo_enum_check");
 	check_constraint->is_enforced = true;
 	check_constraint->skip_validation = false;
 	check_constraint->initially_valid = true;

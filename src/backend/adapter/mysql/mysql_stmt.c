@@ -164,7 +164,7 @@ mys_stmt_parser_setup(ParseState *pstate, void *arg)
 {
 	MysStmt    *stmt = (MysStmt *) arg;
 
-	pstate->p_parser_routine = GetMySQLParserRoutine();
+	pstate->p_parser_routine = parserengine;
 	setup_parse_fixed_parameters(pstate, stmt->param_types, stmt->num_params);
 }
 
@@ -1170,7 +1170,7 @@ mysql_stmt_prepare(MysPacketState *ps, StringInfo inBuf)
 				 errmsg("invalid MySQL prepared statement text")));
 
 	ProtocolStartCommand();
-	raw_list = pg_parse_query_with_routine(inBuf->data, GetMySQLParserRoutine());
+	raw_list = pg_parse_query_with_routine(inBuf->data, parserengine);
 	if (list_length(raw_list) != 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
@@ -1201,7 +1201,7 @@ mysql_stmt_prepare(MysPacketState *ps, StringInfo inBuf)
 	 */
 	query = parse_analyze_varparams_with_routine(rawstmt, inBuf->data,
 																 &param_types, &num_params, NULL,
-																 GetMySQLParserRoutine());
+																 parserengine);
 	query = mys_stmt_default_unknown_params(query, param_types, num_params);
 	query_list = QueryRewrite(query);
 	if (snapshot_set)

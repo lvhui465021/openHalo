@@ -16,6 +16,6 @@
 #include "nodes/pg_list.h"
 
 /* GUC: enable MySQL-style multi-table UPDATE.  Set false for M3 baseline. */
-extern bool unvdb_mysql_support_multiple_table_update;
+extern bool halo_mysql_support_multiple_table_update;
 
 #endif /* MYS_COMPAT_H */

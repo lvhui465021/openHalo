@@ -48,7 +48,7 @@ static Oid FuncNameAsType(List *funcname);
 /*
  *	Parse a function call
  *
- *	For historical reasons, Unvdb tries to treat the notations tab.col
+ *	For historical reasons, openHalo tries to treat the notations tab.col
  *	and col(tab) as equivalent: if a single-argument function call has an
  *	argument of complex type and the (unqualified) function name matches
  *	any attribute of the type, we can interpret it as a column projection.

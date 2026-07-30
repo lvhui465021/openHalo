@@ -7107,7 +7107,7 @@ ATExecDropPrimaryKey(Relation rel, DropBehavior behavior, bool missing_ok, LOCKM
  *
  * Mysql: 可以删除primary key, unique key, 还有一般的Index
  * 
- * Unvdb: 索引与约束是不同的对象，部分约束使用索引实现(使用索引实现的约束，两者名字相同)
+ * openHalo: 索引与约束是不同的对象，部分约束使用索引实现(使用索引实现的约束，两者名字相同)
  *      1.继承表只能继承检查约束与null/not null，此处不用处理
  *      2.分区表继承的各种属性，由依赖关系删除
  * 
@@ -16095,7 +16095,7 @@ mysBuildInternalIndexName(Oid relOid, char *oriIndexName)
 char *
 mysBuildCheckNameForSet(void)
 {
-    return pstrdup("unvdb_set_check");
+    return pstrdup("halo_set_check");
 }
 
 
@@ -16439,7 +16439,7 @@ mysGetColumnAutoIncTrig(Relation rel, Oid seqOid, char *colName)
     else
     {
         // 不应该发生
-        elog(ERROR, "Unvdb中自增字段必须有相应的触发器.");
+        elog(ERROR, "openHalo中自增字段必须有相应的触发器.");
     }
 
     return autoIncTrigOid;

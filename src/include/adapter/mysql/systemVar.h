@@ -26,7 +26,7 @@
 #define MYS_MODE_ONLY_FULL_GROUP_BY         32
 #define MYS_MODE_NO_UNSIGNED_SUBTRACTION    64
 #define MYS_MODE_NO_DIR_IN_CREATE           128
-#define MYS_MODE_UNVDBTX                 256
+#define MYS_MODE_POSTGRESQL                 256
 #define MYS_MODE_ORACLE                     512
 #define MYS_MODE_MSSQL                      1024
 #define MYS_MODE_DB2                        2048

@@ -847,6 +847,10 @@
 # VERSION AND PLATFORM COMPATIBILITY
 #------------------------------------------------------------------------------
 
+#database_compat_mode = 'postgresql'	# database compat mode, values can be:
+					# postgresql (default)
+					# mysql (MySQL compatibility mode)
+
 # - Previous PostgreSQL Versions -
 
 #array_nulls = on

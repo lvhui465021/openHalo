@@ -1425,7 +1425,7 @@ mysql_report_parameter_status(const char *name, const char *value)
  *    ProtocolRoutine instance
  * ----------------------------------------------------------------
  */
-static const ProtocolRoutine MySQLProtocolRoutine = {
+const ProtocolRoutine MySQLProtocolRoutine = {
     .kind = COMPAT_PROTOCOL_MYSQL,
     .name = "MySQL",
 

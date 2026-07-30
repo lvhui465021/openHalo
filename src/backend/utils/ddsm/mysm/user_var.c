@@ -137,7 +137,7 @@ convertDateToDouble(PG_FUNCTION_ARGS)
     char *strp;
 
     strp = parmStr;
-    j2date(dateADT + UNVDB_EPOCH_JDATE,
+    j2date(dateADT + POSTGRES_EPOCH_JDATE,
            &(tm->tm_year), &(tm->tm_mon), &(tm->tm_mday));
     strp = pg_ultostr_zeropad(strp, 
                               (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1), 
@@ -3323,7 +3323,7 @@ convertParameterToNumeric(Oid parmType, Datum parm)
         char *strp;
 
         strp = parmStr;
-        j2date(parmDate + UNVDB_EPOCH_JDATE,
+        j2date(parmDate + POSTGRES_EPOCH_JDATE,
 			   &(tm->tm_year), &(tm->tm_mon), &(tm->tm_mday));
         strp = pg_ultostr_zeropad(strp, (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1), 4);
         strp = pg_ultostr_zeropad(strp, tm->tm_mon, 2);
@@ -3612,7 +3612,7 @@ convertParameterToInt8(Oid parmType, Datum parm)
         char *strp;
 
         strp = parmStr;
-        j2date(parmDate + UNVDB_EPOCH_JDATE,
+        j2date(parmDate + POSTGRES_EPOCH_JDATE,
 			   &(tm->tm_year), &(tm->tm_mon), &(tm->tm_mday));
         strp = pg_ultostr_zeropad(strp, (tm->tm_year > 0) ? tm->tm_year : -(tm->tm_year - 1), 4);
         strp = pg_ultostr_zeropad(strp, tm->tm_mon, 2);

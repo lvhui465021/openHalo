@@ -321,6 +321,7 @@ $node->start;
 
 # Configure MySQL listener on a non-default port to avoid conflicts
 my $mysql_port = 3308;
+$node->append_conf('postgresql.conf', "database_compat_mode = 'mysql'");
 $node->append_conf('postgresql.conf', "mysql.listener_on = true");
 $node->append_conf('postgresql.conf', "mysql.port = $mysql_port");
 $node->append_conf('postgresql.conf', "mysql.backend_database = 'postgres'");
