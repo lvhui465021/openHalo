@@ -6919,6 +6919,21 @@ END
 $$
 STRICT LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION mysql.convert_bigint_to_varbit(pg_catalog.int8)
+RETURNS pg_catalog.varbit
+AS '$libdir/mysm', 'convertBigintToVarbit'
+LANGUAGE C STRICT IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION mysql.cast_bigint_to_varbit(pg_catalog.int8)
+RETURNS pg_catalog.varbit
+AS
+$$
+BEGIN
+    RETURN mysql.convert_bigint_to_varbit($1);
+END;
+$$
+LANGUAGE plpgsql STRICT;
+
 CREATE OR REPLACE FUNCTION mysql.conv(pg_catalog.int8, pg_catalog.int4, pg_catalog.int4)
 RETURNS pg_catalog.text
 AS
@@ -9077,7 +9092,7 @@ CREATE OR REPLACE FUNCTION mysql.microsecond(time)
 RETURNS integer
 AS
 $$
-    select extract(microsecond from $1)::integer
+	select pg_catalog.mod(extract(microsecond from $1)::integer, 1000000)
 $$
 IMMUTABLE STRICT LANGUAGE SQL;
 
@@ -9085,7 +9100,7 @@ CREATE OR REPLACE FUNCTION mysql.microsecond(timestamp)
 RETURNS integer
 AS
 $$
-    select extract(microsecond from $1)::integer
+	select pg_catalog.mod(extract(microsecond from $1)::integer, 1000000)
 $$
 IMMUTABLE STRICT LANGUAGE SQL;
 
@@ -9093,7 +9108,7 @@ CREATE OR REPLACE FUNCTION mysql.microsecond(text)
 RETURNS integer
 AS
 $$
-    select extract(microsecond from $1::time(6))::integer;
+	select pg_catalog.mod(extract(microsecond from $1::time(6))::integer, 1000000);
 $$
 IMMUTABLE STRICT LANGUAGE SQL;
 
@@ -9223,18 +9238,18 @@ language c strict immutable;
 
 CREATE OR REPLACE FUNCTION mysql.row_count()
 RETURNS int8
-AS '$libdir/mysm', 'rowCount'
-LANGUAGE C STRICT IMMUTABLE;
+AS 'SELECT pg_catalog.mys_row_count()'
+LANGUAGE SQL VOLATILE;
 
 CREATE OR REPLACE FUNCTION mysql.found_rows()
 RETURNS int8
-AS '$libdir/mysm', 'mysFoundRows'
-LANGUAGE C STRICT IMMUTABLE;
+AS 'SELECT pg_catalog.mys_found_rows()'
+LANGUAGE SQL VOLATILE;
 
 CREATE OR REPLACE FUNCTION mysql.last_insert_id()
 RETURNS pg_catalog.int8
-AS '$libdir/mysm', 'mysLastInsertId'
-LANGUAGE C STRICT VOLATILE;
+AS 'SELECT pg_catalog.mys_last_insert_id()'
+LANGUAGE SQL VOLATILE;
 
 CREATE OR REPLACE FUNCTION mysql.substring_index(pg_catalog.text, pg_catalog.text, pg_catalog.int4)
 RETURNS pg_catalog.text
@@ -9283,9 +9298,9 @@ DECLARE
     tmp pg_catalog.int8;
 BEGIN
     if $1 is not null then
-        tmp = $1 | ($2::pg_catalog.int8);
+        tmp = $1 | mysql.convert_text_varbit_to_bigint($2::pg_catalog.text);
     else
-        tmp = $2::pg_catalog.int8;
+        tmp = mysql.convert_text_varbit_to_bigint($2::pg_catalog.text);
     end if;
     return tmp;
 END
@@ -9316,9 +9331,9 @@ DECLARE
     tmp pg_catalog.int8;
 BEGIN
     if $1 is not null then
-        tmp = $1 & ($2::pg_catalog.int8);
+        tmp = $1 & mysql.convert_text_varbit_to_bigint($2::pg_catalog.text);
     else
-        tmp = $2::pg_catalog.int8;
+        tmp = mysql.convert_text_varbit_to_bigint($2::pg_catalog.text);
     end if;
     return tmp;
 END
@@ -9349,9 +9364,9 @@ DECLARE
     tmp pg_catalog.int8;
 BEGIN
     if $1 is not null then
-        tmp = $1 ^ ($2::pg_catalog.int8);
+        tmp = $1 # mysql.convert_text_varbit_to_bigint($2::pg_catalog.text);
     else
-        tmp = $2::pg_catalog.int8;
+        tmp = mysql.convert_text_varbit_to_bigint($2::pg_catalog.text);
     end if;
     return tmp;
 END
@@ -12995,9 +13010,9 @@ DECLARE
 tmp pg_catalog.int8;
 BEGIN
     if $1 is not null then
-        tmp = $1 | ($2::pg_catalog.int8);
+        tmp = $1 | mysql.convert_text_varbit_to_bigint($2::pg_catalog.text);
     else
-        tmp = $2::pg_catalog.int8;
+        tmp = mysql.convert_text_varbit_to_bigint($2::pg_catalog.text);
     end if;
     return tmp;
 END
@@ -13031,9 +13046,9 @@ DECLARE
 tmp pg_catalog.int8;
 BEGIN
     if $1 is not null then
-        tmp = $1 & ($2::pg_catalog.int8);
+        tmp = $1 & mysql.convert_text_varbit_to_bigint($2::pg_catalog.text);
     else
-        tmp = $2::pg_catalog.int8;
+        tmp = mysql.convert_text_varbit_to_bigint($2::pg_catalog.text);
     end if;
     return tmp;
 END
@@ -13067,9 +13082,9 @@ DECLARE
 tmp pg_catalog.int8;
 BEGIN
     if $1 is not null then
-        tmp = $1 ^ ($2::pg_catalog.int8);
+        tmp = $1 # mysql.convert_text_varbit_to_bigint($2::pg_catalog.text);
     else
-        tmp = $2::pg_catalog.int8;
+        tmp = mysql.convert_text_varbit_to_bigint($2::pg_catalog.text);
     end if;
     return tmp;
 END
@@ -16672,8 +16687,8 @@ immutable language 'plpgsql';
 DROP FUNCTION IF EXISTS mysql.last_insert_id() cascade;
 CREATE OR REPLACE FUNCTION mysql.last_insert_id()
 RETURNS pg_catalog.int8
-AS '$libdir/mysm', 'mysLastInsertId'
-LANGUAGE C STRICT VOLATILE;
+AS 'SELECT pg_catalog.mys_last_insert_id()'
+LANGUAGE SQL VOLATILE;
 
 DROP FUNCTION IF EXISTS mysql.amend_def_val_for_internal(pg_catalog.text) cascade;
 CREATE OR REPLACE FUNCTION mysql.amend_def_val_for_internal(pg_catalog.text)
@@ -16747,18 +16762,18 @@ BEGIN
             into columnIndexNum;
         if (1 <= columnIndexNum) then
             if (indexs.indisprimary = 1) then
-                ret := "PRI";
+                ret := 'PRI';
                 exit;
             else
                 if (indexs.indisunique = 1) then
                     if (1 = array_length(string_to_array(indexs.indkey::text, ' '), 1)) then
-                        ret := "UNI";
+                        ret := 'UNI';
                         exit;
                     else
-                        ret := "MUL";
+                        ret := 'MUL';
                     end if;
                 else
-                    ret := "MUL";
+                    ret := 'MUL';
                 end if;
             end if;
         end if;
@@ -16780,7 +16795,7 @@ BEGIN
     ret := '';
 
     if (($1 is not null) and (0 < position('nextval(' in $1))) then
-        ret := "auto_increment";
+        ret := 'auto_increment';
     end if;
 
     return ret;
@@ -16806,37 +16821,37 @@ DECLARE
     allArgNum int;
     argIndex int;
 BEGIN
-    ret := "CREATE PROCEDURE";
+    ret := 'CREATE PROCEDURE';
 
-    ret := ret || " ";
+    ret := ret || ' ';
     ret := ret || funcName;
 
-    ret := ret || "(";
+    ret := ret || '(';
     if (proallargtypes is not null) then
         allArgNum := array_length(proallargtypes, 1);
         argIndex := 1;
         LOOP
             if (1 < argIndex) then
-                ret := ret || ",";
+                ret := ret || ',';
             end if;
 
             if (proargmodes[argIndex] = 'i') then
-                ret := ret || " IN";
+                ret := ret || ' IN';
             else
-                ret := ret || " OUT";
+                ret := ret || ' OUT';
             end if;
 
-            ret := ret || " ";
+            ret := ret || ' ';
             ret := ret || proargnames[argIndex];
 
-            ret := ret || " ";
+            ret := ret || ' ';
             ret := ret || proallargtypes[argIndex]::regType::text;
 
             argIndex := argIndex + 1;
             EXIT WHEN argIndex > allArgNum;
         END LOOP;
     end if;
-    ret := ret || ")\n";
+    ret := ret || E')\n';
 
     ret := ret || prosrc;
 
@@ -16865,10 +16880,12 @@ $function$
     SELECT ($1::date - '2000-01-01'::date) + 730485
 $function$;
 
+CREATE SEQUENCE IF NOT EXISTS mysql.uuid_short_sequence AS bigint;
+
 CREATE OR REPLACE FUNCTION mysql.uuid_short()
 RETURNS pg_catalog.text
-AS '$libdir/mysm', 'uuidShort'
-LANGUAGE C VOLATILE;
+AS 'SELECT pg_catalog.nextval(''mysql.uuid_short_sequence'')::pg_catalog.text'
+LANGUAGE SQL VOLATILE;
 
 CREATE OR REPLACE FUNCTION mysql.isnull(pg_catalog.int2)
 returns pg_catalog.bool
@@ -17742,7 +17759,7 @@ BEGIN
     ret := '';
 
     if (($1 is not null) and (0 < position('nextval(' in $1))) then
-        ret := "auto_increment";
+        ret := 'auto_increment';
     end if;
 
     return ret;
@@ -17955,7 +17972,7 @@ returns numeric
 AS
 $$
 BEGIN
-    return mysql.`extract`($1, $2::timestamp);
+    return mysql."extract"($1, $2::timestamp);
 END
 $$
 IMMUTABLE STRICT LANGUAGE 'plpgsql';

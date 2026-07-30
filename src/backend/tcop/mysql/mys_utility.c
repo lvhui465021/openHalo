@@ -299,8 +299,10 @@ static void mys_ProcessUtilitySlow(ParseState *pstate,
 static void mys_ExecDropStmt(DropStmt *stmt, bool isTopLevel);
 static void MysExecSetVariableStmt(ParseState *pstate, MysVariableSetStmt *parsetree, ParamListInfo params, bool isTopLevel);
 static void MysExecSelectIntoStmt(ParseState *pstate, MysSelectIntoStmt *parsetree, ParamListInfo params, QueryCompletion *qc);
+static void MysValidateUseDatabase(VariableSetStmt *stmt);
 static bool MysSetAutocommitValue(Node *arg, bool *enabled);
 static bool MysApplyAutocommitAssignment(Node *assignment);
+static bool MysApplySqlModeAssignment(Node *assignment);
 static bool MysApplyTimeZoneAssignment(Node *assignment);
 static bool MysApplyGlobalTimeZoneAssignment(Node *assignment);
 static const char *MysStringAssignmentValue(Node *arg);
@@ -635,6 +637,7 @@ mys_standard_ProcessUtility(PlannedStmt *pstmt,
 			break;
 
 		case T_VariableSetStmt:
+			MysValidateUseDatabase((VariableSetStmt *) parsetree);
 			ExecSetVariableStmt((VariableSetStmt *) parsetree, isTopLevel);
 			break;
         
@@ -1923,6 +1926,89 @@ MysStringAssignmentValue(Node *arg)
 	return NULL;
 }
 
+static const char *
+MysSqlModeAssignmentValue(Node *arg)
+{
+	SysVarRef  *ref;
+	const char *name;
+	bool		is_session = true;
+	char	   *value = NULL;
+
+	if (!IsA(arg, SysVarRef))
+		return MysStringAssignmentValue(arg);
+
+	ref = castNode(SysVarRef, arg);
+	name = ref->sysVarName;
+	if (pg_strncasecmp(name, "session.", 8) == 0)
+		name += 8;
+	else if (pg_strncasecmp(name, "local.", 6) == 0)
+		name += 6;
+	else if (pg_strncasecmp(name, "global.", 7) == 0)
+	{
+		name += 7;
+		is_session = false;
+	}
+
+	if (pg_strcasecmp(name, "sql_mode") != 0)
+		return NULL;
+
+	getSystemVariableValueForSelect(pstrdup(name), is_session, &value);
+	return value;
+}
+
+static bool
+MysApplySqlModeAssignment(Node *assignment)
+{
+	SelectStmt *select_stmt;
+	ListCell   *lc;
+	bool		found = false;
+
+	if (!IsA(assignment, SelectStmt))
+		return false;
+	select_stmt = castNode(SelectStmt, assignment);
+
+	foreach(lc, select_stmt->targetList)
+	{
+		ResTarget  *target = lfirst_node(ResTarget, lc);
+		FuncCall   *call;
+		Node	   *name_arg;
+		Node	   *value_arg;
+		A_Const    *name_constant;
+		const char *name;
+		const char *value;
+
+		if (!IsA(target->val, FuncCall))
+			continue;
+		call = castNode(FuncCall, target->val);
+		if (list_length(call->funcname) != 2 || list_length(call->args) != 2 ||
+			strcmp(strVal(linitial(call->funcname)), "mysql") != 0 ||
+			strcmp(strVal(lsecond(call->funcname)),
+				   "set_system_session_variable") != 0)
+			continue;
+
+		name_arg = linitial(call->args);
+		value_arg = lsecond(call->args);
+		if (!IsA(name_arg, A_Const))
+			continue;
+		name_constant = castNode(A_Const, name_arg);
+		if (name_constant->isnull || !IsA(&name_constant->val, String))
+			continue;
+		name = strVal(&name_constant->val);
+		if (pg_strcasecmp(name, "sql_mode") != 0)
+			continue;
+
+		value = MysSqlModeAssignmentValue(value_arg);
+		if (value == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("sql_mode must be set to a string value")));
+		setSystemVariableValue(pstrdup(name), pstrdup(value), true);
+		found = true;
+	}
+
+	return found;
+}
+
 static bool
 MysApplyTimeZoneAssignment(Node *assignment)
 {
@@ -2034,6 +2120,35 @@ MysApplyGlobalTimeZoneAssignment(Node *assignment)
 }
 
 static void
+MysValidateUseDatabase(VariableSetStmt *stmt)
+{
+	A_Const    *database_arg;
+	const char *database_name;
+
+	/*
+	 * USE is lowered by the PG18 MySQL grammar to a five-element search_path:
+	 * database, $user, public, mysql, pg_catalog.  PostgreSQL deliberately
+	 * permits nonexistent schemas in search_path, while MySQL USE must reject
+	 * an unknown database immediately.
+	 */
+	if (stmt->kind != VAR_SET_VALUE ||
+		strcmp(stmt->name, "search_path") != 0 ||
+		list_length(stmt->args) != 5 ||
+		!IsA(linitial(stmt->args), A_Const))
+		return;
+
+	database_arg = castNode(A_Const, linitial(stmt->args));
+	if (database_arg->isnull || !IsA(&database_arg->val, String))
+		return;
+
+	database_name = strVal(&database_arg->val);
+	if (!OidIsValid(get_namespace_oid(database_name, true)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_SCHEMA_NAME),
+				 errmsg("Unknown database '%s'", database_name)));
+}
+
+static void
 MysExecSetVariableStmt(ParseState *pstate, MysVariableSetStmt *parsetree, ParamListInfo params, bool isTopLevel)
 {
     ListCell   *lc;
@@ -2086,6 +2201,7 @@ MysExecSetVariableStmt(ParseState *pstate, MysVariableSetStmt *parsetree, ParamL
         }
 
         (void) MysApplyAutocommitAssignment(assignment);
+		(void) MysApplySqlModeAssignment(assignment);
         (void) MysApplyTimeZoneAssignment(assignment);
 		(void) MysApplyGlobalTimeZoneAssignment(assignment);
     }

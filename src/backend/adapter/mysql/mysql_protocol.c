@@ -1326,6 +1326,10 @@ mysql_send_error(ErrorData *edata)
         errcode = 1054;
         sqlstate = "42S22";
         break;
+	case ERRCODE_INVALID_SCHEMA_NAME:
+		errcode = 1049;         /* ER_BAD_DB_ERROR */
+		sqlstate = "42000";
+		break;
     case ERRCODE_DUPLICATE_TABLE:
         errcode = 1050;
         sqlstate = "42S01";

@@ -15,6 +15,7 @@
 #include "parser/parserapi.h"         /* ParserRoutine               */
 #include "parser/parsereng.h"
 #include "parser/mysql/mys_analyze.h"
+#include "parser/mysql/mys_parse_clause.h"
 #include "parser/mysql/mys_parser.h"  /* mys_raw_parser              */
 #include "parser/mysql/mys_expr_transform.h"  /* mys_transform_expr_node */
 
@@ -37,6 +38,7 @@ static const ParserRoutine StandardParserRoutine = {
 const ParserRoutine MySQLParserRoutine = {
 	.raw_parse = mys_raw_parser,
 	.transformOptionalSelectInto = mys_transformOptionalSelectInto,
+	.transformOnConflictArbiter = mys_transformOnConflictArbiter,
     .transform_expr_node = mys_transform_expr_node,
 	.figure_colname = mys_figure_colname,
 };

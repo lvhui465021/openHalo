@@ -93,4 +93,7 @@ SELECT 'null_safe_equality' AS test_name,
 SELECT 'boolean_literals' AS test_name,
        true = 1 AND false = 0 AS passed;
 
+SELECT 'literal_like_case_insensitive' AS test_name,
+       'AbC' LIKE 'a%' AS passed;
+
 DROP DATABASE mysql_compat_dml;

@@ -92,6 +92,10 @@ DELETE FROM mysql_query_target WHERE category = 'y' ORDER BY id LIMIT 1;
 SELECT 'delete_order_limit' AS test_name,
        COUNT(*) = 1 AS passed FROM mysql_query_target WHERE category = 'y';
 
+SELECT SQL_CALC_FOUND_ROWS id
+FROM mysql_query_target ORDER BY id LIMIT 2;
+SELECT 'calc_found_rows' AS test_name, FOUND_ROWS() > 0 AS passed;
+
 SET sql_mode = '';
 SELECT 'nonstrict_empty_numeric' AS test_name, '' + 0 = 0 AS passed;
 SET sql_mode = DEFAULT;

@@ -17,6 +17,9 @@
 
 struct AttrMap;					/* avoid including attmap.h here */
 
+/* PG18 MySQL shim: first explicit schema on the active search_path. */
+extern Oid getCurrentNamespaceOid(void);
+
 extern List *mys_expandTableLikeClause(RangeVar *heapRel, 
                                        TableLikeClause *table_like_clause);
 extern List *mys_transformCreateStmt(CreateStmt *stmt, const char *queryString);
@@ -62,4 +65,3 @@ extern bool existAutoUpdateTrigOnThisAtt(Relation relation,
                                          FormData_pg_attribute *att);
 
 #endif							/* MYS_PARSE_UTILCMD_H */
-

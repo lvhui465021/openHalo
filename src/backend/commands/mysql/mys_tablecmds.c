@@ -17377,7 +17377,7 @@ mysPreProcessDropStmt(DropStmt *dropStmt)
 
             if (schemaName == NULL)
             {
-                schemaOid = get_namespace_oid("public", false);
+				schemaOid = getCurrentNamespaceOid();
             }
             else 
             {
@@ -17392,7 +17392,7 @@ mysPreProcessDropStmt(DropStmt *dropStmt)
             }
             else    
             {
-                schemaName = get_namespace_name(get_namespace_oid("public", false));
+				schemaName = get_namespace_name(getCurrentNamespaceOid());
                 names = list_make2(makeString(pstrdup(schemaName)), 
                                    makeString(pstrdup(newIndexName)));
             }

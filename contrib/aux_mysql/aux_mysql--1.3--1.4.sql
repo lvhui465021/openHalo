@@ -3706,7 +3706,7 @@ BEGIN
     FOR func IN
         select
             Name,
-            @@sql_mode::varchar(256) as sql_mode,
+            mysql.get_system_session_variable('sql_mode')::varchar(256) as sql_mode,
             Define,
             Character_set_client,
             Collation_connection,
@@ -3725,7 +3725,7 @@ BEGIN
     return;
 END;
 $$
-IMMUTABLE LANGUAGE plpgsql;
+VOLATILE LANGUAGE plpgsql;
 
 DROP FUNCTION IF EXISTS mysql.show_create_procedure(pg_catalog.text, pg_catalog.text) cascade;
 CREATE OR REPLACE FUNCTION mysql.show_create_procedure(pg_catalog.text, pg_catalog.text)
@@ -3745,7 +3745,7 @@ BEGIN
     FOR proc IN
         select
             Name,
-            @@sql_mode::varchar(256) as sql_mode,
+            mysql.get_system_session_variable('sql_mode')::varchar(256) as sql_mode,
             Define,
             Character_set_client,
             Collation_connection,
@@ -3764,7 +3764,7 @@ BEGIN
     return;
 END;
 $$
-IMMUTABLE LANGUAGE plpgsql;
+VOLATILE LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION mysql.get_proc_def(procName pg_catalog.text,
                                                 procOwner pg_catalog.text,
@@ -3782,31 +3782,31 @@ DECLARE
     argIndex pg_catalog.int4;
     argTypes pg_catalog.int4[];
 BEGIN
-    ret := "CREATE DEFINER=`";
+    ret := 'CREATE DEFINER=`';
     ret := pg_catalog.concat(ret, procOwner);
-    ret := pg_catalog.concat(ret, "`@`%` PROCEDURE `");
+    ret := pg_catalog.concat(ret, '`@`%` PROCEDURE `');
     ret := pg_catalog.concat(ret, procName);
-    ret := pg_catalog.concat(ret, "`(");
+    ret := pg_catalog.concat(ret, '`(');
     if (proallargtypes is not null) then
         allArgNum := array_length(proallargtypes, 1);
         argIndex := 1;
         LOOP
             if (1 < argIndex) then
-                ret := pg_catalog.concat(ret, ", ");
+                ret := pg_catalog.concat(ret, ', ');
             end if;
 
             if (proargmodes[argIndex] = 'i') then
-                ret := pg_catalog.concat(ret, "IN");
+                ret := pg_catalog.concat(ret, 'IN');
             elsif (proargmodes[argIndex] = 'b') then
-                ret := pg_catalog.concat(ret, "INOUT");
+                ret := pg_catalog.concat(ret, 'INOUT');
             else
-                ret := pg_catalog.concat(ret, "OUT");
+                ret := pg_catalog.concat(ret, 'OUT');
             end if;
 
-            ret := pg_catalog.concat(ret, " ");
+            ret := pg_catalog.concat(ret, ' ');
             ret := pg_catalog.concat(ret, proargnames[argIndex]);
 
-            ret := pg_catalog.concat(ret, " ");
+            ret := pg_catalog.concat(ret, ' ');
             ret := pg_catalog.concat(ret, proallargtypes[argIndex]::regType::pg_catalog.text);
 
             argIndex := argIndex + 1;
@@ -3820,15 +3820,15 @@ BEGIN
             argIndex := 1;
             LOOP
                 if (1 < argIndex) then
-                    ret := pg_catalog.concat(ret, ",");
+                    ret := pg_catalog.concat(ret, ',');
                 end if;
 
-                ret := pg_catalog.concat(ret, " IN");
+                ret := pg_catalog.concat(ret, ' IN');
 
-                ret := pg_catalog.concat(ret, " ");
+                ret := pg_catalog.concat(ret, ' ');
                 ret := pg_catalog.concat(ret, proargnames[argIndex]);
 
-                ret := pg_catalog.concat(ret, " ");
+                ret := pg_catalog.concat(ret, ' ');
                 ret := pg_catalog.concat(ret, argTypes[argIndex]::regType::pg_catalog.text);
 
                 argIndex := argIndex + 1;
@@ -3836,7 +3836,7 @@ BEGIN
             END LOOP;
         end if;
     end if;
-    ret := pg_catalog.concat(ret, ")\n");
+    ret := pg_catalog.concat(ret, E')\n');
 
     ret := pg_catalog.concat(ret, prosrc);
 
@@ -3860,35 +3860,35 @@ DECLARE
     allArgNum pg_catalog.int4;
     argIndex pg_catalog.int4;
 BEGIN
-    ret := "CREATE DEFINER=`";
+    ret := 'CREATE DEFINER=`';
     ret := pg_catalog.concat(ret, procOwner);
-    ret := pg_catalog.concat(ret, "`@`%` FUNCTION `");
+    ret := pg_catalog.concat(ret, '`@`%` FUNCTION `');
     ret := pg_catalog.concat(ret, funcName);
-    ret := pg_catalog.concat(ret, "`(");
+    ret := pg_catalog.concat(ret, '`(');
     argTypes := string_to_array(proargtypes::text, ' ');
     allArgNum := array_length(argTypes, 1);
     argIndex := 1;
     if (0 < allArgNum) then
         LOOP
             if (1 < argIndex) then
-                ret := pg_catalog.concat(ret, ", ");
+                ret := pg_catalog.concat(ret, ', ');
             end if;
 
             ret := pg_catalog.concat(ret, proargnames[argIndex]);
-            ret := pg_catalog.concat(ret, " ");
+            ret := pg_catalog.concat(ret, ' ');
             ret := pg_catalog.concat(ret, argTypes[argIndex]::regType::text);
 
             argIndex := argIndex + 1;
             EXIT WHEN argIndex > allArgNum;
         END LOOP;
     end if;
-    ret := pg_catalog.concat(ret, ")");
+    ret := pg_catalog.concat(ret, ')');
 
-    -- ret := pg_catalog.concat(ret, "\n");
-    ret := pg_catalog.concat(ret, " ");
-    ret := pg_catalog.concat(ret, "RETURNS ", prorettype::regType::text);
+    -- ret := pg_catalog.concat(ret, E'\n');
+    ret := pg_catalog.concat(ret, ' ');
+    ret := pg_catalog.concat(ret, 'RETURNS ', prorettype::regType::text);
 
-    ret := pg_catalog.concat(ret, "\n");
+    ret := pg_catalog.concat(ret, E'\n');
     ret := pg_catalog.concat(ret, prosrc);
 
     RETURN ret;
@@ -3977,7 +3977,7 @@ BEGIN
         FOREACH element IN ARRAY indkeyAttNums LOOP
             if (columnNameAttNum = element) then
                 if (indexs.indisprimary = 1) then
-                    ret := "PRI";
+                    ret := 'PRI';
                     exit;
                 else
                     if (indexs.indisunique = 1) then
@@ -3988,14 +3988,14 @@ BEGIN
                             columnIndexNum := 2;
                         end if;
                         if (1 = columnIndexNum) then
-                            ret := "UNI";
+                            ret := 'UNI';
                             exit;
                         else
-                            ret := "MUL";
+                            ret := 'MUL';
                         end if;
                     else
                         if (indexs.indkey is not null) and (indexs.indkey::text != '') then
-                            ret := "MUL";
+                            ret := 'MUL';
                         end if;
                     end if;
                 end if;
@@ -4444,7 +4444,7 @@ BEGIN
         definition_ := records.definition;
     END LOOP;
 
-    ret := pg_catalog.concat("CREATE ALGORITHM=UNDEFINED DEFINER=`", definer, "`@`%` SQL SECURITY DEFINER VIEW `", vwName, "` AS ");
+    ret := pg_catalog.concat('CREATE ALGORITHM=UNDEFINED DEFINER=`', definer, '`@`%` SQL SECURITY DEFINER VIEW `', vwName, '` AS ');
 
     definition_ = pg_catalog.replace(definition_, '+', ' ');
     definition_ = pg_catalog.replace(definition_, '\n', ' ');
@@ -4458,26 +4458,26 @@ BEGIN
             subSections := string_to_array(element, '.');
             if (array_length(subSections, 1) = 2) then
                 if (0 < columnNum) then
-                    ret := pg_catalog.concat(ret, ",");
+                    ret := pg_catalog.concat(ret, ',');
                 end if;
-                ret := pg_catalog.concat(ret, "`");
+                ret := pg_catalog.concat(ret, '`');
                 ret := pg_catalog.concat(ret, subSections[1]);
-                ret := pg_catalog.concat(ret, "`.`");
+                ret := pg_catalog.concat(ret, '`.`');
                 ret := pg_catalog.concat(ret, subSections[2]);
-                ret := pg_catalog.concat(ret, "` AS `");
+                ret := pg_catalog.concat(ret, '` AS `');
                 ret := pg_catalog.concat(ret, subSections[2]);
-                ret := pg_catalog.concat(ret, "`");
+                ret := pg_catalog.concat(ret, '`');
                 columnNum := columnNum + 1;
             else
-                if (subSections[1] = "SELECT") then
-                    ret := pg_catalog.concat(ret, "select ");
-                elsif (subSections[1] = "FROM") then
-                    ret := pg_catalog.concat(ret, " from ");
+                if (subSections[1] = 'SELECT') then
+                    ret := pg_catalog.concat(ret, 'select ');
+                elsif (subSections[1] = 'FROM') then
+                    ret := pg_catalog.concat(ret, ' from ');
                     columnNum := 0;
                 else
-                    ret := pg_catalog.concat(ret, "`");
+                    ret := pg_catalog.concat(ret, '`');
                     ret := pg_catalog.concat(ret, subSections[1]);
-                    ret := pg_catalog.concat(ret, "`");
+                    ret := pg_catalog.concat(ret, '`');
                 end if;
             end if;
         end if;
@@ -4837,7 +4837,7 @@ BEGIN
             end if;
 
             if (records.column_comment is not null) then
-                ret := pg_catalog.concat(ret, ' COMMENT \'', records.column_comment, '\'');
+                ret := pg_catalog.concat(ret, ' COMMENT ''', records.column_comment, '''');
             end if;
 
             columnIndex := columnIndex + 1;

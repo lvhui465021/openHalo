@@ -977,65 +977,87 @@ transformUserVarRef(ParseState *pstate, UserVarRef *userVarRef)
 static Node *
 transformSysVarRef(ParseState *pstate, SysVarRef *sysVarRef)
 {
-    const char *val;
-    A_Const *n;
+	const char *val;
+	A_Const    *n;
+	const char *sql_mode_name = NULL;
+	bool		is_session = true;
 
-    if (pg_strcasecmp(sysVarRef->sysVarName, "time_zone") == 0 ||
-        pg_strcasecmp(sysVarRef->sysVarName, "session.time_zone") == 0 ||
-        pg_strcasecmp(sysVarRef->sysVarName, "local.time_zone") == 0)
-    {
-        List *funcName = list_make2(makeString(pstrdup("pg_catalog")),
-                                    makeString(pstrdup("mys_get_session_time_zone")));
-        Node *funcCall = (Node *) makeFuncCall(funcName, NIL,
-                                                COERCE_EXPLICIT_CALL,
-                                                sysVarRef->location);
+	if (pg_strcasecmp(sysVarRef->sysVarName, "time_zone") == 0 ||
+		pg_strcasecmp(sysVarRef->sysVarName, "session.time_zone") == 0 ||
+		pg_strcasecmp(sysVarRef->sysVarName, "local.time_zone") == 0)
+	{
+		List	   *funcName = list_make2(makeString(pstrdup("pg_catalog")),
+									 makeString(pstrdup("mys_get_session_time_zone")));
+		Node	   *funcCall = (Node *) makeFuncCall(funcName, NIL,
+											 COERCE_EXPLICIT_CALL,
+											 sysVarRef->location);
 
         /*
          * Keep this volatile: SQL PREPARE must read the session value when
          * EXECUTE runs, not fold @@session.time_zone at prepare time.
          */
-        return transformExprRecurse(pstate, funcCall);
-    }
+		return transformExprRecurse(pstate, funcCall);
+	}
 
-    if (pg_strcasecmp(sysVarRef->sysVarName, "version_comment") == 0)
-        val = mysql_server_version;
-    else if (pg_strcasecmp(sysVarRef->sysVarName, "version") == 0)
-        val = mysql_server_version;
-    else if (pg_strcasecmp(sysVarRef->sysVarName, "autocommit") == 0 ||
-             pg_strcasecmp(sysVarRef->sysVarName, "session.autocommit") == 0 ||
-             pg_strcasecmp(sysVarRef->sysVarName, "local.autocommit") == 0)
-        val = MysAutocommitEnabled() ? "1" : "0";
-    else if (pg_strcasecmp(sysVarRef->sysVarName, "character_set_client") == 0 ||
-             pg_strcasecmp(sysVarRef->sysVarName, "character_set_connection") == 0 ||
-             pg_strcasecmp(sysVarRef->sysVarName, "character_set_results") == 0 ||
-             pg_strcasecmp(sysVarRef->sysVarName, "character_set_server") == 0)
-        val = "utf8mb4";
-    else if (pg_strcasecmp(sysVarRef->sysVarName, "collation_connection") == 0 ||
-             pg_strcasecmp(sysVarRef->sysVarName, "session.collation_connection") == 0)
-        val = "utf8mb4_general_ci";
-    else if (pg_strcasecmp(sysVarRef->sysVarName, "collation_server") == 0)
-        val = "utf8mb4_general_ci";
-    else if (pg_strcasecmp(sysVarRef->sysVarName, "collation_database") == 0)
-        val = "utf8mb4_general_ci";
-    else if (pg_strcasecmp(sysVarRef->sysVarName, "max_allowed_packet") == 0)
-        val = "16777216";
-    else if (pg_strcasecmp(sysVarRef->sysVarName, "sql_mode") == 0 ||
-             pg_strcasecmp(sysVarRef->sysVarName, "session.sql_mode") == 0)
-        val = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,"
-              "NO_ZERO_IN_DATE,NO_ZERO_DATE,"
-              "ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
-    else if (pg_strcasecmp(sysVarRef->sysVarName, "wait_timeout") == 0 ||
-             pg_strcasecmp(sysVarRef->sysVarName, "interactive_timeout") == 0)
-        val = "28800";
-    else
-        val = sysVarRef->sysVarName;
+	if (pg_strcasecmp(sysVarRef->sysVarName, "version_comment") == 0)
+		val = mysql_server_version;
+	else if (pg_strcasecmp(sysVarRef->sysVarName, "version") == 0)
+		val = mysql_server_version;
+	else if (pg_strcasecmp(sysVarRef->sysVarName, "autocommit") == 0 ||
+			 pg_strcasecmp(sysVarRef->sysVarName, "session.autocommit") == 0 ||
+			 pg_strcasecmp(sysVarRef->sysVarName, "local.autocommit") == 0)
+		val = MysAutocommitEnabled() ? "1" : "0";
+	else if (pg_strcasecmp(sysVarRef->sysVarName, "character_set_client") == 0 ||
+			 pg_strcasecmp(sysVarRef->sysVarName, "character_set_connection") == 0 ||
+			 pg_strcasecmp(sysVarRef->sysVarName, "character_set_results") == 0 ||
+			 pg_strcasecmp(sysVarRef->sysVarName, "character_set_server") == 0)
+		val = "utf8mb4";
+	else if (pg_strcasecmp(sysVarRef->sysVarName, "collation_connection") == 0 ||
+			 pg_strcasecmp(sysVarRef->sysVarName, "session.collation_connection") == 0)
+		val = "utf8mb4_general_ci";
+	else if (pg_strcasecmp(sysVarRef->sysVarName, "collation_server") == 0)
+		val = "utf8mb4_general_ci";
+	else if (pg_strcasecmp(sysVarRef->sysVarName, "collation_database") == 0)
+		val = "utf8mb4_general_ci";
+	else if (pg_strcasecmp(sysVarRef->sysVarName, "max_allowed_packet") == 0)
+		val = "16777216";
+	else if (pg_strcasecmp(sysVarRef->sysVarName, "sql_mode") == 0)
+		sql_mode_name = "sql_mode";
+	else if (pg_strcasecmp(sysVarRef->sysVarName, "session.sql_mode") == 0 ||
+			 pg_strcasecmp(sysVarRef->sysVarName, "local.sql_mode") == 0)
+		sql_mode_name = "sql_mode";
+	else if (pg_strcasecmp(sysVarRef->sysVarName, "global.sql_mode") == 0)
+	{
+		sql_mode_name = "sql_mode";
+		is_session = false;
+	}
+	else if (pg_strcasecmp(sysVarRef->sysVarName, "wait_timeout") == 0 ||
+			 pg_strcasecmp(sysVarRef->sysVarName, "interactive_timeout") == 0)
+		val = "28800";
+	else
+		val = sysVarRef->sysVarName;
 
-    n = makeNode(A_Const);
-    n->val.node.type = T_String;
-    n->val.sval = *makeString(pstrdup(val));
-    n->location = sysVarRef->location;
+	if (sql_mode_name != NULL)
+	{
+		List	   *funcName = list_make2(makeString(pstrdup("pg_catalog")),
+									 makeString(pstrdup("mys_get_system_variable")));
+		List	   *argList = list_make2(makeStringConst(pstrdup(sql_mode_name),
+												 sysVarRef->location),
+									makeStringConst(is_session ? "true" : "false",
+													sysVarRef->location));
+		Node	   *funcCall = (Node *) makeFuncCall(funcName, argList,
+											 COERCE_EXPLICIT_CALL,
+											 sysVarRef->location);
 
-    return (Node *) mys_make_const(pstate, n, n->location);
+		return transformExprRecurse(pstate, funcCall);
+	}
+
+	n = makeNode(A_Const);
+	n->val.node.type = T_String;
+	n->val.sval = *makeString(pstrdup(val));
+	n->location = sysVarRef->location;
+
+	return (Node *) mys_make_const(pstate, n, n->location);
 }
 
 

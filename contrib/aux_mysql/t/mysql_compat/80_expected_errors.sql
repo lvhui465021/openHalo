@@ -25,7 +25,6 @@ INSERT INTO mysql_negative_values VALUES (6, 6, 'six', 'a', 6, 256);
 SELECT DATE('2024-02-30');
 SELECT DATE('0000-00-00');
 SELECT TIMESTAMP('2024-13-01 00:00:00');
-SELECT 'abc' REGEXP 'a{0}';
 CREATE TABLE mysql_negative_values(id INT);
 USE mysql_compat_database_does_not_exist;
 

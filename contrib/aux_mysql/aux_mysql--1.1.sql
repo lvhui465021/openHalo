@@ -412,7 +412,15 @@ LANGUAGE SQL IMMUTABLE;
 CREATE OR REPLACE FUNCTION mysql.format(numeric, int)
 RETURNS text
 AS $$
-SELECT pg_catalog.to_char($1, repeat('9', 30) || 'FM' || CASE WHEN $2 > 0 THEN '.' || repeat('9', $2) ELSE '' END)
+SELECT pg_catalog.to_char(
+           $1,
+           pg_catalog.concat(
+               repeat('9', 30),
+               'FM',
+               CASE WHEN $2 > 0
+                    THEN pg_catalog.concat('.', repeat('9', $2))
+                    ELSE ''
+               END))
 $$
 LANGUAGE SQL IMMUTABLE STRICT;
 
@@ -700,6 +708,24 @@ AS $$SELECT string_agg(CASE WHEN ($1 & (1::int8 << (i::int))) <> 0 THEN $2 ELSE 
                             $4 ORDER BY i)
      FROM generate_series(0, GREATEST($5 - 1, 0)) AS g(i)$$
 LANGUAGE SQL IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION mysql.convert_bigint_to_varbit(pg_catalog.int8)
+RETURNS pg_catalog.varbit
+AS '$libdir/mysm', 'convertBigintToVarbit'
+LANGUAGE C STRICT IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION mysql.cast_bigint_to_varbit(pg_catalog.int8)
+RETURNS pg_catalog.varbit
+AS
+$$
+BEGIN
+    RETURN mysql.convert_bigint_to_varbit($1);
+END;
+$$
+LANGUAGE plpgsql STRICT;
+
+CREATE CAST (pg_catalog.int8 AS pg_catalog.varbit)
+WITH FUNCTION mysql.cast_bigint_to_varbit AS ASSIGNMENT;
 
 CREATE OR REPLACE FUNCTION mysql.insert(text, int, int, text)
 RETURNS text
@@ -1260,27 +1286,19 @@ LANGUAGE SQL;
 -- LAST_INSERT_ID()
 CREATE OR REPLACE FUNCTION mysql.last_insert_id()
 RETURNS int8
-AS 'SELECT pg_catalog.lastval()'
-LANGUAGE SQL;
+AS 'SELECT pg_catalog.mys_last_insert_id()'
+LANGUAGE SQL VOLATILE;
 
--- ROW_COUNT() -- PG doesn't have a simple equivalent; use GET DIAGNOSTICS
--- This provides a placeholder that returns -1 (caller should use pg_catalog.ROW_COUNT via plpgsql)
 CREATE OR REPLACE FUNCTION mysql.row_count()
 RETURNS int8
-AS $$
-DECLARE
-    rc int8;
-BEGIN
-    GET DIAGNOSTICS rc = ROW_COUNT;
-    RETURN rc;
-END;
-$$ LANGUAGE plpgsql;
+AS 'SELECT pg_catalog.mys_row_count()'
+LANGUAGE SQL VOLATILE;
 
 -- FOUND_ROWS()
 CREATE OR REPLACE FUNCTION mysql.found_rows()
 RETURNS int8
 AS 'SELECT pg_catalog.mys_found_rows()'
-LANGUAGE SQL;
+LANGUAGE SQL VOLATILE;
 -- PG16 UDB-TX DATE_FORMAT semantics, adapted to PG18's available week APIs.
 CREATE OR REPLACE FUNCTION mysql.date_format(timestamp without time zone, text)
 RETURNS text
@@ -1326,8 +1344,8 @@ BEGIN
                 WHEN n = 'v' THEN pg_catalog.lpad(mysql.week($1::date, 3)::text, 2, '0')
                 WHEN n = 'W' THEN pg_catalog.to_char($1, 'FMDay')
                 WHEN n = 'w' THEN EXTRACT(DOW FROM $1)::text
-                WHEN n = 'X' THEN pg_catalog.lpad(((_calc_mysql.week($1::date, _week_mode(2)))[2])::text, 4, '0')
-                WHEN n = 'x' THEN pg_catalog.lpad(((_calc_mysql.week($1::date, _week_mode(3)))[2])::text, 4, '0')
+                WHEN n = 'X' THEN pg_catalog.to_char(($1::date + 1), 'IYYY')
+                WHEN n = 'x' THEN pg_catalog.to_char($1::date, 'IYYY')
                 WHEN n = 'Y' THEN pg_catalog.to_char($1, 'YYYY')
                 WHEN n = 'y' THEN pg_catalog.to_char($1, 'YY')
                 WHEN n = '%' THEN pg_catalog.to_char($1, '%')

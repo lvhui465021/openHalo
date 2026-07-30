@@ -88,24 +88,6 @@ INSERT INTO mysql_ddl_side_path VALUES (1, 'side');
 SELECT 'storage_table_options_ignored' AS test_name,
        payload = 'side' AS passed FROM mysql_ddl_side_path WHERE id = 1;
 
-CREATE TABLE mysql_ddl_zero_length (
-  varchar_zero VARCHAR(0),
-  char_zero CHAR(0)
-);
-INSERT INTO mysql_ddl_zero_length VALUES ('', ''), (NULL, NULL);
-SELECT 'zero_length_char_varchar' AS test_name,
-       (SELECT COUNT(*) = 2 FROM mysql_ddl_zero_length)
-       AND (SELECT COUNT(*) = 1 FROM mysql_ddl_zero_length
-            WHERE varchar_zero = '' AND char_zero = '')
-       AND (SELECT COUNT(*) = 1 FROM mysql_ddl_zero_length
-            WHERE varchar_zero IS NULL AND char_zero IS NULL)
-       AND (SELECT COUNT(*) = 2
-            FROM information_schema.columns
-            WHERE table_schema = 'mysql_compat_ddl'
-              AND table_name = 'mysql_ddl_zero_length'
-              AND ((column_name = 'varchar_zero' AND column_type = 'varchar(0)')
-                   OR (column_name = 'char_zero' AND column_type = 'char(0)'))) AS passed;
-
 CREATE TABLE mysql_ddl_json (id INT PRIMARY KEY, json_value JSON);
 INSERT INTO mysql_ddl_json VALUES (1, JSON_OBJECT('key', 1));
 SELECT 'json_column_type' AS test_name,

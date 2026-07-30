@@ -1241,8 +1241,16 @@ transformOnConflictClause(ParseState *pstate,
 	}
 
 	/* Process the arbiter clause, ON CONFLICT ON (...) */
-	transformOnConflictArbiter(pstate, onConflictClause, &arbiterElems,
-							   &arbiterWhere, &arbiterConstraint);
+	if (pstate->p_parser_routine != NULL &&
+		pstate->p_parser_routine->transformOnConflictArbiter != NULL)
+		pstate->p_parser_routine->transformOnConflictArbiter(pstate,
+													 onConflictClause,
+													 &arbiterElems,
+													 &arbiterWhere,
+													 &arbiterConstraint);
+	else
+		transformOnConflictArbiter(pstate, onConflictClause, &arbiterElems,
+								   &arbiterWhere, &arbiterConstraint);
 
 	/* Process DO UPDATE */
 	if (onConflictClause->action == ONCONFLICT_UPDATE)

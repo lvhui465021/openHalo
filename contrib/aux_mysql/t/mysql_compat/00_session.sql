@@ -2,8 +2,6 @@
 -- Prerequisite: connect through the MySQL listener as a superuser to a database
 -- that has aux_mysql installed (normally a database cloned from template1).
 
-USE unvdb_mysqldb;
-
 SELECT 'extension_installed' AS test_name,
        COUNT(*) = 1 AND COALESCE(MAX(extversion), 'missing') <> 'missing' AS passed
 FROM pg_extension WHERE extname = 'aux_mysql';

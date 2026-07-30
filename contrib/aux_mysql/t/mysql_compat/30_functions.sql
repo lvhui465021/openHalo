@@ -60,6 +60,11 @@ SELECT 'string_length_aliases' AS test_name,
        AND LOCATE('a', 'banana', 3) = 4 AS passed;
 SELECT 'hex_string' AS test_name,
        HEX(CAST('abc' AS CHAR)) = '616263' AS passed;
+SELECT 'encoding_functions' AS test_name,
+       UNHEX(CAST('616263' AS CHAR)) = CAST('abc' AS BINARY)
+       AND FROM_BASE64(CAST('YWJj' AS CHAR)) = CAST('abc' AS BINARY) AS passed;
+SELECT 'repeat_untyped_literal' AS test_name,
+       repeat('ab', 3) = 'ababab' AS passed;
 SELECT 'json' AS test_name,
        json_object('key', 1) IS NOT NULL
        AND json(42) IS NOT NULL

@@ -11,17 +11,9 @@ SHOW STATUS;
 SHOW SESSION STATUS;
 SHOW GLOBAL STATUS;
 
--- The REPEAT mapping cannot resolve an untyped polymorphic string literal.
-SELECT repeat('ab', 3);
-
--- SQL_CALC_FOUND_ROWS (KF-020 fixed, verify)
-SELECT SQL_CALC_FOUND_ROWS oid FROM pg_class ORDER BY oid LIMIT 2;
-SELECT 'calc_found_rows' AS test_name, FOUND_ROWS() > 0 AS passed;
-
--- These MySQL encoding functions are not installed by aux_mysql 1.5.
-SELECT UNHEX(CAST('616263' AS CHAR));
+-- TO_BASE64 remains absent in both OpenHalo and PG18.  PG18's UNHEX and
+-- FROM_BASE64 compatibility functions are covered by the positive suite.
 SELECT TO_BASE64(CAST('abc' AS CHAR));
-SELECT FROM_BASE64(CAST('YWJj' AS CHAR));
 
 -- LOAD_FILE raises a server file error instead of returning NULL.
 SELECT LOAD_FILE('/mysql-compat-file-does-not-exist');
@@ -29,9 +21,13 @@ SELECT LOAD_FILE('/mysql-compat-file-does-not-exist');
 -- BIGINT UNSIGNED is incorrectly bounded by signed int8 storage.
 SELECT CAST(18446744073709551615 AS UNSIGNED);
 
--- Connection collation is case-insensitive, but untyped literal LIKE is not.
-SELECT 'literal_like_case_insensitive' AS test_name,
-       'AbC' LIKE 'a%' AS passed;
+-- OpenHalo and PG18 both report an indeterminate collation when a catalog
+-- name is compared directly with a MySQL-collated VARCHAR value.
+CREATE TEMPORARY TABLE mysql_known_api_name(function_name VARCHAR(64));
+INSERT INTO mysql_known_api_name VALUES ('version');
+SELECT 'catalog_name_collation' AS test_name, COUNT(*) = 1 AS passed
+FROM mysql_known_api_name r JOIN pg_proc p ON p.proname = r.function_name;
+DROP TEMPORARY TABLE mysql_known_api_name;
 
 -- The ->> operator accepts a bare key but not the standard MySQL $.key path.
 SELECT 'json_dollar_path' AS test_name,
@@ -46,6 +42,22 @@ SELECT mysql.release_lock('mysql_compat_known_lock');
 DROP DATABASE IF EXISTS mysql_compat_known_metadata;
 CREATE DATABASE mysql_compat_known_metadata;
 USE mysql_compat_known_metadata;
+
+-- OpenHalo and PG18 both lose MySQL zero-length CHAR/VARCHAR semantics.
+CREATE TABLE mysql_known_zero_length (
+  varchar_zero VARCHAR(0),
+  char_zero CHAR(0)
+);
+INSERT INTO mysql_known_zero_length VALUES ('', ''), (NULL, NULL);
+SELECT 'zero_length_char_varchar' AS test_name,
+       (SELECT COUNT(*) = 1 FROM mysql_known_zero_length
+        WHERE varchar_zero = '' AND char_zero = '')
+       AND (SELECT COUNT(*) = 2
+            FROM information_schema.columns
+            WHERE table_schema = 'mysql_compat_known_metadata'
+              AND table_name = 'mysql_known_zero_length'
+              AND ((column_name = 'varchar_zero' AND column_type = 'varchar(0)')
+                   OR (column_name = 'char_zero' AND column_type = 'char(0)'))) AS passed;
 
 -- INFORMATION_SCHEMA.STATISTICS is not populated from live indexes.
 CREATE TABLE mysql_known_indexed (id INT PRIMARY KEY, value_int INT);

@@ -49,6 +49,7 @@ PG_FUNCTION_INFO_V1(mys_get_user_var);
 PG_FUNCTION_INFO_V1(mys_set_user_var);
 PG_FUNCTION_INFO_V1(mys_get_session_time_zone);
 PG_FUNCTION_INFO_V1(mys_get_global_time_zone);
+PG_FUNCTION_INFO_V1(mys_get_system_variable);
 
 
 void 
@@ -91,6 +92,20 @@ mys_get_global_time_zone(PG_FUNCTION_ARGS)
 
 	pfree(value);
 	PG_RETURN_TEXT_P(result);
+}
+
+Datum
+mys_get_system_variable(PG_FUNCTION_ARGS)
+{
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	bool		is_session = PG_GETARG_BOOL(1);
+	char	   *value = NULL;
+
+	getSystemVariableValueForSelect(name, is_session, &value);
+	pfree(name);
+	if (value == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(value));
 }
 
 Datum

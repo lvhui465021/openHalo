@@ -31,16 +31,22 @@
 #include "catalog/namespace.h"
 #include "catalog/toasting.h"
 #include "commands/createas.h"
+#include "commands/defrem.h"
 #include "commands/matview.h"
+#include "commands/mysql/mys_tablecmds.h"
 #include "commands/prepare.h"
 #include "commands/tablecmds.h"
+#include "commands/trigger.h"
 #include "commands/view.h"
 #include "executor/execdesc.h"
 #include "executor/executor.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/queryjumble.h"
 #include "parser/analyze.h"
+#include "parser/mysql/mys_parse_utilcmd.h"
+#include "libpq/libpq-be.h"
 #include "rewrite/rewriteHandler.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
@@ -63,6 +69,8 @@ typedef struct
 /* utility functions for CTAS definition creation */
 static ObjectAddress create_ctas_internal(List *attrList, IntoClause *into);
 static ObjectAddress create_ctas_nodata(List *tlist, IntoClause *into);
+static void create_mysql_ctas_on_update_triggers(ParseState *pstate,
+											 Query *query, Oid target_relid);
 
 /* DestReceiver routines for collecting data */
 static void intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo);
@@ -351,6 +359,11 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		/* get object address that intorel_startup saved for us */
 		address = ((DR_intorel *) dest)->reladdr;
 
+		if (MyProcPort != NULL &&
+			MyProcPort->protocol_kind == COMPAT_PROTOCOL_MYSQL)
+			create_mysql_ctas_on_update_triggers(pstate, query,
+											 address.objectId);
+
 		/* and clean up */
 		ExecutorFinish(queryDesc);
 		ExecutorEnd(queryDesc);
@@ -361,6 +374,73 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 	}
 
 	return address;
+}
+
+static void
+create_mysql_ctas_on_update_triggers(ParseState *pstate, Query *query,
+									 Oid target_relid)
+{
+	Relation	target_rel;
+	const char *target_schema;
+	const char *target_name;
+	ListCell   *lc;
+	int			output_attnum = 0;
+
+	target_rel = table_open(target_relid, NoLock);
+	target_schema = get_namespace_name(RelationGetNamespace(target_rel));
+	target_name = RelationGetRelationName(target_rel);
+
+	foreach(lc, query->targetList)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		Relation	source_rel;
+		Form_pg_attribute source_attr;
+		const char *target_colname;
+		CreateFunctionStmt *function_stmt;
+		CreateTrigStmt *trigger_stmt;
+
+		if (tle->resjunk)
+			continue;
+		output_attnum++;
+		if (!OidIsValid(tle->resorigtbl) || tle->resorigcol <= 0 ||
+			output_attnum > RelationGetDescr(target_rel)->natts)
+			continue;
+
+		source_rel = table_open(tle->resorigtbl, AccessShareLock);
+		if (tle->resorigcol > RelationGetDescr(source_rel)->natts)
+		{
+			table_close(source_rel, AccessShareLock);
+			continue;
+		}
+		source_attr = TupleDescAttr(RelationGetDescr(source_rel),
+									 tle->resorigcol - 1);
+		if (source_attr->attisdropped ||
+			!OidIsValid(mysGetColumnOnUpdateNowTrig(source_rel,
+												 NameStr(source_attr->attname))))
+		{
+			table_close(source_rel, AccessShareLock);
+			continue;
+		}
+		table_close(source_rel, AccessShareLock);
+
+		target_colname = NameStr(TupleDescAttr(RelationGetDescr(target_rel),
+											output_attnum - 1)->attname);
+		function_stmt = createAutoUpdateTimeStampTriggerFunc(
+			(char *) target_schema, (char *) target_name,
+			(char *) target_colname);
+		(void) CreateFunction(pstate, function_stmt);
+		CommandCounterIncrement();
+
+		trigger_stmt = createAutoUpdateTimeStampTrigger(
+			(char *) target_schema, (char *) target_name,
+			(char *) target_colname);
+		(void) CreateTrigger(trigger_stmt, NULL, target_relid, InvalidOid,
+						 InvalidOid, InvalidOid, InvalidOid, InvalidOid,
+						 NULL, false, false);
+		CommandCounterIncrement();
+	}
+
+	table_close(target_rel, NoLock);
 }
 
 /*

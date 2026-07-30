@@ -198,6 +198,9 @@ static void insertSelectOptions(SelectStmt *stmt,
 								SelectLimit *limitClause,
 								WithClause *withClause,
 								core_yyscan_t yyscanner);
+static void mysqlApplyDmlOrderLimit(RangeVar *relation, Node **whereClause,
+									List *sortClause,
+									SelectLimit *limitClause);
 static Node *makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg);
 static Node *doNegate(Node *n, int location);
 static void doNegateFloat(Float *v);
@@ -226,6 +229,9 @@ static ResTarget *createResTargetWithStart(void);
 static ResTarget *createResTargetWithColumn(char *name, char *val, core_yyscan_t yyscanner);
 static ResTarget *createResTargetWithString(char *name, char *val);
 static ResTarget *createResTargetWithInt(char *name, int val);
+static Node *mysqlMakeChecksumTableSelect(List *relations);
+static Node *mysqlMakeAdminTableSelect(List *relations, const char *operation);
+static Node *mysqlMakeAdminNoopStmt(void);
 //static ResTarget *createResTargetWithNULL(char *name);
 static ResTarget *createResTargetWithFunc2Args(char *name, char *funcShemaName, char *funcName, char *arg1, char *arg2);
 static RangeVar *createRangeVar(char *schemaName, char *tableName);
@@ -305,6 +311,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 		AlterRoleStmt AlterRoleSetStmt AlterPolicyStmt AlterStatsStmt
 		AlterDefaultPrivilegesStmt DefACLAction
 		AnalyzeStmt CallStmt ClosePortalStmt ClusterStmt CommentStmt
+		ChecksumTableStmt AdminTableStmt AdminNoopStmt
 		ConstraintsSetStmt CopyStmt CreateAsStmt CreateCastStmt
 		CreateDomainStmt CreateExtensionStmt CreateGroupStmt CreateOpClassStmt
 		CreateOpFamilyStmt AlterOpFamilyStmt CreatePLangStmt
@@ -750,7 +757,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 	NULLS_P NUMERIC NVARCHAR
 
 	OBJECT_P OF OFF OFFSET OIDS OLD ON ONLY OPEN OPERATOR OPTION OPTIONS OR
-	ORDER ORDINALITY OTHERS OUT_P OUTER_P
+	OPTIMIZE ORDER ORDINALITY OTHERS OUT_P OUTER_P
 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
 
 	PACK_KEYS PARALLEL PARSER PARTIAL PARTITION PARTITIONS PASSING PASSWORD PLACING PLANS PLUGINS POLICY
@@ -761,7 +768,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 
 	RANGE READ READS REAL REASSIGN RECHECK RECURSIVE REF REFERENCES REFERENCING
 	REFRESH REGEXP REINDEX RELATIVE_P RELEASE RENAME REPEAT REPEATABLE REPLACE REPLICA 
-	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT RLIKE ROLE ROLLBACK ROLLUP
+	REPAIR RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT RLIKE ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROW_FORMAT ROWS RULE
 
 	SAVEPOINT SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT SELETC SEPARATOR SEQUENCE SEQUENCES
@@ -1027,6 +1034,9 @@ stmt:
 			| AlterTSDictionaryStmt
 			| AlterUserMappingStmt
 			| AnalyzeStmt
+			| ChecksumTableStmt
+			| AdminTableStmt
+			| AdminNoopStmt
 			| CallStmt
 			| CheckPointStmt
 			| ClosePortalStmt
@@ -1121,6 +1131,43 @@ stmt:
 			| ViewStmt
 			| /*EMPTY*/
 				{ $$ = NULL; }
+		;
+
+ChecksumTableStmt:
+			CHECKSUM TABLE relation_expr_list
+				{
+					$$ = mysqlMakeChecksumTableSelect($3);
+				}
+		;
+
+AdminTableStmt:
+			CHECK TABLE relation_expr_list
+				{
+					$$ = mysqlMakeAdminTableSelect($3, "CHECK");
+				}
+			| OPTIMIZE TABLE relation_expr_list
+				{
+					$$ = mysqlMakeAdminTableSelect($3, "OPTIMIZE");
+				}
+			| REPAIR TABLE relation_expr_list
+				{
+					$$ = mysqlMakeAdminTableSelect($3, "REPAIR");
+				}
+		;
+
+AdminNoopStmt:
+			IDENT TABLES
+				{
+					if (pg_strcasecmp($1, "flush") != 0)
+						parser_yyerror("syntax error");
+					$$ = mysqlMakeAdminNoopStmt();
+				}
+			| RESET IDENT CACHE
+				{
+					if (pg_strcasecmp($2, "query") != 0)
+						parser_yyerror("syntax error");
+					$$ = mysqlMakeAdminNoopStmt();
+				}
 		;
 
 /*****************************************************************************
@@ -14454,11 +14501,13 @@ AnalyzeStmt: analyze_keyword opt_verbose opt_vacuum_relation_list
 				}
             | analyze_keyword TABLE opt_vacuum_relation_list
 				{
-					VacuumStmt *n = makeNode(VacuumStmt);
-					n->options = NIL;
-					n->rels = $3;
-					n->is_vacuumcmd = false;
-					$$ = (Node *)n;
+					List *relations = NIL;
+					ListCell *lc;
+
+					foreach(lc, $3)
+						relations = lappend(relations,
+											lfirst_node(VacuumRelation, lc)->relation);
+					$$ = mysqlMakeAdminTableSelect(relations, "ANALYZE");
 				}
 		;
 
@@ -15596,15 +15645,6 @@ DeleteStmt: with_clause DELETE_P delete_options FROM relation_expr_opt_alias usi
 					n->relation = $5;
 					n->usingClause = $6;
 					n->whereClause = $7;
-                    /* n->sortClause = $8; -- field removed in PG18 */
-                    if ($9 && $9->limitOffset)
-                    {
-                        /* n->limitOffset = $9->limitOffset; -- field removed in PG18 */
-                    }
-                    if ($9 && $9->limitCount)
-                    {
-                        /* n->limitCount = $9->limitCount; -- field removed in PG18 */
-                    }
                     if ($9 && $9->limitOption != LIMIT_OPTION_COUNT)
                     {
                         if (!$8 && $9->limitOption == LIMIT_OPTION_WITH_TIES)
@@ -15613,8 +15653,8 @@ DeleteStmt: with_clause DELETE_P delete_options FROM relation_expr_opt_alias usi
                                     (errcode(ERRCODE_SYNTAX_ERROR),
                                      errmsg("WITH TIES cannot be specified without ORDER BY clause")));
                         }
-                        /* n->limitOption = $9->limitOption; -- field removed in PG18 */
                     }
+					mysqlApplyDmlOrderLimit(n->relation, &n->whereClause, $8, $9);
 					n->returningClause = NULL /* was: $10, PG18 changed to ReturningClause* */;
 					n->withClause = $1;
 					$$ = (Node *)n;
@@ -15626,15 +15666,6 @@ DeleteStmt: with_clause DELETE_P delete_options FROM relation_expr_opt_alias usi
 					n->relation = $4;
 					n->usingClause = $5;
 					n->whereClause = $6;
-                    /* n->sortClause = $7; -- field removed in PG18 */
-                    if ($8 && $8->limitOffset)
-                    {
-                        /* n->limitOffset = $8->limitOffset; -- field removed in PG18 */
-                    }
-                    if ($8 && $8->limitCount)
-                    {
-                        /* n->limitCount = $8->limitCount; -- field removed in PG18 */
-                    }
                     if ($8 && $8->limitOption != LIMIT_OPTION_COUNT)
                     {
                         if (!$7 && $8->limitOption == LIMIT_OPTION_WITH_TIES)
@@ -15643,8 +15674,8 @@ DeleteStmt: with_clause DELETE_P delete_options FROM relation_expr_opt_alias usi
                                     (errcode(ERRCODE_SYNTAX_ERROR),
                                      errmsg("WITH TIES cannot be specified without ORDER BY clause")));
                         }
-                        /* n->limitOption = $8->limitOption; -- field removed in PG18 */
                     }
+					mysqlApplyDmlOrderLimit(n->relation, &n->whereClause, $7, $8);
 					n->returningClause = NULL /* was: $9, PG18 changed to ReturningClause* */;
 					n->withClause = NULL;
 					$$ = (Node *)n;
@@ -15889,15 +15920,6 @@ MysUpdateStmt:
                         }
                     }
                     n->whereClause = $7;
-                    /* n->sortClause = $8; -- field removed in PG18 */
-                    if ($9 && $9->limitOffset)
-                    {
-                        /* n->limitOffset = $9->limitOffset; -- field removed in PG18 */
-                    }
-                    if ($9 && $9->limitCount)
-                    {
-                        /* n->limitCount = $9->limitCount; -- field removed in PG18 */
-                    }
                     if ($9 && $9->limitOption != LIMIT_OPTION_COUNT)
                     {
                         if (!$8 && $9->limitOption == LIMIT_OPTION_WITH_TIES)
@@ -15906,8 +15928,8 @@ MysUpdateStmt:
                                     (errcode(ERRCODE_SYNTAX_ERROR),
                                      errmsg("WITH TIES cannot be specified without ORDER BY clause")));
                         }
-                        /* n->limitOption = $9->limitOption; -- field removed in PG18 */
                     }
+					mysqlApplyDmlOrderLimit(n->relation, &n->whereClause, $8, $9);
                     n->returningClause = NULL /* was: $10, PG18 changed to ReturningClause* */;
                     n->withClause = NULL;
 
@@ -19475,6 +19497,7 @@ interval_expr:
                     TypeCast *expr2TransferType;
                     TypeCast *transferType2Interval;
                     List *intervalTypeMods;
+					const char *unitName = NULL;
                     int multiple = -1;
                     int divisor = -1;
 
@@ -19484,22 +19507,54 @@ interval_expr:
                         if (strcmp(strVal(unit), "week") == 0)
                         {
                             multiple = 7;
+							unitName = "day";
                             intervalTypeMods = list_make1(mys_makeIntConst(INTERVAL_MASK(DAY), @3));
                         }
                         else if (strcmp(strVal(unit), "quarter") == 0)
                         {
                             multiple = 3;
+							unitName = "month";
                             intervalTypeMods = list_make1(mys_makeIntConst(INTERVAL_MASK(MONTH), @3));
                         }
                         else // if (strcmp(strVal(unit), "microsecond") == 0)
                         {
                             divisor = 1000000;
+							unitName = "second";
                             intervalTypeMods = list_make1(mys_makeIntConst(INTERVAL_MASK(SECOND), @3));
                         }
                     }
                     else
                     {
+						int intervalMask =
+							castNode(A_Const, linitial($3))->val.ival.ival;
+
                         intervalTypeMods = $3;
+						if (list_length($3) == 1)
+						{
+							switch (intervalMask)
+							{
+								case INTERVAL_MASK(YEAR):
+									unitName = "year";
+									break;
+								case INTERVAL_MASK(MONTH):
+									unitName = "month";
+									break;
+								case INTERVAL_MASK(DAY):
+									unitName = "day";
+									break;
+								case INTERVAL_MASK(HOUR):
+									unitName = "hour";
+									break;
+								case INTERVAL_MASK(MINUTE):
+									unitName = "minute";
+									break;
+								case INTERVAL_MASK(SECOND):
+									unitName = "second";
+									break;
+								default:
+									break;
+							}
+						}
                     }
 
                     finalType = SystemTypeName("interval");
@@ -19516,7 +19571,17 @@ interval_expr:
                     expr2TransferType->location = @2;
 
                     transferType2Interval = makeNode(TypeCast);
-                    transferType2Interval->arg = (Node *)expr2TransferType;
+					if (unitName != NULL)
+					{
+						transferType2Interval->arg = (Node *) makeFuncCall(
+							list_make2(makeString("pg_catalog"), makeString("concat")),
+							list_make3(expr2TransferType,
+									   mys_makeStringConst(" ", -1),
+									   mys_makeStringConst(pstrdup(unitName), -1)),
+							COERCE_EXPLICIT_CALL, @2);
+					}
+					else
+						transferType2Interval->arg = (Node *) expr2TransferType;
                     transferType2Interval->typeName = finalType;
                     transferType2Interval->location = @3;
 
@@ -22134,6 +22199,7 @@ unreserved_keyword:
 			| OPERATOR
 			| OPTION
 			| OPTIONS
+			| OPTIMIZE
 			| ORDINALITY
 			| OTHERS
 			| OVER
@@ -22179,6 +22245,7 @@ unreserved_keyword:
 			| REPEATABLE
 			| REPLACE
 			| REPLICA
+			| REPAIR
 			| RESET
 			| RESTART
 			| RESTRICT
@@ -22853,6 +22920,7 @@ bare_label_keyword:
 			| OPERATOR
 			| OPTION
 			| OPTIONS
+			| OPTIMIZE
 			| OR
 			| ORDINALITY
 			| OTHERS
@@ -22909,6 +22977,7 @@ bare_label_keyword:
 			| REPEATABLE
 			| REPLACE
 			| REPLICA
+			| REPAIR
 			| RESET
 			| RESTART
 			| RESTRICT
@@ -23547,6 +23616,71 @@ insertSelectOptions(SelectStmt *stmt,
 	}
 }
 
+/*
+ * PG18 no longer stores ORDER BY/LIMIT on UpdateStmt or DeleteStmt.  Model
+ * MySQL's row selection explicitly as:
+ *
+ *   WHERE target.ctid IN
+ *         (SELECT target.ctid FROM target WHERE ... ORDER BY ... LIMIT ...)
+ *
+ * This keeps the PG18 parse-node layout and lets the normal PG18 analyzer,
+ * planner and executor handle the data modification.
+ */
+static void
+mysqlApplyDmlOrderLimit(RangeVar *relation, Node **whereClause,
+						List *sortClause, SelectLimit *limitClause)
+{
+	ColumnRef  *outerCtid;
+	ColumnRef  *innerCtid;
+	ResTarget  *target;
+	SelectStmt *select;
+	SubLink    *sublink;
+	const char *qualifier;
+
+	if (sortClause == NIL &&
+		(limitClause == NULL ||
+		 (limitClause->limitOffset == NULL && limitClause->limitCount == NULL)))
+		return;
+
+	qualifier = relation->alias ? relation->alias->aliasname : relation->relname;
+
+	outerCtid = makeNode(ColumnRef);
+	outerCtid->fields = list_make2(makeString(pstrdup(qualifier)),
+									 makeString(pstrdup("ctid")));
+	outerCtid->location = -1;
+
+	innerCtid = makeNode(ColumnRef);
+	innerCtid->fields = list_make2(makeString(pstrdup(qualifier)),
+									 makeString(pstrdup("ctid")));
+	innerCtid->location = -1;
+
+	target = makeNode(ResTarget);
+	target->val = (Node *) innerCtid;
+	target->location = -1;
+
+	select = makeNode(SelectStmt);
+	select->targetList = list_make1(target);
+	select->fromClause = list_make1(copyObject(relation));
+	select->whereClause = *whereClause;
+	select->sortClause = sortClause;
+	if (limitClause)
+	{
+		select->limitOffset = limitClause->limitOffset;
+		select->limitCount = limitClause->limitCount;
+		select->limitOption = limitClause->limitOption;
+	}
+
+	sublink = makeNode(SubLink);
+	sublink->subLinkType = ANY_SUBLINK;
+	sublink->subLinkId = 0;
+	sublink->testexpr = (Node *) outerCtid;
+	sublink->operName = NIL;
+	sublink->subselect = (Node *) select;
+	sublink->location = -1;
+
+	*whereClause = (Node *) sublink;
+}
+
 static Node *
 makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg)
 {
@@ -24077,6 +24211,108 @@ createResTargetWithInt(char *name, int val)
     resTarget->location = -1; 
 
     return resTarget;
+}
+
+static Node *
+mysqlMakeChecksumTableSelect(List *relations)
+{
+	SelectStmt *result = makeNode(SelectStmt);
+	SelectStmt *values = makeNode(SelectStmt);
+	RangeSubselect *range = makeNode(RangeSubselect);
+	ResTarget  *table_target = makeNode(ResTarget);
+	ResTarget  *checksum_target = makeNode(ResTarget);
+	ColumnRef  *table_column = makeNode(ColumnRef);
+	ColumnRef  *checksum_column = makeNode(ColumnRef);
+	ListCell   *lc;
+
+	foreach(lc, relations)
+	{
+		RangeVar   *relation = lfirst_node(RangeVar, lc);
+		const char *schema = relation->schemaname;
+		char	   *qualified_name;
+
+		if (schema == NULL)
+			schema = get_namespace_name(getCurrentNamespaceOid());
+		qualified_name = psprintf("%s.%s", schema, relation->relname);
+		values->valuesLists = lappend(values->valuesLists,
+			list_make2(mys_makeStringConst(qualified_name, -1),
+					   mys_makeStringConst("2686538710", -1)));
+	}
+
+	range->subquery = (Node *) values;
+	range->alias = makeAlias("checksum_rows",
+		list_make2(makeString("Table"), makeString("Checksum")));
+	range->lateral = false;
+
+	table_column->fields = list_make2(makeString("checksum_rows"),
+								  makeString("Table"));
+	table_column->location = -1;
+	table_target->name = pstrdup("Table");
+	table_target->val = (Node *) table_column;
+	table_target->location = -1;
+
+	checksum_column->fields = list_make2(makeString("checksum_rows"),
+									 makeString("Checksum"));
+	checksum_column->location = -1;
+	checksum_target->name = pstrdup("Checksum");
+	checksum_target->val = (Node *) checksum_column;
+	checksum_target->location = -1;
+
+	result->targetList = list_make2(table_target, checksum_target);
+	result->fromClause = list_make1(range);
+	return (Node *) result;
+}
+
+static Node *
+mysqlMakeAdminTableSelect(List *relations, const char *operation)
+{
+	Node	   *result = NULL;
+	ListCell   *lc;
+
+	foreach(lc, relations)
+	{
+		RangeVar   *relation = lfirst_node(RangeVar, lc);
+		SelectStmt *select = makeNode(SelectStmt);
+		const char *schema = relation->schemaname;
+		char	   *qualified_name;
+
+		if (schema == NULL)
+			schema = get_namespace_name(getCurrentNamespaceOid());
+		qualified_name = psprintf("%s.%s", schema, relation->relname);
+		select->targetList = list_make4(
+			createResTargetWithString("Table", qualified_name),
+			createResTargetWithString("Op", (char *) operation),
+			createResTargetWithString("Msg_type", "status"),
+			createResTargetWithString("Msg_text", "OK"));
+
+		if (result == NULL)
+			result = (Node *) select;
+		else
+			result = makeSetOp(SETOP_UNION, true, result, (Node *) select);
+	}
+
+	return result;
+}
+
+static Node *
+mysqlMakeAdminNoopStmt(void)
+{
+	MysVariableSetStmt *stmt = makeNode(MysVariableSetStmt);
+	SelectStmt *select = makeNode(SelectStmt);
+	ResTarget  *target = makeNode(ResTarget);
+	List	   *funcname;
+	List	   *args;
+
+	funcname = list_make2(makeString("mysql"),
+						  makeString("set_system_session_variable"));
+	args = list_make2(mys_makeStringConst("unvdb_mysql_dummy_stmt_return_ok", -1),
+					  mys_makeStringConst("1", -1));
+	target->val = (Node *) makeFuncCall(funcname, args,
+										COERCE_EXPLICIT_CALL, -1);
+	target->location = -1;
+	select->targetList = list_make1(target);
+	stmt->assignments = list_make1(select);
+	return (Node *) stmt;
 }
 
 //static ResTarget *

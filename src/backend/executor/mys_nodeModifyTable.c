@@ -773,7 +773,7 @@ ExecInsert(ModifyTableContext *context,
 			 (resultRelInfo->ri_TrigDesc &&
 			  resultRelInfo->ri_TrigDesc->trig_insert_before_row)))
 			ExecPartitionCheck(resultRelInfo, slot, estate, true);
-		if (onconflict != ONCONFLICT_NONE && onconflict != ONCONFLICT_UPDATE /* PG18: ONCONFLICT_REPLACE not available; using ONCONFLICT_UPDATE as placeholder */ && resultRelInfo->ri_NumIndices > 0)
+		if (onconflict != ONCONFLICT_NONE && onconflict != ONCONFLICT_REPLACE && resultRelInfo->ri_NumIndices > 0)
 		{
 			/* Perform a speculative insertion. */
 			uint32		specToken;
@@ -892,31 +892,29 @@ ExecInsert(ModifyTableContext *context,
 
 			/* Since there was no insertion conflict, we're done */
 		}
-    	else
+		else
 		{
-            if (onconflict == ONCONFLICT_UPDATE /* PG18: ONCONFLICT_REPLACE not available; using ONCONFLICT_UPDATE as placeholder */ && resultRelInfo->ri_NumIndices > 0)
-            {
-                ItemPointer        tupleid;
-                ItemPointerData conflictTid;
-			ItemPointerData invalidItemPtr;
-                List	   *arbiterIndexes;			ItemPointerSetInvalid(&invalidItemPtr);
-                arbiterIndexes = resultRelInfo->ri_onConflictArbiterIndexes; /*获取执行约束检查的索引列表*/
-                if (!ExecCheckIndexConstraints(resultRelInfo, slot, estate,
-                                               &conflictTid, &invalidItemPtr, arbiterIndexes))
-                do
-                {
-                        tupleid = &conflictTid;
-                        ExecDeleteAct(context, resultRelInfo, tupleid, false);
-                        // if(ExecDeleteAct(context, resultRelInfo, tupleid, false))
-                        // 	elog(INFO,"aa");
-                        // else
-                        // 	elog(INFO,"bb");
+			if (onconflict == ONCONFLICT_REPLACE && resultRelInfo->ri_NumIndices > 0)
+			{
+				ItemPointer tupleid;
+				ItemPointerData conflictTid;
+				ItemPointerData invalidItemPtr;
+				List	   *arbiterIndexes;
 
-                }
-                while (!ExecCheckIndexConstraints(resultRelInfo, slot, estate,
-                                                &conflictTid, &invalidItemPtr, arbiterIndexes));
-
-            }
+				ItemPointerSetInvalid(&invalidItemPtr);
+				arbiterIndexes = resultRelInfo->ri_onConflictArbiterIndexes;
+				if (!ExecCheckIndexConstraints(resultRelInfo, slot, estate,
+										   &conflictTid, &invalidItemPtr,
+										   arbiterIndexes))
+					do
+					{
+						tupleid = &conflictTid;
+						ExecDeleteAct(context, resultRelInfo, tupleid, false);
+					}
+					while (!ExecCheckIndexConstraints(resultRelInfo, slot, estate,
+												  &conflictTid, &invalidItemPtr,
+												  arbiterIndexes));
+			}
 
 			/* insert the tuple normally */
 			table_tuple_insert(resultRelationDesc, slot,
@@ -928,7 +926,7 @@ ExecInsert(ModifyTableContext *context,
 				recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
 													   slot, estate, false,
 													   false, NULL, NIL, false);
-        }
+		}
 	}
 
 	if (canSetTag)

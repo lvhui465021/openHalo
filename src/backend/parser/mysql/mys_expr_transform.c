@@ -64,6 +64,21 @@ mys_transform_noarg_call(ParseState *pstate, const char *function_name,
 	return transformExpr(pstate, (Node *) call, pstate->p_expr_kind);
 }
 
+static Node *
+mys_transform_system_var_call(ParseState *pstate, const char *name,
+						  bool is_session, ParseLoc location)
+{
+	FuncCall   *call;
+	List	   *args;
+
+	args = list_make2(makeStringConst(pstrdup(name), location),
+					  makeStringConst(is_session ? "true" : "false", location));
+	call = makeFuncCall(list_make2(makeString("pg_catalog"),
+								 makeString("mys_get_system_variable")),
+					args, COERCE_EXPLICIT_CALL, location);
+	return transformExpr(pstate, (Node *) call, pstate->p_expr_kind);
+}
+
 /*
  * MySQL exposes the source spelling of unaliased literals as their result
  * column label (for example, SELECT 1 produces a column named "1").  The
@@ -124,9 +139,11 @@ mys_transform_expr_node(ParseState *pstate, Node *expr, Node **result)
     switch (nodeTag(expr))
     {
     case T_SysVarRef:
-        {
-            SysVarRef  *sv = (SysVarRef *) expr;
-            const char *val;
+		{
+			SysVarRef  *sv = (SysVarRef *) expr;
+			const char *val;
+			const char *sql_mode_name = NULL;
+			bool		is_session = true;
 
             if (pg_strcasecmp(sv->sysVarName, "time_zone") == 0 ||
                 pg_strcasecmp(sv->sysVarName, "session.time_zone") == 0 ||
@@ -162,11 +179,16 @@ mys_transform_expr_node(ParseState *pstate, Node *expr, Node **result)
 				val = "utf8mb4_general_ci";
 			else if (pg_strcasecmp(sv->sysVarName, "max_allowed_packet") == 0)
 				val = "16777216";
-			else if (pg_strcasecmp(sv->sysVarName, "sql_mode") == 0 ||
-					 pg_strcasecmp(sv->sysVarName, "session.sql_mode") == 0)
-				val = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,"
-					  "NO_ZERO_IN_DATE,NO_ZERO_DATE,"
-					  "ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
+			else if (pg_strcasecmp(sv->sysVarName, "sql_mode") == 0)
+				sql_mode_name = "sql_mode";
+			else if (pg_strcasecmp(sv->sysVarName, "session.sql_mode") == 0 ||
+					 pg_strcasecmp(sv->sysVarName, "local.sql_mode") == 0)
+				sql_mode_name = "sql_mode";
+			else if (pg_strcasecmp(sv->sysVarName, "global.sql_mode") == 0)
+			{
+				sql_mode_name = "sql_mode";
+				is_session = false;
+			}
 			else if (pg_strcasecmp(sv->sysVarName, "wait_timeout") == 0 ||
 					 pg_strcasecmp(sv->sysVarName, "interactive_timeout") == 0)
 				val = "28800";
@@ -174,8 +196,15 @@ mys_transform_expr_node(ParseState *pstate, Node *expr, Node **result)
                 val = mysql_server_version;
             else if (pg_strcasecmp(sv->sysVarName, "version") == 0)
                 val = mysql_server_version;
-            else
-                val = sv->sysVarName;
+			else
+				val = sv->sysVarName;
+
+			if (sql_mode_name != NULL)
+			{
+				*result = mys_transform_system_var_call(pstate, sql_mode_name,
+												 is_session, sv->location);
+				return true;
+			}
 
             *result = (Node *) make_const(pstate,
                          (A_Const *) makeStringConst(pstrdup(val), sv->location));
@@ -211,6 +240,7 @@ mys_transform_expr_node(ParseState *pstate, Node *expr, Node **result)
 	case T_A_Expr:
 		{
 			A_Expr *aexpr = (A_Expr *) expr;
+			const char *opname = NULL;
 
 			/* MySQL <=> is SQL's null-safe equality operator. */
 			if (aexpr->kind == AEXPR_OP && list_length(aexpr->name) == 1 &&
@@ -221,6 +251,45 @@ mys_transform_expr_node(ParseState *pstate, Node *expr, Node **result)
 				*result = transformExpr(pstate, (Node *) aexpr,
 										pstate->p_expr_kind);
 				return true;
+			}
+
+			if (aexpr->kind == AEXPR_OP && list_length(aexpr->name) == 1)
+				opname = strVal(linitial(aexpr->name));
+
+			/*
+			 * In non-strict mode MySQL converts an empty string to zero in a
+			 * numeric expression.  Do this while the raw literal and session
+			 * sql_mode are still visible; PG18's normal operator resolver can
+			 * then select its native numeric operator without weakening any
+			 * PostgreSQL input function or cast globally.
+			 */
+			if (opname != NULL &&
+				(strcmp(opname, "+") == 0 || strcmp(opname, "-") == 0 ||
+				 strcmp(opname, "*") == 0 || strcmp(opname, "/") == 0 ||
+				 strcmp(opname, "%") == 0) &&
+				(mys_sqlMode & (MYS_MODE_STRICT_TRANS_TABLES |
+								MYS_MODE_STRICT_ALL_TABLES)) == 0)
+			{
+				Node **operands[2] = {&aexpr->lexpr, &aexpr->rexpr};
+				int i;
+
+				for (i = 0; i < lengthof(operands); i++)
+				{
+					Node *operand = *operands[i];
+
+					if (operand != NULL && IsA(operand, A_Const))
+					{
+						A_Const *constant = (A_Const *) operand;
+
+						if (!constant->isnull &&
+							constant->val.node.type == T_String &&
+							constant->val.sval.sval[0] == '\0')
+						{
+							constant->val.node.type = T_Integer;
+							constant->val.ival.ival = 0;
+						}
+					}
+				}
 			}
 			break;
 		}
