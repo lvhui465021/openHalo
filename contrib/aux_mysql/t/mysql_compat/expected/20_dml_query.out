@@ -258,6 +258,33 @@ pattern_operators	1
 1 row in set
 
 --------------
+SELECT 'null_safe_equality' AS test_name,
+       (1 <=> 1) = 1 AND (NULL <=> NULL) = 1 AND (1 <=> NULL) = 0 AS passed
+--------------
+
+test_name	passed
+null_safe_equality	1
+1 row in set
+
+--------------
+SELECT 'boolean_literals' AS test_name,
+       true = 1 AND false = 0 AS passed
+--------------
+
+test_name	passed
+boolean_literals	1
+1 row in set
+
+--------------
+SELECT 'literal_like_case_insensitive' AS test_name,
+       'AbC' LIKE 'a%' AS passed
+--------------
+
+test_name	passed
+literal_like_case_insensitive	1
+1 row in set
+
+--------------
 DROP DATABASE mysql_compat_dml
 --------------
 

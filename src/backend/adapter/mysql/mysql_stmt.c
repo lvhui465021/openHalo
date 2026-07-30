@@ -1112,7 +1112,10 @@ mys_stmt_rstartup(DestReceiver *self, int operation, TupleDesc typeinfo)
 
 	(void) operation;
 	if (receiver->send_header)
+	{
 		mys_stmt_send_result_header(receiver->ps, typeinfo, true);
+		mysql_packet_set_result_started(receiver->ps, true);
+	}
 }
 
 static void

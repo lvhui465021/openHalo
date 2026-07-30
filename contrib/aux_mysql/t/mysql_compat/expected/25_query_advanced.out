@@ -249,7 +249,7 @@ Query OK, 1 row affected
 ROLLBACK TO SAVEPOINT mysql_query_savepoint
 --------------
 
-Query OK, 1 row affected
+Query OK, 0 rows affected
 
 --------------
 COMMIT
@@ -279,6 +279,24 @@ SELECT 'delete_order_limit' AS test_name,
 
 test_name	passed
 delete_order_limit	1
+1 row in set
+
+--------------
+SELECT SQL_CALC_FOUND_ROWS id
+FROM mysql_query_target ORDER BY id LIMIT 2
+--------------
+
+id
+1
+2
+2 rows in set
+
+--------------
+SELECT 'calc_found_rows' AS test_name, FOUND_ROWS() > 0 AS passed
+--------------
+
+test_name	passed
+calc_found_rows	1
 1 row in set
 
 --------------

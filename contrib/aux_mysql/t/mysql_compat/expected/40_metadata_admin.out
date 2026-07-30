@@ -90,7 +90,7 @@ mysql_metadata_view
 SHOW FULL TABLES
 --------------
 
-Tables_in_mysql_compat_metadata	Table_type
+Tables_in_mysql_compat_metadata	table_type
 mysql_metadata_table	BASE TABLE
 mysql_metadata_view	VIEW
 2 rows in set
@@ -108,7 +108,7 @@ mysql_metadata_view
 SHOW FULL TABLES LIKE 'mysql_metadata_%'
 --------------
 
-Tables_in_mysql_compat_metadata	Table_type
+Tables_in_mysql_compat_metadata	table_type
 mysql_metadata_table	BASE TABLE
 mysql_metadata_view	VIEW
 2 rows in set
@@ -186,7 +186,7 @@ SHOW INDEX FROM mysql_metadata_table
 Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
 mysql_metadata_table	0	PRIMARY	1	id	A	0	NULL	NULL		btree		
 mysql_metadata_table	0	mysql_metadata_table_code_key	1	code	A	0	NULL	NULL		btree		
-mysql_metadata_table	1	_<OID>_mysql_metadata_value_index	1	value_int	A	0	NULL	NULL	YES	btree		
+mysql_metadata_table	1	mysql_metadata_value_index	1	value_int	A	0	NULL	NULL	YES	btree		
 3 rows in set
 
 --------------
@@ -196,7 +196,7 @@ SHOW INDEXES FROM mysql_metadata_table
 Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
 mysql_metadata_table	0	PRIMARY	1	id	A	0	NULL	NULL		btree		
 mysql_metadata_table	0	mysql_metadata_table_code_key	1	code	A	0	NULL	NULL		btree		
-mysql_metadata_table	1	_<OID>_mysql_metadata_value_index	1	value_int	A	0	NULL	NULL	YES	btree		
+mysql_metadata_table	1	mysql_metadata_value_index	1	value_int	A	0	NULL	NULL	YES	btree		
 3 rows in set
 
 --------------
@@ -206,7 +206,7 @@ SHOW KEYS FROM mysql_metadata_table
 Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
 mysql_metadata_table	0	PRIMARY	1	id	A	0	NULL	NULL		btree		
 mysql_metadata_table	0	mysql_metadata_table_code_key	1	code	A	0	NULL	NULL		btree		
-mysql_metadata_table	1	_<OID>_mysql_metadata_value_index	1	value_int	A	0	NULL	NULL	YES	btree		
+mysql_metadata_table	1	mysql_metadata_value_index	1	value_int	A	0	NULL	NULL	YES	btree		
 3 rows in set
 
 --------------
@@ -214,14 +214,7 @@ SHOW CREATE TABLE mysql_metadata_table
 --------------
 
 Table	Create Table
-mysql_metadata_table	CREATE TABLE `mysql_metadata_table` (
-  `id` int(11) NOT NULL AUTO_INCREMENT,
-  `code` varchar(20) NOT NULL COLLATE case_insensitive,
-  `value_int` int(11) DEFAULT 0 COMMENT 'metadata column',
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `mysql_metadata_table_code_key`(`code`),
-  KEY `_<OID>_mysql_metadata_value_index`(`value_int`)
-) ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COMMENT 'metadata table'
+mysql_metadata_table	CREATE TABLE `mysql_metadata_table` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n  `code` varchar(20) NOT NULL COLLATE case_insensitive,\n  `value_int` int(11) DEFAULT 0 COMMENT 'metadata column',\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `mysql_metadata_table_code_key`(`code`),\n  KEY `mysql_metadata_value_index`(`value_int`)\n) ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COMMENT 'metadata table'
 1 row in set
 
 --------------
@@ -229,7 +222,10 @@ SHOW CREATE VIEW mysql_metadata_view
 --------------
 
 View	Create View	character_set_client	collation_connection
-mysql_metadata_view	CREATE ALGORITHM=UNDEFINED DEFINER=`test`@`%` SQL SECURITY DEFINER VIEW `mysql_metadata_view` AS select `id``code``value_int` from `mysql_metadata_table`	utf8mb4	utf8mb4_general_ci
+mysql_metadata_view	CREATE ALGORITHM=UNDEFINED DEFINER=`test`@`%` SQL SECURITY DEFINER VIEW `mysql_metadata_view` AS select `id``
+``code``
+``value_int
+` from `mysql_metadata_table`	utf8mb4	utf8mb4_general_ci
 1 row in set
 
 --------------
@@ -237,7 +233,7 @@ SHOW CREATE FUNCTION mysql.version
 --------------
 
 Function	sql_mode	Create Function	character_set_client	collation_connection	Database Collation
-version	STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION	CREATE DEFINER=`unvdb`@`%` FUNCTION `version`() RETURNS `text`
+version	STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION	CREATE DEFINER=`unvdb`@`%` FUNCTION `version`() RETURNS text
 mysVersion	utf8mb4	utf8mb4_general_ci	utf8mb4_general_ci
 1 row in set
 
@@ -264,7 +260,7 @@ SHOW CREATE TRIGGER aitmysql_metadata_table
 --------------
 
 Trigger	sql_mode	SQL Original Statement	character_set_client	collation_connection	Database Collation	Created
-aitmysql_metadata_table	ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION	CREATE DEFINER=`test`@`%` TRIGGER `aitmysql_metadata_table` BEFORE INSERT ON `mysql_metadata_table` FOR EACH ROW BEGIN if New.id is not null then if 0 < New.id then PERFORM mysql.setval('mysql_compat_metadata.seqmysql_metadata_table'::regclass, New.id, true);elsif 0 = New.id then New.id = (select nextval('mysql_compat_metadata.seqmysql_metadata_table'::regclass)); end if; else New.id = (select nextval('mysql_compat_metadata.seqmysql_metadata_table'::regclass)); end if; RETURN NEW; END;	utf8mb4	utf8mb4_0900_ai_ci	utf8mb4_0900_ai_ci	NULL
+aitmysql_metadata_table	ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION	CREATE DEFINER=`test`@`%` TRIGGER `aitmysql_metadata_table` BEFORE INSERT ON `mysql_metadata_table` FOR EACH ROW BEGIN if New.id is not null then if 0 < New.id then PERFORM setval('mysql_compat_metadata.seqmysql_metadata_table'::regclass, New.id, true);elsif 0 = New.id then New.id = (select nextval('mysql_compat_metadata.seqmysql_metadata_table'::regclass)); end if; else New.id = (select nextval('mysql_compat_metadata.seqmysql_metadata_table'::regclass)); end if; RETURN NEW; END;	utf8mb4	utf8mb4_0900_ai_ci	utf8mb4_0900_ai_ci	NULL
 1 row in set
 
 --------------
@@ -285,7 +281,7 @@ unvdb_mysqldb
 SHOW CHARACTER SET
 --------------
 
-Charset	Description	Default collation	Maxlen
+charset	description	default collation	maxlen
 utf8mb4	UTF-8 Unicode	utf8mb4_general_ci	4
 1 row in set
 
@@ -293,7 +289,7 @@ utf8mb4	UTF-8 Unicode	utf8mb4_general_ci	4
 SHOW COLLATION
 --------------
 
-Collation	Charset	Id	Default	Compiled	Sortlen
+Collation	Charset	id	Default	Compiled	sortlen
 armscii8_general_ci	armscii8	32	Yes	Yes	1
 armscii8_bin	armscii8	64		Yes	1
 ascii_general_ci	ascii	11	Yes	Yes	1
@@ -586,7 +582,7 @@ utf8mb4_mn_cyrl_0900_as_cs	utf8mb4	323		Yes	0
 SHOW ENGINES
 --------------
 
-Engine	Support	Comment	Transactions	Xa	Savepoints
+engine	support	comment	transactions	xa	savepoints
 InnoDB	DEFAULT	Supports transactions, row-level locking, and foreign keys	YES	YES	YES
 MRG_MYISAM	YES	Collection of identical MyISAM tables	NO	NO	NO
 MEMORY	YES	Hash based, stored in memory, useful for temporary tables	NO	NO	NO
@@ -602,7 +598,7 @@ FEDERATED	NO	Federated MySQL storage engine	NULL	NULL	NULL
 SHOW STORAGE ENGINES
 --------------
 
-Engine	Support	Comment	Transactions	Xa	Savepoints
+engine	support	comment	transactions	xa	savepoints
 InnoDB	DEFAULT	Supports transactions, row-level locking, and foreign keys	YES	YES	YES
 MRG_MYISAM	YES	Collection of identical MyISAM tables	NO	NO	NO
 MEMORY	YES	Hash based, stored in memory, useful for temporary tables	NO	NO	NO
@@ -618,22 +614,22 @@ FEDERATED	NO	Federated MySQL storage engine	NULL	NULL	NULL
 SHOW PLUGINS
 --------------
 
-Empty set
+Query OK, 0 rows affected
 
 --------------
 SHOW SESSION VARIABLES LIKE 'sql_mode'
 --------------
 
-Variable_name	Value
-sql_mode	STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION
+variable_name	value
+sql_mode	
 1 row in set
 
 --------------
 SHOW GLOBAL VARIABLES LIKE 'sql_mode'
 --------------
 
-Variable_name	Value
-sql_mode	STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION
+variable_name	value
+sql_mode	
 1 row in set
 
 --------------
@@ -656,8 +652,8 @@ Id	User	Host	db	Command	Time	State	Info
 SHOW TRIGGERS
 --------------
 
-Trigger	Event	Table	Statement	Timing	Created	sql_mode	Definer	character_set_client	collation_connection	Database Collation
-aitmysql_metadata_table	INSERT	mysql_metadata_table	BEGIN if New.id is not null then if 0 < New.id then PERFORM mysql.setval('mysql_compat_metadata.seqmysql_metadata_table'::regclass, New.id, true);elsif 0 = New.id then New.id = (select nextval('mysql_compat_metadata.seqmysql_metadata_table'::regclass)); end if; else New.id = (select nextval('mysql_compat_metadata.seqmysql_metadata_table'::regclass)); end if; RETURN NEW; END;	BEFORE	NULL	ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION	test	utf8mb4	utf8mb4_0900_ai_ci	utf8mb4_0900_ai_ci
+trigger	event	table	statement	timing	created	sql_mode	definer	character_set_client	collation_connection	database collation
+aitmysql_metadata_table	INSERT	mysql_metadata_table	BEGIN if New.id is not null then if 0 < New.id then PERFORM setval('mysql_compat_metadata.seqmysql_metadata_table'::regclass, New.id, true);elsif 0 = New.id then New.id = (select nextval('mysql_compat_metadata.seqmysql_metadata_table'::regclass)); end if; else New.id = (select nextval('mysql_compat_metadata.seqmysql_metadata_table'::regclass)); end if; RETURN NEW; END;	BEFORE	NULL	ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION	test	utf8mb4	utf8mb4_0900_ai_ci	utf8mb4_0900_ai_ci
 1 row in set
 
 --------------
@@ -668,7 +664,7 @@ WHERE table_schema = 'mysql_compat_metadata'
   AND table_name IN ('mysql_metadata_table', 'mysql_metadata_view')
 --------------
 
-Test_name	Passed
+test_name	passed
 metadata_tables	1
 1 row in set
 
@@ -679,7 +675,7 @@ FROM information_schema.columns
 WHERE table_schema = 'mysql_compat_metadata' AND table_name = 'mysql_metadata_table'
 --------------
 
-Test_name	Passed
+test_name	passed
 information_schema_columns	1
 1 row in set
 
@@ -691,7 +687,7 @@ WHERE schema_name = 'mysql_compat_metadata'
   AND table_name = 'mysql_metadata_table'
 --------------
 
-Test_name	Passed
+test_name	passed
 metadata_indexes	1
 1 row in set
 
@@ -703,7 +699,7 @@ WHERE table_schema = 'mysql_compat_metadata'
   AND table_name = 'mysql_metadata_view'
 --------------
 
-Test_name	Passed
+test_name	passed
 metadata_view	1
 1 row in set
 
@@ -715,7 +711,7 @@ WHERE routine_schema = 'mysql_compat_metadata'
   AND routine_name IN ('mysql_metadata_function', 'mysql_metadata_procedure')
 --------------
 
-Test_name	Passed
+test_name	passed
 metadata_routines	1
 1 row in set
 

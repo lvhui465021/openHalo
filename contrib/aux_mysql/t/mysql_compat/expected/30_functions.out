@@ -123,6 +123,25 @@ hex_string	1
 1 row in set
 
 --------------
+SELECT 'encoding_functions' AS test_name,
+       UNHEX(CAST('616263' AS CHAR)) = CAST('abc' AS BINARY)
+       AND FROM_BASE64(CAST('YWJj' AS CHAR)) = CAST('abc' AS BINARY) AS passed
+--------------
+
+test_name	passed
+encoding_functions	1
+1 row in set
+
+--------------
+SELECT 'repeat_untyped_literal' AS test_name,
+       repeat('ab', 3) = 'ababab' AS passed
+--------------
+
+test_name	passed
+repeat_untyped_literal	1
+1 row in set
+
+--------------
 SELECT 'json' AS test_name,
        json_object('key', 1) IS NOT NULL
        AND json(42) IS NOT NULL

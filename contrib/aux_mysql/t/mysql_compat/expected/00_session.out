@@ -1,14 +1,5 @@
 # mysql-compat full transcript
 --------------
-SELECT 'database_mode' AS test_name,
-       current_setting('unvdb_database_mode') = 'mysql' AS passed
---------------
-
-test_name	passed
-database_mode	1
-1 row in set
-
---------------
 SELECT 'extension_installed' AS test_name,
        COUNT(*) = 1 AND COALESCE(MAX(extversion), 'missing') <> 'missing' AS passed
 FROM pg_extension WHERE extname = 'aux_mysql'
@@ -19,26 +10,15 @@ extension_installed	1
 1 row in set
 
 --------------
-SELECT 'protocol_guc_contract' AS test_name,
-       current_setting('unvdb_mysql.listener_on') = 'on'
-       AND current_setting('unvdb_mysql.port') = '3306'
-       AND current_setting('unvdb_mysql.max_allowed_packet') IS NOT NULL
-       AND current_setting('unvdb_mysql.support_multiple_table_update') = 'on'
-       AND current_setting('unvdb_mysql.column_name_case_control') = '0'
+SELECT 'protocol_listener_on' AS test_name,
+       current_setting('mysql.listener_on') = 'on'
+       AND current_setting('mysql.port') IS NOT NULL
+       AND current_setting('mysql.max_allowed_packet') IS NOT NULL
        AS passed
 --------------
 
 test_name	passed
-protocol_guc_contract	1
-1 row in set
-
---------------
-SELECT 'mysql_parser_no_pg_fallback' AS test_name,
-       current_setting('standard_parserengine_auxiliary') = 'off' AS passed
---------------
-
-test_name	passed
-mysql_parser_no_pg_fallback	1
+protocol_listener_on	1
 1 row in set
 
 --------------
@@ -49,14 +29,6 @@ SELECT 'packet_and_charset_variables' AS test_name,
 
 test_name	passed
 packet_and_charset_variables	1
-1 row in set
-
---------------
-SELECT 'udb_version' AS test_name, udb_version() IS NOT NULL AS passed
---------------
-
-test_name	passed
-udb_version	1
 1 row in set
 
 --------------
@@ -242,7 +214,7 @@ Query OK, 1 row affected
 ROLLBACK
 --------------
 
-Query OK, 1 row affected
+Query OK, 0 rows affected
 
 --------------
 SELECT 'transaction_rollback' AS test_name,

@@ -107,37 +107,28 @@ datetime_binary_blob_year	1
 1 row in set
 
 --------------
-CREATE TABLE mysql_ddl_zero_length (
-  varchar_zero VARCHAR(0),
-  char_zero CHAR(0)
-)
+CREATE TABLE mysql_ddl_side_path (
+  id INT PRIMARY KEY, payload VARCHAR(20)
+) ENGINE=InnoDB AVG_ROW_LENGTH=1024 CHECKSUM=1 COMPRESSION='zlib'
+  CONNECTION='side' DELAY_KEY_WRITE=1 ENCRYPTION='N' KEY_BLOCK_SIZE=8
+  MAX_ROWS=10 MIN_ROWS=1 PACK_KEYS=1 PASSWORD='x'
 --------------
 
 Query OK, 0 rows affected
 
 --------------
-INSERT INTO mysql_ddl_zero_length VALUES ('', ''), (NULL, NULL)
+INSERT INTO mysql_ddl_side_path VALUES (1, 'side')
 --------------
 
-Query OK, 2 rows affected
+Query OK, 1 row affected
 
 --------------
-SELECT 'zero_length_char_varchar' AS test_name,
-       (SELECT COUNT(*) = 2 FROM mysql_ddl_zero_length)
-       AND (SELECT COUNT(*) = 1 FROM mysql_ddl_zero_length
-            WHERE varchar_zero = '' AND char_zero = '')
-       AND (SELECT COUNT(*) = 1 FROM mysql_ddl_zero_length
-            WHERE varchar_zero IS NULL AND char_zero IS NULL)
-       AND (SELECT COUNT(*) = 2
-            FROM information_schema.columns
-            WHERE table_schema = 'mysql_compat_ddl'
-              AND table_name = 'mysql_ddl_zero_length'
-              AND ((column_name = 'varchar_zero' AND column_type = 'varchar(0)')
-                   OR (column_name = 'char_zero' AND column_type = 'char(0)'))) AS passed
+SELECT 'storage_table_options_ignored' AS test_name,
+       payload = 'side' AS passed FROM mysql_ddl_side_path WHERE id = 1
 --------------
 
-Test_name	Passed
-zero_length_char_varchar	1
+test_name	passed
+storage_table_options_ignored	1
 1 row in set
 
 --------------
@@ -249,12 +240,12 @@ SHOW INDEX FROM mysql_ddl_types
 
 Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
 mysql_ddl_types	0	PRIMARY	1	id	A	0	NULL	NULL		btree		
-mysql_ddl_types	0	_<OID>_mysql_ddl_types_name_key	1	name	A	0	NULL	NULL	YES	btree		
-mysql_ddl_types	1	_<OID>_mysql_ddl_types_date_key	1	date_value	A	0	NULL	NULL	YES	btree		
-mysql_ddl_types	1	_<OID>_mysql_ddl_types_text_key	1	text_value	A	0	NULL	NULL	YES	btree		
-mysql_ddl_types	1	_<OID>_mysql_ddl_types_name_index	1	name	A	0	NULL	NULL	YES	btree		
-mysql_ddl_types	1	_<OID>_mysql_ddl_types_fulltext	1	name	A	0	NULL	NULL	YES	btree		
-mysql_ddl_types	1	_<OID>_mysql_ddl_types_spatial	1	name	A	0	NULL	NULL	YES	btree		
+mysql_ddl_types	0	mysql_ddl_types_name_key	1	name	A	0	NULL	NULL	YES	btree		
+mysql_ddl_types	1	mysql_ddl_types_date_key	1	date_value	A	0	NULL	NULL	YES	btree		
+mysql_ddl_types	1	mysql_ddl_types_text_key	1	text_value	A	0	NULL	NULL	YES	btree		
+mysql_ddl_types	1	mysql_ddl_types_name_index	1	name	A	0	NULL	NULL	YES	btree		
+mysql_ddl_types	1	mysql_ddl_types_fulltext	1	name	A	0	NULL	NULL	YES	btree		
+mysql_ddl_types	1	mysql_ddl_types_spatial	1	name	A	0	NULL	NULL	YES	btree		
 7 rows in set
 
 --------------

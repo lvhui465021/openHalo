@@ -50,7 +50,7 @@ $node->init;
 unlink($node->data_dir . '/pg_hba.conf');
 $node->append_conf('pg_hba.conf', "local all all trust");
 $node->append_conf('pg_hba.conf',
-    "host all mysql_compat_test 127.0.0.1/32 md5");
+    "host all test 127.0.0.1/32 md5");
 $node->append_conf('pg_hba.conf', "host all all 127.0.0.1/32 trust");
 $node->start;
 
@@ -65,17 +65,21 @@ sleep 1;
 
 # --- create extension and test user ------------------------------------
 $node->safe_psql('postgres', 'CREATE EXTENSION aux_mysql CASCADE');
+$node->safe_psql('postgres', 'ALTER EXTENSION aux_mysql UPDATE TO "1.2"');
+$node->safe_psql('postgres', 'ALTER EXTENSION aux_mysql UPDATE TO "1.3"');
+$node->safe_psql('postgres', 'ALTER EXTENSION aux_mysql UPDATE TO "1.4"');
+$node->safe_psql('postgres', 'ALTER EXTENSION aux_mysql UPDATE TO "1.5"');
 $node->safe_psql(
     'postgres', q{
 SET password_encryption = 'mysql_native_password';
-CREATE USER mysql_compat_test SUPERUSER PASSWORD 'test';
+CREATE USER test SUPERUSER PASSWORD 'test';
 });
 
 my $pw_check = $node->safe_psql(
     'postgres', q{
 SELECT passwd LIKE 'mysql_native_password:%'
 FROM pg_shadow
-WHERE usename = 'mysql_compat_test';
+WHERE usename = 'test';
 });
 is($pw_check, 't', 'test role uses mysql_native_password');
 
@@ -90,7 +94,7 @@ sub run_mysql {
             $mysql,
             '--no-defaults', '--protocol=TCP',
             '--host=127.0.0.1', "--port=$mysql_port",
-            '--user=mysql_compat_test',
+            '--user=test',
             '--batch', '--raw', '--skip-column-names',
             '--connect-timeout=2', '--execute', $sql
           ], '>', \$stdout, '2>', \$stderr, timeout(15);
@@ -130,7 +134,7 @@ SKIP: {
         local $ENV{MYSQL_BIN}      = $mysql;
         local $ENV{MYSQL_HOST}     = '127.0.0.1';
         local $ENV{MYSQL_PORT}     = $mysql_port;
-        local $ENV{MYSQL_USER}     = 'mysql_compat_test';
+        local $ENV{MYSQL_USER}     = 'test';
         local $ENV{MYSQL_DATABASE} = 'unvdb_mysqldb';
         local $ENV{MYSQL_PWD}      = 'test';
         local $ENV{MYSQL_COMPAT_ACTUAL_DIR}    = $actual_dir;

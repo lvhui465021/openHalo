@@ -91,7 +91,7 @@ WHERE table_schema = 'mysql_compat_ddl_advanced'
   AND table_name = 'mysql_adv_like'
 --------------
 
-Test_name	Passed
+test_name	passed
 create_table_like	1
 1 row in set
 
@@ -129,7 +129,7 @@ SELECT 'alter_column_lifecycle' AS test_name,
 FROM mysql_adv_base
 --------------
 
-Test_name	Passed
+test_name	passed
 alter_column_lifecycle	1
 1 row in set
 
@@ -154,7 +154,7 @@ WHERE schema_name = 'mysql_compat_ddl_advanced'
   AND key_name LIKE '%mysql_adv_index_new'
 --------------
 
-Test_name	Passed
+test_name	passed
 rename_index	1
 1 row in set
 
@@ -173,7 +173,7 @@ WHERE schema_name = 'mysql_compat_ddl_advanced'
   AND key_name LIKE '%mysql_adv_index_new'
 --------------
 
-Test_name	Passed
+test_name	passed
 drop_index	1
 1 row in set
 
@@ -197,7 +197,7 @@ WHERE table_schema = 'mysql_compat_ddl_advanced'
   AND table_name = 'mysql_adv_base'
 --------------
 
-Test_name	Passed
+test_name	passed
 rename_table_forms	1
 1 row in set
 
@@ -245,7 +245,7 @@ WHERE table_schema = 'mysql_compat_ddl_advanced'
   AND column_name = 'note'
 --------------
 
-Test_name	Passed
+test_name	passed
 drop_column	1
 1 row in set
 
