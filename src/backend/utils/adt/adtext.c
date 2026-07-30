@@ -7,7 +7,7 @@
  * or MySQL) based on the active protocol and database mode.  Called once
  * during backend startup.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/utils/adt/adtext.c
  *

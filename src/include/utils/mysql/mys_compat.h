@@ -3,7 +3,7 @@
  * mys_compat.h
  *    MySQL ADT compatibility: compatibility function declarations.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/utils/mysql/mys_compat.h
  *

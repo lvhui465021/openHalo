@@ -8,7 +8,7 @@
  * those values: collapsing MODIFY/CHANGE into AT_AddColumn loses the
  * operation's lifecycle semantics before utility execution.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/nodes/mysql/mys_alttable_enums.h
  *

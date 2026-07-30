@@ -3,7 +3,7 @@
  * mys_parser.h
  *    Declarations for the MySQL-compatibility parser.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/parser/mysql/mys_parser.h
  *

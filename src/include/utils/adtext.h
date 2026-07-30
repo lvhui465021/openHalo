@@ -3,7 +3,7 @@
  * adtext.h
  *    Global ADT Extension instance and initialization.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/utils/adtext.h
  *

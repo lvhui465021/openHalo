@@ -3,7 +3,7 @@
  * mys_parse_agg.c
  *    MySQL-specific aggregate and window function analysis.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/parser/mysql/mys_parse_agg.c
  *

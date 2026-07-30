@@ -4,10 +4,10 @@
  *    Extension API for ADT Data Types.
  *
  * Provides a hook table so that dialect-specific type implementations
- * (MySQL, UDB-TX, etc.) can override the standard PostgreSQL ADT
+ * (MySQL, openHalo, etc.) can override the standard PostgreSQL ADT
  * functions for date, time, timestamp, numeric, and varchar handling.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/utils/adtextapi.h
  *

@@ -1,9 +1,9 @@
 /*
- * mysm_globals.c — Define openHalo globals used by UDB-TX mysm code.
+ * mysm_globals.c — Define openHalo globals used by openHalo mysm code.
  *
  * These globals are populated by the MySQL protocol adapter at runtime.
  * In PG18, the authoritative values are in MysPacketState; these globals
- * exist only for API compatibility with the UDB-TX mysm source.
+ * exist only for API compatibility with the openHalo mysm source.
  */
 #include "postgres.h"
 

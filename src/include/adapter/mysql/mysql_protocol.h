@@ -3,7 +3,7 @@
  * mysql_protocol.h
  *    Declaration for the MySQL ProtocolRoutine registration function.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/adapter/mysql/mysql_protocol.h
  *

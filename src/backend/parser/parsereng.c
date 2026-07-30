@@ -3,7 +3,7 @@
  * parsereng.c
  *    Parser engine selection: standard and MySQL routine singletons.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/parser/parsereng.c
  *

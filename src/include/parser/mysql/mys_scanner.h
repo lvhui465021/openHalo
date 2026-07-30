@@ -7,7 +7,7 @@
  * scanner, layered under mys_yy_extra_type, but has its own flex prefix
  * (mys_core_yy) and keyword list (MysScanKeywords).
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/parser/mysql/mys_scanner.h
  *

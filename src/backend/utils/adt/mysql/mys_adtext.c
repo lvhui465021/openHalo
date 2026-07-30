@@ -3,7 +3,7 @@
  * mys_adtext.c
  *    MySQL ADT compatibility: ADT extension method table for MySQL.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/utils/adt/mysql/mys_adtext.c
  *

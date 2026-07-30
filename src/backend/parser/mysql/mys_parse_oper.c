@@ -3,7 +3,7 @@
  * mys_parse_oper.c
  *    MySQL-specific operator resolution.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/parser/mysql/mys_parse_oper.c
  *

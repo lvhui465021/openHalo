@@ -3,7 +3,7 @@
  * mys_keywords.c
  *    MySQL keyword-list catalog.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * 
  *

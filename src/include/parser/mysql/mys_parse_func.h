@@ -3,7 +3,7 @@
  * mys_parse_func.h
  *    MySQL parser support declarations.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/parser/mysql/mys_parse_func.h
  *

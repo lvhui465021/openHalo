@@ -10,7 +10,7 @@
  *
  * Protocol routine registration is handled in protocol_routine.c.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/adapter/adapter_stub.c
  *

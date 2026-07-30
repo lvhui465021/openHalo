@@ -3,7 +3,7 @@
  * mys_expr_transform.h
  *    Declarations for MySQL-specific expression node lowering.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/parser/mysql/mys_expr_transform.h
  *

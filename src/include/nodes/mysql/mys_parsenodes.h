@@ -10,7 +10,7 @@
  * NodeTag numbers 480--484 are explicitly assigned to avoid colliding
  * with upstream PG18 auto-numbered tags (current boundary: 479).
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/nodes/mysql/mys_parsenodes.h
  *

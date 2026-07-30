@@ -3,7 +3,7 @@
  * parsereng.h
  *    Parser engine selection and initialization.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/parser/parsereng.h
  *

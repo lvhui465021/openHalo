@@ -8,7 +8,7 @@
  * once per backend on first use, then caches in shared memory (global
  * variables) and per-backend hash tables (session variables).
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/adapter/mysql/systemVar.c
  *

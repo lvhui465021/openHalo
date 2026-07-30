@@ -3,7 +3,7 @@
  * mys_kwlist.h
  *    MySQL keyword token assignments.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * 
  *

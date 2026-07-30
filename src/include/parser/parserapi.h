@@ -9,7 +9,7 @@
  * protocol layer (ProtocolRoutine.parser_routine) and stored in
  * ParseState so that sub-queries inherit the same dialect.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/parser/parserapi.h
  *

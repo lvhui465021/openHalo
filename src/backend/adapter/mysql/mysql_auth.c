@@ -18,7 +18,7 @@
  *   N bytes  auth-plugin-data-part-2 (scramble suffix, 12+1 for length=21)
  *   N bytes  auth-plugin name (NUL-terminated), if CLIENT_PLUGIN_AUTH set
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/adapter/mysql/mysql_auth.c
  *

@@ -7,7 +7,7 @@
  * A single const ProtocolRoutine instance is created and registered at
  * _PG_init time so that postmaster startup can resolve it.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/adapter/mysql/mysql_protocol.c
  *

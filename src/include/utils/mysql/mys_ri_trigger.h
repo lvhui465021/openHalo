@@ -3,7 +3,7 @@
  * mys_ri_trigger.h
  *    MySQL ADT compatibility: backtick quoting for RI triggers.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/utils/mysql/mys_ri_trigger.h
  *

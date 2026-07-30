@@ -3,7 +3,7 @@
  * mys_timestamp.h
  *    MySQL ADT compatibility: timestamp parsing declarations.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/utils/mysql/mys_timestamp.h
  *

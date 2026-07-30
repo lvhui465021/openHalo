@@ -7,7 +7,7 @@
  * (PostgreSQL, MySQL, TDS, …) plug into the backend lifecycle at the
  * connection-init, command-I/O, session, and DestReceiver layers.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/postmaster/protocol_routine.h
  *

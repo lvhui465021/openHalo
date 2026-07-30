@@ -3,7 +3,7 @@
  * mys_analyze.c
  *    MySQL-specific semantic analysis: transforms raw parse trees into Query nodes.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/parser/mysql/mys_analyze.c
  *
@@ -761,7 +761,7 @@ mys_transformCallStmt(ParseState *pstate, CallStmt *stmt)
 }
 
 
-/* M3: FindFirstType uses pstate->targettypelist which was a UDB-TX
+/* M3: FindFirstType uses pstate->targettypelist which was a openHalo
  * ParseState extension not present in PG18.  Needs PG18 API review:
  * the standard PG18 transformSetOperationStmt handles type resolution
  * via select_common_type / transformSetOperationTree.  This function

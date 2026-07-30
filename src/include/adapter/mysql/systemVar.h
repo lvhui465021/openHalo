@@ -3,7 +3,7 @@
  * systemVar.h
  *    MySQL adapter systemVar routines
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/adapter/mysql/systemVar.h
  *

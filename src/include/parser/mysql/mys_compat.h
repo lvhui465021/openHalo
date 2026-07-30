@@ -1,10 +1,10 @@
 /*-------------------------------------------------------------------------
  *
  * mys_compat.h
- *    Compatibility declarations for symbols that the UDB-TX analyze code
+ *    Compatibility declarations for symbols that the openHalo analyze code
  *    expects from openHalo headers that are not (yet) present in PG18.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/parser/mysql/mys_compat.h
  *

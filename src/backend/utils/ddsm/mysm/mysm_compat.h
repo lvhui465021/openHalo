@@ -63,7 +63,7 @@ extern Datum numeric_round(PG_FUNCTION_ARGS);
 #endif /* MYSM_COMPAT_H */
 
 /* PG14→PG18: these were public in PG14, now static in like.c/like_match.c.
-   Provide compatible declarations so the original UDB-TX code compiles. */
+   Provide compatible declarations so the original openHalo code compiles. */
 extern int Generic_Text_IC_like(text *str, text *pat, Oid collation);
 extern int MatchText(const char *t, int tlen, const char *p, int plen, pg_locale_t locale);
 extern bool lc_collate_is_c(Oid collation);

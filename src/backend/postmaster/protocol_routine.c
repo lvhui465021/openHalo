@@ -4,7 +4,7 @@
  *    Protocol-routine registry: maps CompatibilityProtocolKind to a
  *    ProtocolRoutine vtable, and provides the per-backend accessor.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/postmaster/protocol_routine.c
  *

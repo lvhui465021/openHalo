@@ -3,7 +3,7 @@
  * mys_execMain.c
  *	  top level executor interface routines for MySQL mode
  *
- * Ported from UDB-TX_MySQL (PG16) and adapted for PG18.
+ * Ported from openHalo_MySQL (PG16) and adapted for PG18.
  * PG18 changes:
  *   - execute_once parameter removed from ExecutorRun
  *   - Delegates to standard_ExecutorStart / standard_ExecutorRun

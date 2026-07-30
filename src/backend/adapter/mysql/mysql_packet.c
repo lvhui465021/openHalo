@@ -4,7 +4,7 @@
  *    MySQL packet-layer I/O: header read/write, sequence tracking,
  *    multi-packet reassembly, and ERR-packet formatting.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/adapter/mysql/mysql_packet.c
  *

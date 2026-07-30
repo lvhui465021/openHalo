@@ -3,7 +3,7 @@
  * mys_parse_utilcmd.c
  *    MySQL-specific utility command analysis: CREATE/ALTER TABLE.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/parser/mysql/mys_parse_utilcmd.c
  *
@@ -1712,7 +1712,7 @@ MysProcessOnUpdateNow(CreateStmtContext *cxt, ColumnDef *colDef)
 
     /*
      * PG18's AlterObjectDependsStmt no longer carries the
-     * referenced-object fields that the old UDB-TX helpers populated.
+     * referenced-object fields that the old openHalo helpers populated.
      * The trigger and function definitions already establish the needed
      * dependencies; skip the AlterObjectDependsStmt nodes.
      */
@@ -1899,7 +1899,7 @@ generateSerialExtraStmts(CreateStmtContext *cxt, ColumnDef *column,
 
     /*
      * PG18's AlterObjectDependsStmt no longer carries the referenced-object
-     * fields that the old UDB-TX helpers populated.  Emitting the partially
+     * fields that the old openHalo helpers populated.  Emitting the partially
      * initialized nodes reaches the generic dependency executor and crashes.
      * The sequence OWNED BY command and the trigger/function definitions
      * already establish the dependencies needed for this generated machinery.

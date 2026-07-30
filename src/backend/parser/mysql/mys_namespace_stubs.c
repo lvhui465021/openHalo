@@ -6,7 +6,7 @@
  * These will be properly migrated from openHalo's catalog/namespace.c
  * and commands/mysql/ modules in a later phase.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/parser/mysql/mys_namespace_stubs.c
  *

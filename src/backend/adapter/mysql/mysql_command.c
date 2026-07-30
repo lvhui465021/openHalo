@@ -12,7 +12,7 @@
  * COM_QUERY and COM_INIT_DB are mapped to PqMsg_Query after prepending
  * appropriate lowering.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/adapter/mysql/mysql_command.c
  *

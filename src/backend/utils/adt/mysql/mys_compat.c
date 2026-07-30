@@ -3,7 +3,7 @@
  * mys_compat.c
  *    MySQL ADT compatibility: compatible functions (repeat, etc.).
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/utils/adt/mysql/mys_compat.c
  *

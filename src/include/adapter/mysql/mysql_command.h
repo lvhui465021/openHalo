@@ -4,7 +4,7 @@
  *    MySQL COM command dispatch for the read-command / process-command
  *    ProtocolRoutine callbacks.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/adapter/mysql/mysql_command.h
  *

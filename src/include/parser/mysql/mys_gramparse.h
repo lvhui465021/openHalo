@@ -7,7 +7,7 @@
  * grammar (mys_gram.y), independent of the PG standard base_yyparser.
  * This header defines the scanner/grammar interface types.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/parser/mysql/mys_gramparse.h
  *

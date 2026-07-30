@@ -51,7 +51,7 @@ anychar_typmodin(ArrayType *ta, const char *typename)
 
 	/*
 	 * MySQL protocol permits CHAR(0) and VARCHAR(0); standard PG mode
-	 * requires at least 1.  (Matches UDB-TX adtext->allow_zero_length.)
+	 * requires at least 1.  (Matches openHalo adtext->allow_zero_length.)
 	 */
 	{
 		const ProtocolRoutine *routine = GetCurrentProtocolRoutine();

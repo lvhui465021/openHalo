@@ -9,7 +9,7 @@
  * Sequence numbers start at 0 for the greeting and increment per-packet
  * on both the client→server and server→client directions independently.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/adapter/mysql/mysql_packet.h
  *

@@ -7,7 +7,7 @@
  * grammar (mys_gram.y) via mys_yyparse(), and returns the raw parse
  * tree.  The ParserRoutine is registered in parsereng.c.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/parser/mysql/mys_parser.c
  *

@@ -7,7 +7,7 @@
  * from mys_kwlist.h.  Each keyword maps to a bison token number defined
  * in the generated mys_gram.h.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/parser/mysql/mys_keywords.h
  *

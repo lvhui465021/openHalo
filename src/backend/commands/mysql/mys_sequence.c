@@ -167,7 +167,7 @@ Datum mys_setval3_oid(Oid seqOid, int64 next, bool isCalled)
 	RelationClose(seqRel);
 }
 
-/* M3 stub: not yet migrated from UDB-TX */
+/* M3 stub: not yet migrated from openHalo */
 Form_pg_sequence_data
 read_seq_tuple(Relation rel, Buffer *buf, HeapTupleData *tuple)
 {

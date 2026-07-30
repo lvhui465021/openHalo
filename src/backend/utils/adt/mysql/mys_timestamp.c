@@ -3,7 +3,7 @@
  * mys_timestamp.c
  *    MySQL ADT compatibility: timestamp parsing and validation.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/backend/utils/adt/mysql/mys_timestamp.c
  *

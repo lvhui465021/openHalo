@@ -5,7 +5,7 @@
  * unlike PostgreSQL's texteq.  This implementation uses PG18's public
  * collation-aware comparison and strips trailing spaces.
  *
- * Adapted from openHalo/UDB-TX bpchar.c:texteq_mys.
+ * Adapted from openHalo/openHalo bpchar.c:texteq_mys.
  */
 #include "postgres.h"
 #include "fmgr.h"

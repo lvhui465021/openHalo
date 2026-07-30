@@ -3,7 +3,7 @@
  * mys_ruleutils.h
  *    MySQL ADT compatibility: backtick identifier quoting.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/utils/mysql/mys_ruleutils.h
  *

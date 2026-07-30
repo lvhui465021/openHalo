@@ -3,7 +3,7 @@
  * mysql_auth.h
  *    MySQL handshake (greeting) and mysql_native_password authentication.
  *
- * Portions Copyright (c) 2026, HaloLab / UDB-TX Contributors
+ * Portions Copyright (c) 2026, HaloLab / openHalo Contributors
  *
  * src/include/adapter/mysql/mysql_auth.h
  *
