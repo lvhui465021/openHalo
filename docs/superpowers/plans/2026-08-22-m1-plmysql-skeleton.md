@@ -638,15 +638,32 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc)
 	YYSTYPE		lval;
 	YYLTYPE		lloc;
 	int			tok;
-	int			depth = 1;		/* the opening BEGIN */
-	int			prev_tok = 0;
+	int			pending = -1;   /* token already lexed but not yet classified */
+	YYLTYPE		pending_loc = 0;
+	int			depth = 1;      /* the opening BEGIN */
 	int			end_loc = -1;
 	char	   *buf = yyextra->core_yy_extra.scanbuf;
 	char	   *body;
 
+	/*
+	 * This loop owns the token stream until the matching END, so it can look
+	 * ahead freely: a token that turns out to belong to the next construct is
+	 * simply carried over in `pending` and classified on the next iteration.
+	 * No pushback into the scanner is needed.
+	 */
 	for (;;)
 	{
-		tok = mys_yylex(&lval, &lloc, yyscanner);
+		if (pending >= 0)
+		{
+			tok = pending;
+			lloc = pending_loc;
+			pending = -1;
+		}
+		else
+		{
+			tok = mys_yylex(&lval, &lloc, yyscanner);
+		}
+
 		if (tok == 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -661,41 +678,57 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc)
 			case REPEAT:
 				depth++;
 				break;
+
 			case IF_P:
-				/*
-				 * Only a statement-position IF opens a block; the IF() function
-				 * call form does not.  A following '(' means the function form.
-				 * We peek by remembering the token and checking the next one.
-				 */
-				depth++;
-				break;
+				{
+					/*
+					 * Statement-position IF opens a block; the IF(a,b,c)
+					 * function-call form does not.  Distinguish by the next
+					 * token: '(' means the function form.
+					 */
+					int		next = mys_yylex(&lval, &lloc, yyscanner);
+
+					if (next != '(')
+						depth++;
+					pending = next;
+					pending_loc = lloc;
+					continue;
+				}
+
 			case END_P:
-				depth--;
-				if (depth == 0)
-					end_loc = lloc;
-				break;
+				{
+					/*
+					 * "END IF" / "END LOOP" / "END CASE" / "END WHILE" /
+					 * "END REPEAT" close one nesting level, and so does a bare
+					 * "END".  Consume the optional trailing keyword here so the
+					 * main switch never sees it as an opener.
+					 */
+					int		close_loc = lloc;
+					int		next = mys_yylex(&lval, &lloc, yyscanner);
+
+					if (next != IF_P && next != LOOP && next != CASE &&
+						next != WHILE && next != REPEAT)
+					{
+						pending = next;
+						pending_loc = lloc;
+					}
+
+					depth--;
+					if (depth == 0)
+					{
+						end_loc = close_loc;
+						goto done;
+					}
+					continue;
+				}
+
 			default:
 				break;
 		}
-
-		if (end_loc >= 0)
-			break;
-
-		/*
-		 * "END IF", "END LOOP", "END CASE", "END WHILE", "END REPEAT" close two
-		 * constructs' worth of tokens but only one nesting level, which the
-		 * END_P case above already accounted for.  Swallow the trailing keyword
-		 * so it is not double-counted as an opener.
-		 */
-		if (prev_tok == END_P &&
-			(tok == IF_P || tok == LOOP || tok == CASE ||
-			 tok == WHILE || tok == REPEAT))
-			depth--;
-
-		prev_tok = tok;
 	}
 
-	/* end_loc is the offset of END; include the keyword itself (3 chars). */
+done:
+	/* end_loc is the offset of the final END; include the keyword itself. */
 	body = palloc(end_loc - body_start_loc + 4);
 	memcpy(body, buf + body_start_loc, end_loc - body_start_loc + 3);
 	body[end_loc - body_start_loc + 3] = '\0';
@@ -704,7 +737,7 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc)
 }
 ```
 
-> **实现者注意**：上面 `IF_P` 的处理有一个已知不精确点——`IF(expr, a, b)` 函数调用形式会被误计为开块。`prev_tok == END_P` 的补偿只处理了闭合侧。实现时需要在 `IF_P` 分支里前瞻一个 token：若下一个是 `'('` 则不增加 `depth`，并把前瞻到的 token 通过 `yyextra->have_lookahead` 机制回退（该机制已存在，见 `mys_gramparse.h:60-66` 的 `have_lookahead`/`lookahead_token`/`lookahead_yylval` 字段）。Step 6 的测试必须覆盖 `IF(1,2,3)` 出现在过程体内的场景。
+> **实现者注意**：`END_P` 分支在 `depth` 归零时通过 `goto done` 跳出，此时可能已经多读了一个 token（`pending`）——这没有问题，因为该 token 属于 `CREATE PROCEDURE` 语句之后的内容（通常是 `;` 或 EOF），主语法不再需要它。若实测发现主语法在 `mysql_routine_body` 归约后仍需要该 token，改为在 `depth == 0` 时不做前瞻。
 
 - [ ] **Step 5: 增加语法产生式**
 
