@@ -129,6 +129,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
 
 import pymysql
@@ -151,6 +152,10 @@ class HaloCluster:
         env = dict(os.environ)
         env["PGHOST"] = self.sockdir
         env["PGPORT"] = str(self.pg_port)
+        # initdb -U halo (in setup()) makes "halo" the only superuser role;
+        # without this, psql/initdb/pg_ctl fall back to the OS user (e.g.
+        # "unvdb"), which is not a role that exists in this cluster.
+        env["PGUSER"] = "halo"
         return subprocess.run(argv, check=True, capture_output=True,
                               text=True, env=env, **kw)
 
@@ -189,19 +194,39 @@ class HaloCluster:
         try:
             self._run([self._bin("pg_ctl"), "-D", self.datadir, "-m",
                        "immediate", "-w", "stop"])
-        except Exception:
-            pass
+        except Exception as e:
+            # Keep teardown best-effort (callers, including the setup()
+            # failure path, must not blow up here) but never fail silently:
+            # an unlogged stuck stop means the next setup()'s unconditional
+            # shutil.rmtree(self.basedir) below can delete the data
+            # directory out from under a still-running postgres.
+            print("warning: teardown: pg_ctl stop failed: %r" % (e,),
+                  file=sys.stderr)
 
-    def psql(self, sql, dbname="postgres"):
+    # Default "halo0root", not "postgres": openHalo's initdb hardcodes the
+    # bootstrap admin database to "halo0root" (src/bin/initdb/initdb.c);
+    # "postgres" does not exist in this cluster, so "fixing" this default
+    # back to "postgres" breaks setup()'s own CREATE EXTENSION call.
+    def psql(self, sql, dbname="halo0root"):
         r = self._run([self._bin("psql"), "-X", "-q", "-A", "-t",
                        "-v", "ON_ERROR_STOP=1", "-d", dbname, "-c", sql])
         return r.stdout
 
-    def mysql(self, dbname="postgres"):
+    # Default None (no database selected), not "postgres": for MySQL-protocol
+    # connections the server always attaches to the real PG database
+    # "halo0root" internally, but separately validates the client-requested
+    # "database" name as a PG *schema* (postinit.c, get_namespace_oid) and
+    # rejects anything that isn't one with MySQL error 1049 "Unknown
+    # database" - "postgres" and even "halo0root" itself both fail that
+    # check. None matches openHalo's own documented bare-connection usage
+    # (`mysql -P 3306 -h 127.0.0.1`, no -D) and skips the check entirely.
+    def mysql(self, dbname=None):
         return pymysql.connect(host="127.0.0.1", port=self.mysql_port,
                                user="halo", database=dbname,
                                autocommit=True, charset="utf8mb4")
 ```
+
+（`_run` 中 `import sys` 需要加入文件顶部的 import 列表，与 `os`/`shutil`/`socket`/`subprocess`/`time`/`pymysql` 并列。）
 
 - [ ] **Step 2: 写测试运行器**
 
@@ -241,7 +266,15 @@ def main():
     tests = sorted(glob.glob(os.path.join(here, "t", "test_*.py")))
 
     cluster = HaloCluster(bindir=bindir, basedir=basedir)
-    cluster.setup()
+    try:
+        cluster.setup()
+    except Exception:
+        # setup() can fail after pg_ctl start already succeeded (e.g. the
+        # CREATE EXTENSION at the end of setup() errors out). Without this,
+        # the postmaster it started leaks and holds mysql_port/pg_port,
+        # breaking every subsequent run until manually killed.
+        cluster.teardown()
+        raise
     failed = []
     try:
         for path in tests:
@@ -273,21 +306,43 @@ if __name__ == "__main__":
 ```makefile
 # src/test/mysql/Makefile
 
+# aux_mysql lives in contrib/ and is not part of the core "make install",
+# so "make check"'s automatic temp-install (see temp-install/checkprep in
+# src/Makefile.global) would otherwise stage a tree without it.
+EXTRA_INSTALL = contrib/aux_mysql
+
 subdir = src/test/mysql
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-PYTHON ?= python3
+# NOTE: plain "PYTHON ?= python3" does not work here: src/Makefile.global
+# unconditionally defines PYTHON (empty, unless configured --with-python),
+# and "?=" only applies to a variable that was never assigned at all, not
+# one that is merely empty. Fall back explicitly when it is blank.
+ifeq ($(PYTHON),)
+PYTHON = python3
+endif
 TESTBASEDIR ?= $(CURDIR)/tmp_check
 
+# Plain "$(bindir)" is wrong here: "check" implicitly depends on
+# Makefile.global's temp-install, which stages a full reinstall under
+# DESTDIR=.../tmp_install, so the real binaries end up nested at
+# tmp_install<abs-configure-prefix>/bin, not tmp_install/bin, and are linked
+# with rpaths for the final (non-nested) prefix. $(with_temp_install) sets
+# PATH/LD_LIBRARY_PATH for that nested tree, and
+# "$(abs_top_builddir)/tmp_install$(bindir)" is the matching bindir to pass
+# run_tests.py; both are the same idiom Makefile.global itself defines
+# with_temp_install for (see also src/interfaces/ecpg/test/Makefile).
 check:
-	$(PYTHON) $(srcdir)/run_tests.py '$(bindir)' '$(TESTBASEDIR)'
+	$(with_temp_install) $(PYTHON) $(srcdir)/run_tests.py '$(abs_top_builddir)/tmp_install$(bindir)' '$(TESTBASEDIR)'
 
 clean distclean maintainer-clean:
 	rm -rf $(TESTBASEDIR)
 
 .PHONY: check
 ```
+
+（Task 1 实施中发现原始三行版本的 Makefile 跑不通 `make check`：`PYTHON ?= python3` 被 `Makefile.global` 无条件定义的空 `PYTHON` 挡住 `?=` 不生效；`$(bindir)` 在 `temp-install` 的 DESTDIR 嵌套布局下指向错误路径；`aux_mysql` 不在核心 `make install` 范围内，需要 `EXTRA_INSTALL` 显式带入临时安装树。上面已是修正后可用的版本。）
 
 创建 `src/test/mysql/t/__init__.py`（内容为空）。
 
@@ -322,6 +377,8 @@ cd /home/unvdb/pg_github/openHalo/src/test/mysql && python3 run_tests.py /home/u
 Expected: `ok - test_000_smoke` 与 `1/1 passed`，退出码 0。
 
 若 `pymysql` 缺失，先 `pip3 install pymysql`。
+
+Task 1 实施验证：`--with-uuid=ossp --with-icu` 在实际环境中直接可用，未触发降级方案。此外 `make check`（在 `src/test/mysql/` 下执行）是等价的替代入口，会自动走 `temp-install` 流程重装一份包含 `contrib/aux_mysql` 的临时安装树后运行同一套测试——不需要手工 `configure && make install`，更接近实际 CI 会跑的命令。
 
 - [ ] **Step 5: Commit**
 
