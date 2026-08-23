@@ -31,7 +31,15 @@ def main():
     tests = sorted(glob.glob(os.path.join(here, "t", "test_*.py")))
 
     cluster = HaloCluster(bindir=bindir, basedir=basedir)
-    cluster.setup()
+    try:
+        cluster.setup()
+    except Exception:
+        # setup() can fail after pg_ctl start already succeeded (e.g. the
+        # CREATE EXTENSION at the end of setup() errors out). Without this,
+        # the postmaster it started leaks and holds mysql_port/pg_port,
+        # breaking every subsequent run until manually killed.
+        cluster.teardown()
+        raise
     failed = []
     try:
         for path in tests:

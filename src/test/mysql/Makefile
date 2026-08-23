@@ -18,6 +18,15 @@ PYTHON = python3
 endif
 TESTBASEDIR ?= $(CURDIR)/tmp_check
 
+# Plain "$(bindir)" is wrong here: "check" implicitly depends on
+# Makefile.global's temp-install, which stages a full reinstall under
+# DESTDIR=.../tmp_install, so the real binaries end up nested at
+# tmp_install<abs-configure-prefix>/bin, not tmp_install/bin, and are linked
+# with rpaths for the final (non-nested) prefix. $(with_temp_install) sets
+# PATH/LD_LIBRARY_PATH for that nested tree, and
+# "$(abs_top_builddir)/tmp_install$(bindir)" is the matching bindir to pass
+# run_tests.py; both are the same idiom Makefile.global itself defines
+# with_temp_install for (see also src/interfaces/ecpg/test/Makefile).
 check:
 	$(with_temp_install) $(PYTHON) $(srcdir)/run_tests.py '$(abs_top_builddir)/tmp_install$(bindir)' '$(TESTBASEDIR)'
 

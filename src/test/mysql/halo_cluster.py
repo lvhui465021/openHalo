@@ -12,6 +12,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
 
 import pymysql
@@ -34,6 +35,9 @@ class HaloCluster:
         env = dict(os.environ)
         env["PGHOST"] = self.sockdir
         env["PGPORT"] = str(self.pg_port)
+        # initdb -U halo (in setup()) makes "halo" the only superuser role;
+        # without this, psql/initdb/pg_ctl fall back to the OS user (e.g.
+        # "unvdb"), which is not a role that exists in this cluster.
         env["PGUSER"] = "halo"
         return subprocess.run(argv, check=True, capture_output=True,
                               text=True, env=env, **kw)
@@ -73,14 +77,32 @@ class HaloCluster:
         try:
             self._run([self._bin("pg_ctl"), "-D", self.datadir, "-m",
                        "immediate", "-w", "stop"])
-        except Exception:
-            pass
+        except Exception as e:
+            # Keep teardown best-effort (callers, including the setup()
+            # failure path, must not blow up here) but never fail silently:
+            # an unlogged stuck stop means the next setup()'s unconditional
+            # shutil.rmtree(self.basedir) below can delete the data
+            # directory out from under a still-running postgres.
+            print("warning: teardown: pg_ctl stop failed: %r" % (e,),
+                  file=sys.stderr)
 
+    # Default "halo0root", not "postgres": openHalo's initdb hardcodes the
+    # bootstrap admin database to "halo0root" (src/bin/initdb/initdb.c);
+    # "postgres" does not exist in this cluster, so "fixing" this default
+    # back to "postgres" breaks setup()'s own CREATE EXTENSION call.
     def psql(self, sql, dbname="halo0root"):
         r = self._run([self._bin("psql"), "-X", "-q", "-A", "-t",
                        "-v", "ON_ERROR_STOP=1", "-d", dbname, "-c", sql])
         return r.stdout
 
+    # Default None (no database selected), not "postgres": for MySQL-protocol
+    # connections the server always attaches to the real PG database
+    # "halo0root" internally, but separately validates the client-requested
+    # "database" name as a PG *schema* (postinit.c, get_namespace_oid) and
+    # rejects anything that isn't one with MySQL error 1049 "Unknown
+    # database" - "postgres" and even "halo0root" itself both fail that
+    # check. None matches openHalo's own documented bare-connection usage
+    # (`mysql -P 3306 -h 127.0.0.1`, no -D) and skips the check entirely.
     def mysql(self, dbname=None):
         return pymysql.connect(host="127.0.0.1", port=self.mysql_port,
                                user="halo", database=dbname,
