@@ -1,0 +1,8 @@
+# plmysql extension
+comment = 'PL/MySQL procedural language for MySQL compatibility mode'
+default_version = '1.0'
+module_pathname = '$libdir/plmysql'
+relocatable = false
+schema = pg_catalog
+superuser = true
+trusted = true
