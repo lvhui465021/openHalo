@@ -108,8 +108,6 @@ static	void			 check_labels(const char *start_label,
 									  int end_location);
 static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 										  int until);
-static	List			*read_raise_options(void);
-static	void			check_raise_parameters(PLMySQL_stmt_raise *stmt);
 
 %}
 
@@ -176,7 +174,6 @@ static	void			check_raise_parameters(PLMySQL_stmt_raise *stmt);
 %type <oid>		decl_collate
 %type <datum>	decl_cursor_args
 %type <list>	decl_cursor_arglist
-%type <nsitem>	decl_aliasitem
 
 %type <expr>	expr_until_semi
 %type <expr>	expr_until_then expr_until_loop opt_expr_until_when
@@ -195,8 +192,8 @@ static	void			check_raise_parameters(PLMySQL_stmt_raise *stmt);
 %type <loop_body>	loop_body
 %type <stmt>	proc_stmt pl_block
 %type <stmt>	stmt_assign stmt_if stmt_loop stmt_while stmt_exit
-%type <stmt>	stmt_return stmt_raise stmt_assert stmt_execsql
-%type <stmt>	stmt_dynexecute stmt_for stmt_perform stmt_call stmt_getdiag
+%type <stmt>	stmt_return stmt_execsql
+%type <stmt>	stmt_dynexecute stmt_for stmt_call stmt_getdiag
 %type <stmt>	stmt_open stmt_fetch stmt_move stmt_close stmt_null
 %type <stmt>	stmt_commit stmt_rollback
 %type <stmt>	stmt_case stmt_foreach_a
@@ -251,11 +248,9 @@ static	void			check_raise_parameters(PLMySQL_stmt_raise *stmt);
  * in the "unreserved_keyword" production below.
  */
 %token <keyword>	K_ABSOLUTE
-%token <keyword>	K_ALIAS
 %token <keyword>	K_ALL
 %token <keyword>	K_AND
 %token <keyword>	K_ARRAY
-%token <keyword>	K_ASSERT
 %token <keyword>	K_BACKWARD
 %token <keyword>	K_BEGIN
 %token <keyword>	K_BY
@@ -267,6 +262,7 @@ static	void			check_raise_parameters(PLMySQL_stmt_raise *stmt);
 %token <keyword>	K_COLUMN
 %token <keyword>	K_COLUMN_NAME
 %token <keyword>	K_COMMIT
+%token <keyword>	K_CONDITION
 %token <keyword>	K_CONSTANT
 %token <keyword>	K_CONSTRAINT
 %token <keyword>	K_CONSTRAINT_NAME
@@ -282,6 +278,7 @@ static	void			check_raise_parameters(PLMySQL_stmt_raise *stmt);
 %token <keyword>	K_DO
 %token <keyword>	K_DUMP
 %token <keyword>	K_ELSE
+%token <keyword>	K_ELSEIF
 %token <keyword>	K_ELSIF
 %token <keyword>	K_END
 %token <keyword>	K_ERRCODE
@@ -296,6 +293,7 @@ static	void			check_raise_parameters(PLMySQL_stmt_raise *stmt);
 %token <keyword>	K_FORWARD
 %token <keyword>	K_FROM
 %token <keyword>	K_GET
+%token <keyword>	K_HANDLER
 %token <keyword>	K_HINT
 %token <keyword>	K_IF
 %token <keyword>	K_IMPORT
@@ -304,7 +302,9 @@ static	void			check_raise_parameters(PLMySQL_stmt_raise *stmt);
 %token <keyword>	K_INSERT
 %token <keyword>	K_INTO
 %token <keyword>	K_IS
+%token <keyword>	K_ITERATE
 %token <keyword>	K_LAST
+%token <keyword>	K_LEAVE
 %token <keyword>	K_LOG
 %token <keyword>	K_LOOP
 %token <keyword>	K_MESSAGE
@@ -318,7 +318,6 @@ static	void			check_raise_parameters(PLMySQL_stmt_raise *stmt);
 %token <keyword>	K_OPEN
 %token <keyword>	K_OPTION
 %token <keyword>	K_OR
-%token <keyword>	K_PERFORM
 %token <keyword>	K_PG_CONTEXT
 %token <keyword>	K_PG_DATATYPE_NAME
 %token <keyword>	K_PG_EXCEPTION_CONTEXT
@@ -327,8 +326,9 @@ static	void			check_raise_parameters(PLMySQL_stmt_raise *stmt);
 %token <keyword>	K_PRINT_STRICT_PARAMS
 %token <keyword>	K_PRIOR
 %token <keyword>	K_QUERY
-%token <keyword>	K_RAISE
 %token <keyword>	K_RELATIVE
+%token <keyword>	K_REPEAT
+%token <keyword>	K_RESIGNAL
 %token <keyword>	K_RETURN
 %token <keyword>	K_RETURNED_SQLSTATE
 %token <keyword>	K_REVERSE
@@ -338,15 +338,18 @@ static	void			check_raise_parameters(PLMySQL_stmt_raise *stmt);
 %token <keyword>	K_SCHEMA
 %token <keyword>	K_SCHEMA_NAME
 %token <keyword>	K_SCROLL
+%token <keyword>	K_SIGNAL
 %token <keyword>	K_SLICE
+%token <keyword>	K_SQLEXCEPTION
 %token <keyword>	K_SQLSTATE
+%token <keyword>	K_SQLWARNING
 %token <keyword>	K_STACKED
-%token <keyword>	K_STRICT
 %token <keyword>	K_TABLE
 %token <keyword>	K_TABLE_NAME
 %token <keyword>	K_THEN
 %token <keyword>	K_TO
 %token <keyword>	K_TYPE
+%token <keyword>	K_UNTIL
 %token <keyword>	K_USE_COLUMN
 %token <keyword>	K_USE_VARIABLE
 %token <keyword>	K_USING
@@ -526,11 +529,6 @@ decl_statement	: decl_varname decl_const decl_datatype decl_collate decl_notnull
 											var->refname),
 									 parser_errposition(@5)));
 					}
-				| decl_varname K_ALIAS K_FOR decl_aliasitem ';'
-					{
-						plmysql_ns_additem($4->itemtype,
-										   $4->itemno, $1.name);
-					}
 				| decl_varname opt_scrollable K_CURSOR
 					{ plmysql_ns_push($1.name, PLMYSQL_LABEL_OTHER); }
 				  decl_cursor_args decl_is_for decl_cursor_query
@@ -659,64 +657,6 @@ decl_cursor_arg : decl_varname decl_datatype
 
 decl_is_for		:	K_IS |		/* Oracle */
 					K_FOR;		/* SQL standard */
-
-decl_aliasitem	: T_WORD
-					{
-						PLMySQL_nsitem *nsi;
-
-						nsi = plmysql_ns_lookup(plmysql_ns_top(), false,
-												$1.ident, NULL, NULL,
-												NULL);
-						if (nsi == NULL)
-							ereport(ERROR,
-									(errcode(ERRCODE_UNDEFINED_OBJECT),
-									 errmsg("variable \"%s\" does not exist",
-											$1.ident),
-									 parser_errposition(@1)));
-						$$ = nsi;
-					}
-				| unreserved_keyword
-					{
-						PLMySQL_nsitem *nsi;
-
-						nsi = plmysql_ns_lookup(plmysql_ns_top(), false,
-												$1, NULL, NULL,
-												NULL);
-						if (nsi == NULL)
-							ereport(ERROR,
-									(errcode(ERRCODE_UNDEFINED_OBJECT),
-									 errmsg("variable \"%s\" does not exist",
-											$1),
-									 parser_errposition(@1)));
-						$$ = nsi;
-					}
-				| T_CWORD
-					{
-						PLMySQL_nsitem *nsi;
-
-						if (list_length($1.idents) == 2)
-							nsi = plmysql_ns_lookup(plmysql_ns_top(), false,
-													strVal(linitial($1.idents)),
-													strVal(lsecond($1.idents)),
-													NULL,
-													NULL);
-						else if (list_length($1.idents) == 3)
-							nsi = plmysql_ns_lookup(plmysql_ns_top(), false,
-													strVal(linitial($1.idents)),
-													strVal(lsecond($1.idents)),
-													strVal(lthird($1.idents)),
-													NULL);
-						else
-							nsi = NULL;
-						if (nsi == NULL)
-							ereport(ERROR,
-									(errcode(ERRCODE_UNDEFINED_OBJECT),
-									 errmsg("variable \"%s\" does not exist",
-											NameListToString($1.idents)),
-									 parser_errposition(@1)));
-						$$ = nsi;
-					}
-				;
 
 decl_varname	: T_WORD
 					{
@@ -870,15 +810,9 @@ proc_stmt		: pl_block ';'
 						{ $$ = $1; }
 				| stmt_return
 						{ $$ = $1; }
-				| stmt_raise
-						{ $$ = $1; }
-				| stmt_assert
-						{ $$ = $1; }
 				| stmt_execsql
 						{ $$ = $1; }
 				| stmt_dynexecute
-						{ $$ = $1; }
-				| stmt_perform
 						{ $$ = $1; }
 				| stmt_call
 						{ $$ = $1; }
@@ -898,42 +832,6 @@ proc_stmt		: pl_block ';'
 						{ $$ = $1; }
 				| stmt_rollback
 						{ $$ = $1; }
-				;
-
-stmt_perform	: K_PERFORM
-					{
-						PLMySQL_stmt_perform *new;
-						int		startloc;
-
-						new = palloc0(sizeof(PLMySQL_stmt_perform));
-						new->cmd_type = PLMYSQL_STMT_PERFORM;
-						new->lineno   = plmysql_location_to_lineno(@1);
-						new->stmtid = ++plmysql_curr_compile->nstatements;
-						plmysql_push_back_token(K_PERFORM);
-
-						/*
-						 * Since PERFORM isn't legal SQL, we have to cheat to
-						 * the extent of substituting "SELECT" for "PERFORM"
-						 * in the parsed text.  It does not seem worth
-						 * inventing a separate parse mode for this one case.
-						 * We can't do syntax-checking until after we make the
-						 * substitution.
-						 */
-						new->expr = read_sql_construct(';', 0, 0, ";",
-													   RAW_PARSE_DEFAULT,
-													   false, false,
-													   &startloc, NULL);
-						/* overwrite "perform" ... */
-						memcpy(new->expr->query, " SELECT", 7);
-						/* left-justify to get rid of the leading space */
-						memmove(new->expr->query, new->expr->query + 1,
-								strlen(new->expr->query));
-						/* offset syntax error position to account for that */
-						check_sql_expr(new->expr->query, new->expr->parseMode,
-									   startloc + 1);
-
-						$$ = (PLMySQL_stmt *)new;
-					}
 				;
 
 stmt_call		: K_CALL
@@ -1805,175 +1703,6 @@ stmt_return		: K_RETURN
 					}
 				;
 
-stmt_raise		: K_RAISE
-					{
-						PLMySQL_stmt_raise		*new;
-						int	tok;
-
-						new = palloc(sizeof(PLMySQL_stmt_raise));
-
-						new->cmd_type	= PLMYSQL_STMT_RAISE;
-						new->lineno		= plmysql_location_to_lineno(@1);
-						new->stmtid		= ++plmysql_curr_compile->nstatements;
-						new->elog_level = ERROR;	/* default */
-						new->condname	= NULL;
-						new->message	= NULL;
-						new->params		= NIL;
-						new->options	= NIL;
-
-						tok = yylex();
-						if (tok == 0)
-							yyerror("unexpected end of function definition");
-
-						/*
-						 * We could have just RAISE, meaning to re-throw
-						 * the current error.
-						 */
-						if (tok != ';')
-						{
-							/*
-							 * First is an optional elog severity level.
-							 */
-							if (tok_is_keyword(tok, &yylval,
-											   K_EXCEPTION, "exception"))
-							{
-								new->elog_level = ERROR;
-								tok = yylex();
-							}
-							else if (tok_is_keyword(tok, &yylval,
-													K_WARNING, "warning"))
-							{
-								new->elog_level = WARNING;
-								tok = yylex();
-							}
-							else if (tok_is_keyword(tok, &yylval,
-													K_NOTICE, "notice"))
-							{
-								new->elog_level = NOTICE;
-								tok = yylex();
-							}
-							else if (tok_is_keyword(tok, &yylval,
-													K_INFO, "info"))
-							{
-								new->elog_level = INFO;
-								tok = yylex();
-							}
-							else if (tok_is_keyword(tok, &yylval,
-													K_LOG, "log"))
-							{
-								new->elog_level = LOG;
-								tok = yylex();
-							}
-							else if (tok_is_keyword(tok, &yylval,
-													K_DEBUG, "debug"))
-							{
-								new->elog_level = DEBUG1;
-								tok = yylex();
-							}
-							if (tok == 0)
-								yyerror("unexpected end of function definition");
-
-							/*
-							 * Next we can have a condition name, or
-							 * equivalently SQLSTATE 'xxxxx', or a string
-							 * literal that is the old-style message format,
-							 * or USING to start the option list immediately.
-							 */
-							if (tok == SCONST)
-							{
-								/* old style message and parameters */
-								new->message = yylval.str;
-								/*
-								 * We expect either a semi-colon, which
-								 * indicates no parameters, or a comma that
-								 * begins the list of parameter expressions,
-								 * or USING to begin the options list.
-								 */
-								tok = yylex();
-								if (tok != ',' && tok != ';' && tok != K_USING)
-									yyerror("syntax error");
-
-								while (tok == ',')
-								{
-									PLMySQL_expr *expr;
-
-									expr = read_sql_construct(',', ';', K_USING,
-															  ", or ; or USING",
-															  RAW_PARSE_PLPGSQL_EXPR,
-															  true, true,
-															  NULL, &tok);
-									new->params = lappend(new->params, expr);
-								}
-							}
-							else if (tok != K_USING)
-							{
-								/* must be condition name or SQLSTATE */
-								if (tok_is_keyword(tok, &yylval,
-												   K_SQLSTATE, "sqlstate"))
-								{
-									/* next token should be a string literal */
-									char   *sqlstatestr;
-
-									if (yylex() != SCONST)
-										yyerror("syntax error");
-									sqlstatestr = yylval.str;
-
-									if (strlen(sqlstatestr) != 5)
-										yyerror("invalid SQLSTATE code");
-									if (strspn(sqlstatestr, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") != 5)
-										yyerror("invalid SQLSTATE code");
-									new->condname = sqlstatestr;
-								}
-								else
-								{
-									if (tok == T_WORD)
-										new->condname = yylval.word.ident;
-									else if (plmysql_token_is_unreserved_keyword(tok))
-										new->condname = pstrdup(yylval.keyword);
-									else
-										yyerror("syntax error");
-									plmysql_recognize_err_condition(new->condname,
-																	false);
-								}
-								tok = yylex();
-								if (tok != ';' && tok != K_USING)
-									yyerror("syntax error");
-							}
-
-							if (tok == K_USING)
-								new->options = read_raise_options();
-						}
-
-						check_raise_parameters(new);
-
-						$$ = (PLMySQL_stmt *)new;
-					}
-				;
-
-stmt_assert		: K_ASSERT
-					{
-						PLMySQL_stmt_assert		*new;
-						int	tok;
-
-						new = palloc(sizeof(PLMySQL_stmt_assert));
-
-						new->cmd_type	= PLMYSQL_STMT_ASSERT;
-						new->lineno		= plmysql_location_to_lineno(@1);
-						new->stmtid		= ++plmysql_curr_compile->nstatements;
-
-						new->cond = read_sql_expression2(',', ';',
-														 ", or ;",
-														 &tok);
-
-						if (tok == ',')
-							new->message = read_sql_expression(';', ";");
-						else
-							new->message = NULL;
-
-						$$ = (PLMySQL_stmt *) new;
-					}
-				;
-
 loop_body		: proc_sect K_END K_LOOP opt_label ';'
 					{
 						$$.stmts = $1;
@@ -2496,10 +2225,8 @@ any_identifier	: T_WORD
 
 unreserved_keyword	:
 				K_ABSOLUTE
-				| K_ALIAS
 				| K_AND
 				| K_ARRAY
-				| K_ASSERT
 				| K_BACKWARD
 				| K_CALL
 				| K_CHAIN
@@ -2545,7 +2272,6 @@ unreserved_keyword	:
 				| K_NOTICE
 				| K_OPEN
 				| K_OPTION
-				| K_PERFORM
 				| K_PG_CONTEXT
 				| K_PG_DATATYPE_NAME
 				| K_PG_EXCEPTION_CONTEXT
@@ -2554,7 +2280,6 @@ unreserved_keyword	:
 				| K_PRINT_STRICT_PARAMS
 				| K_PRIOR
 				| K_QUERY
-				| K_RAISE
 				| K_RELATIVE
 				| K_RETURN
 				| K_RETURNED_SQLSTATE
@@ -2566,7 +2291,9 @@ unreserved_keyword	:
 				| K_SCHEMA_NAME
 				| K_SCROLL
 				| K_SLICE
+				| K_SQLEXCEPTION
 				| K_SQLSTATE
+				| K_SQLWARNING
 				| K_STACKED
 				| K_TABLE
 				| K_TABLE_NAME
@@ -3519,11 +3246,6 @@ read_into_target(PLMySQL_variable **target, bool *strict)
 		*strict = false;
 
 	tok = yylex();
-	if (strict && tok == K_STRICT)
-	{
-		*strict = true;
-		tok = yylex();
-	}
 
 	/*
 	 * Currently, a row or record variable can be the single INTO target,
@@ -3981,104 +3703,6 @@ read_cursor_args(PLMySQL_var *cursor, int until)
 		yyerror("syntax error");
 
 	return expr;
-}
-
-/*
- * Parse RAISE ... USING options
- */
-static List *
-read_raise_options(void)
-{
-	List	   *result = NIL;
-
-	for (;;)
-	{
-		PLMySQL_raise_option *opt;
-		int		tok;
-
-		if ((tok = yylex()) == 0)
-			yyerror("unexpected end of function definition");
-
-		opt = (PLMySQL_raise_option *) palloc(sizeof(PLMySQL_raise_option));
-
-		if (tok_is_keyword(tok, &yylval,
-						   K_ERRCODE, "errcode"))
-			opt->opt_type = PLMYSQL_RAISEOPTION_ERRCODE;
-		else if (tok_is_keyword(tok, &yylval,
-								K_MESSAGE, "message"))
-			opt->opt_type = PLMYSQL_RAISEOPTION_MESSAGE;
-		else if (tok_is_keyword(tok, &yylval,
-								K_DETAIL, "detail"))
-			opt->opt_type = PLMYSQL_RAISEOPTION_DETAIL;
-		else if (tok_is_keyword(tok, &yylval,
-								K_HINT, "hint"))
-			opt->opt_type = PLMYSQL_RAISEOPTION_HINT;
-		else if (tok_is_keyword(tok, &yylval,
-								K_COLUMN, "column"))
-			opt->opt_type = PLMYSQL_RAISEOPTION_COLUMN;
-		else if (tok_is_keyword(tok, &yylval,
-								K_CONSTRAINT, "constraint"))
-			opt->opt_type = PLMYSQL_RAISEOPTION_CONSTRAINT;
-		else if (tok_is_keyword(tok, &yylval,
-								K_DATATYPE, "datatype"))
-			opt->opt_type = PLMYSQL_RAISEOPTION_DATATYPE;
-		else if (tok_is_keyword(tok, &yylval,
-								K_TABLE, "table"))
-			opt->opt_type = PLMYSQL_RAISEOPTION_TABLE;
-		else if (tok_is_keyword(tok, &yylval,
-								K_SCHEMA, "schema"))
-			opt->opt_type = PLMYSQL_RAISEOPTION_SCHEMA;
-		else
-			yyerror("unrecognized RAISE statement option");
-
-		tok = yylex();
-		if (tok != '=' && tok != COLON_EQUALS)
-			yyerror("syntax error, expected \"=\"");
-
-		opt->expr = read_sql_expression2(',', ';', ", or ;", &tok);
-
-		result = lappend(result, opt);
-
-		if (tok == ';')
-			break;
-	}
-
-	return result;
-}
-
-/*
- * Check that the number of parameter placeholders in the message matches the
- * number of parameters passed to it, if a message was given.
- */
-static void
-check_raise_parameters(PLMySQL_stmt_raise *stmt)
-{
-	char	   *cp;
-	int			expected_nparams = 0;
-
-	if (stmt->message == NULL)
-		return;
-
-	for (cp = stmt->message; *cp; cp++)
-	{
-		if (cp[0] == '%')
-		{
-			/* ignore literal % characters */
-			if (cp[1] == '%')
-				cp++;
-			else
-				expected_nparams++;
-		}
-	}
-
-	if (expected_nparams < list_length(stmt->params))
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				errmsg("too many parameters specified for RAISE")));
-	if (expected_nparams > list_length(stmt->params))
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				errmsg("too few parameters specified for RAISE")));
 }
 
 /*
