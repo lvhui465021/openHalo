@@ -24278,34 +24278,12 @@ makeOnClause(Node **expr, JoinExpr *joinExpr)
 
 
 /*
- * mys_keyword_is_function_call
- *
- * MySQL spells two of its block openers with keywords that are also built-in
- * function names: IF(expr,a,b) and REPEAT(str,count).  MySQL's own lexer tells
- * the two apart by adjacency -- a built-in function name must be followed
- * *immediately* by '(', with no whitespace or comment in between; a name
- * followed by whitespace is not a function call.  (That is precisely what the
- * IGNORE_SPACE SQL mode relaxes.)  Reproduce that same test here, so that we
- * classify exactly what MySQL classifies.
- *
- * kw_loc is the scanner offset of the keyword and kw_len its length.
- * next_token must already have been read: the scanner parks a '\0' just past
- * the token it most recently returned and only restores it on the following
- * call, so buf[kw_loc + kw_len] is trustworthy only once the token after the
- * keyword has been fetched.
- */
-static bool
-mys_keyword_is_function_call(const char *buf, int kw_loc, int kw_len,
-							 int next_token)
-{
-	return next_token == '(' && buf[kw_loc + kw_len] == '(';
-}
-
-/*
  * mys_skip_balanced_parens
  *
  * Consume tokens through the ')' matching an already-consumed '(', and return
- * the token that follows it (leaving *lval / *lloc describing that token).
+ * the token that follows it (leaving *lval / *lloc describing that token).  If
+ * top_commas is not NULL, it receives the number of commas seen at the group's
+ * own nesting level, which is how many arguments a call had minus one.
  *
  * What sits between the parentheses is an expression, and an expression cannot
  * leave block nesting unbalanced: a CASE expression carries its own END, and
@@ -24313,9 +24291,11 @@ mys_keyword_is_function_call(const char *buf, int kw_loc, int kw_len,
  * contributes nothing to the depth count and needs no classification.
  */
 static int
-mys_skip_balanced_parens(core_yyscan_t yyscanner, YYSTYPE *lval, YYLTYPE *lloc)
+mys_skip_balanced_parens(core_yyscan_t yyscanner, YYSTYPE *lval, YYLTYPE *lloc,
+						 int *top_commas)
 {
 	int			nesting = 1;
+	int			commas = 0;
 	int			tok;
 
 	for (;;)
@@ -24331,9 +24311,87 @@ mys_skip_balanced_parens(core_yyscan_t yyscanner, YYSTYPE *lval, YYLTYPE *lloc)
 			nesting++;
 		else if (tok == ')' && --nesting == 0)
 			break;
+		else if (tok == ',' && nesting == 1)
+			commas++;
 	}
 
+	if (top_commas != NULL)
+		*top_commas = commas;
+
 	return mys_yylex(lval, lloc, yyscanner);
+}
+
+/*
+ * mys_if_opens_block
+ *
+ * Decide whether an IF token just read from the scanner opens an IF ... END IF
+ * block.  In this grammar IF wears three different hats:
+ *
+ *   1. the block-opening statement, "IF <condition> THEN ... END IF";
+ *   2. the three-argument built-in function, "IF(expr, a, b)";
+ *   3. a DDL clause modifier, "DROP TABLE IF EXISTS t" / "CREATE TABLE IF NOT
+ *      EXISTS t" (there are ~85 such productions in this file).
+ *
+ * Only the first changes block depth.  Whitespace is no help in telling them
+ * apart: unlike the built-in functions that IGNORE_SPACE governs, IF is a
+ * reserved word whose call form is a grammar production, so "IF (1,2,3)" with a
+ * space is the function just as much as "IF(1,2,3)" is.  We therefore decide
+ * from the token stream alone.
+ *
+ * On return, *last_token / *lloc describe the last token consumed here, which
+ * the caller must feed back into the main loop.  Tokens swallowed on the way
+ * (NOT, EXISTS, and the contents of a parenthesised group) are never block
+ * keywords, so dropping them cannot disturb the depth count.
+ */
+static bool
+mys_if_opens_block(core_yyscan_t yyscanner, YYSTYPE *lval, YYLTYPE *lloc,
+				   int *last_token)
+{
+	int			tok = mys_yylex(lval, lloc, yyscanner);
+	bool		opens;
+
+	if (tok == NOT)
+	{
+		tok = mys_yylex(lval, lloc, yyscanner);
+		if (tok == EXISTS)
+		{
+			/*
+			 * "IF NOT EXISTS (SELECT ...) THEN" is a statement whose condition
+			 * is an EXISTS predicate; "CREATE TABLE IF NOT EXISTS t" is the
+			 * clause modifier.  A predicate is followed by its subquery's '(',
+			 * the modifier by the object's name.
+			 */
+			tok = mys_yylex(lval, lloc, yyscanner);
+			opens = (tok == '(');
+		}
+		else
+			opens = true;		/* IF NOT <condition> THEN */
+	}
+	else if (tok == EXISTS)
+	{
+		/* as above, for "IF EXISTS (...)" vs "DROP TABLE IF EXISTS t" */
+		tok = mys_yylex(lval, lloc, yyscanner);
+		opens = (tok == '(');
+	}
+	else if (tok == '(')
+	{
+		int			commas;
+
+		/*
+		 * Either the built-in call "IF(a, b, c)" or a condition that merely
+		 * starts with a parenthesised sub-expression, as in "IF (x = 1) THEN"
+		 * or "IF (SELECT c FROM t) > 0 THEN".  The built-in takes exactly three
+		 * arguments, so two commas at the group's own level identify it; a
+		 * parenthesised condition has none there.
+		 */
+		tok = mys_skip_balanced_parens(yyscanner, lval, lloc, &commas);
+		opens = (commas != 2);
+	}
+	else
+		opens = true;			/* IF <condition> THEN */
+
+	*last_token = tok;
+	return opens;
 }
 
 /*
@@ -24402,33 +24460,10 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 
 			case IF_P:
 				{
-					int			kw_loc = lloc;
-					int			next = mys_yylex(&lval, &lloc, yyscanner);
+					int			next;
 
-					if (mys_keyword_is_function_call(buf, kw_loc, 2, next))
-					{
-						/*
-						 * "IF(" with nothing in between is the built-in
-						 * function -- unless a THEN follows the parenthesised
-						 * group, which makes it the statement form written
-						 * without a space, e.g. "IF(x > 1) THEN".  Skipping the
-						 * group to find out is safe; see the comment on
-						 * mys_skip_balanced_parens.
-						 */
-						next = mys_skip_balanced_parens(yyscanner, &lval, &lloc);
-						if (next == THEN)
-							depth++;
-					}
-					else
-					{
-						/*
-						 * "IF <condition> THEN ... END IF".  Note the condition
-						 * may still start with '(' -- "IF (SELECT c FROM t) > 0
-						 * THEN" -- which is why the adjacency test above, not
-						 * the mere presence of a parenthesis, is what decides.
-						 */
+					if (mys_if_opens_block(yyscanner, &lval, &lloc, &next))
 						depth++;
-					}
 
 					pending = next;
 					pending_loc = lloc;
@@ -24437,16 +24472,16 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 
 			case REPEAT:
 				{
-					int			kw_loc = lloc;
 					int			next = mys_yylex(&lval, &lloc, yyscanner);
 
 					/*
-					 * REPEAT needs no equivalent second chance: its statement
-					 * form is "REPEAT <stmt> ... UNTIL c END REPEAT", which
-					 * never puts a parenthesised group directly after the
-					 * keyword.
+					 * REPEAT needs none of IF's case analysis.  It is never a
+					 * clause modifier, and its statement form is
+					 * "REPEAT <stmt> ... UNTIL c END REPEAT", which never puts a
+					 * parenthesised group right after the keyword -- so a '('
+					 * here means the built-in REPEAT(str, count).
 					 */
-					if (!mys_keyword_is_function_call(buf, kw_loc, 6, next))
+					if (next != '(')
 						depth++;
 
 					pending = next;

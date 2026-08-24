@@ -141,6 +141,96 @@ def run(cluster):
                    "END IF; NULL; END"), \
         "IF (subquery) > 0 THEN miscounted: %r" % src
 
+    # fix round 2 / 发现 A：IF 在这份文法里还是 DDL 子句修饰符（IF EXISTS /
+    # IF NOT EXISTS，全文约 85 处产生式）。它后面不跟 '('，但绝不是开块。
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t002_ifexists",
+         "CREATE PROCEDURE t002_ifexists() "
+         "BEGIN DROP TABLE IF EXISTS t002_tmp; NULL; END")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_ifexists';")
+    src = out.strip()
+    assert src == "BEGIN DROP TABLE IF EXISTS t002_tmp; NULL; END", \
+        "IF EXISTS miscounted as block opener: %r" % src
+
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t002_ifnotexists",
+         "CREATE PROCEDURE t002_ifnotexists() "
+         "BEGIN CREATE TABLE IF NOT EXISTS t002_tmp (c int); NULL; END")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_ifnotexists';")
+    src = out.strip()
+    assert src == "BEGIN CREATE TABLE IF NOT EXISTS t002_tmp (c int); NULL; END", \
+        "IF NOT EXISTS miscounted as block opener: %r" % src
+
+    # …但 IF EXISTS / IF NOT EXISTS 后面跟 '(' 时是 EXISTS 子查询谓词，
+    # 那才是货真价实的语句形式 IF，必须开块。两者不能一刀切。
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t002_ifexistssubq",
+         "CREATE PROCEDURE t002_ifexistssubq() "
+         "BEGIN IF EXISTS (SELECT 1) THEN NULL; END IF; NULL; END")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_ifexistssubq';")
+    src = out.strip()
+    assert src == "BEGIN IF EXISTS (SELECT 1) THEN NULL; END IF; NULL; END", \
+        "IF EXISTS (subquery) THEN lost its block: %r" % src
+
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t002_ifnotexistssubq",
+         "CREATE PROCEDURE t002_ifnotexistssubq() "
+         "BEGIN IF NOT EXISTS (SELECT 1) THEN NULL; END IF; NULL; END")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_ifnotexistssubq';")
+    src = out.strip()
+    assert src == "BEGIN IF NOT EXISTS (SELECT 1) THEN NULL; END IF; NULL; END", \
+        "IF NOT EXISTS (subquery) THEN lost its block: %r" % src
+
+    # IF NOT <cond> THEN：NOT 后面不是 EXISTS，是普通条件，必须开块
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t002_ifnotcond",
+         "CREATE PROCEDURE t002_ifnotcond() "
+         "BEGIN IF NOT (1 = 0) THEN NULL; END IF; NULL; END")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_ifnotcond';")
+    src = out.strip()
+    assert src == "BEGIN IF NOT (1 = 0) THEN NULL; END IF; NULL; END", \
+        "IF NOT <cond> THEN lost its block: %r" % src
+
+    # fix round 2 / 发现 B：IF / REPEAT 是保留字，函数调用形式是文法产生式，
+    # 关键字与 '(' 之间有没有空白根本不是区分信号（IGNORE_SPACE 只管
+    # sql_functions[] 里的符号）。带空格的调用形式必须仍被当成函数调用。
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t002_ifspace",
+         "CREATE PROCEDURE t002_ifspace() BEGIN SELECT IF (1, 2, 3); END")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_ifspace';")
+    src = out.strip()
+    assert src == "BEGIN SELECT IF (1, 2, 3); END", \
+        "spaced IF (a,b,c) miscounted as block opener: %r" % src
+
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t002_repeatspace",
+         "CREATE PROCEDURE t002_repeatspace() BEGIN SELECT REPEAT ('a', 3); END")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_repeatspace';")
+    src = out.strip()
+    assert src == "BEGIN SELECT REPEAT ('a', 3); END", \
+        "spaced REPEAT (s,n) miscounted as block opener: %r" % src
+
+    # 三参数的 IF() 出现在 CASE 表达式的 WHEN 里，后面紧跟 THEN：
+    # 按参数个数（两个顶层逗号）判定，不会被那个 THEN 骗成语句形式。
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t002_casewhenif",
+         "CREATE PROCEDURE t002_casewhenif() "
+         "BEGIN SELECT CASE WHEN IF(1, 1, 0) THEN 'y' ELSE 'n' END; END")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_casewhenif';")
+    src = out.strip()
+    assert src == "BEGIN SELECT CASE WHEN IF(1, 1, 0) THEN 'y' ELSE 'n' END; END", \
+        "IF(a,b,c) before THEN miscounted as block opener: %r" % src
+
+    # 条件由多个括号子表达式拼成，括号组后面不是 THEN，仍必须开块
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t002_ifandparen",
+         "CREATE PROCEDURE t002_ifandparen() "
+         "BEGIN IF (1 = 1) AND (2 = 2) THEN NULL; END IF; NULL; END")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_ifandparen';")
+    src = out.strip()
+    assert src == "BEGIN IF (1 = 1) AND (2 = 2) THEN NULL; END IF; NULL; END", \
+        "IF (a) AND (b) THEN lost its block: %r" % src
+
     # fix round 1 / 发现 2：DECLARE ... HANDLER FOR <condition> <stmt>，handler
     # 后面那条语句是 IF ... END IF。它前面是一个 condition 名（标识符），旧的
     # 「语句起始位置」集合里没有它，会漏算一层，END IF 提前把 depth 归零。
