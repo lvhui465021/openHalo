@@ -24287,6 +24287,31 @@ makeOnClause(Node **expr, JoinExpr *joinExpr)
 
 
 /*
+ * The blocks whose openers mys_capture_routine_body() deliberately does not
+ * count, one slot each in its per-level tally.  Returns -1 for a token that
+ * does not name one of them.
+ */
+#define MYS_UNCOUNTED_KINDS 4
+
+static int
+mys_uncounted_block_kind(int tok)
+{
+	switch (tok)
+	{
+		case IF_P:
+			return 0;
+		case LOOP:
+			return 1;
+		case WHILE:
+			return 2;
+		case REPEAT:
+			return 3;
+		default:
+			return -1;
+	}
+}
+
+/*
  * mys_capture_routine_body
  *
  * See the header comment in mys_gramparse.h.  This is the openHalo analogue of
@@ -24304,9 +24329,33 @@ makeOnClause(Node **expr, JoinExpr *joinExpr)
  * IF(a,b,c) and the clause modifier in "DROP TABLE IF EXISTS t", REPEAT is also
  * REPEAT(str,count), and nothing local to the keyword separates those uses --
  * not the preceding token, not whitespace before '(', not the shape of the
- * parenthesised group.  Their closers, by contrast, are unambiguous: the two
- * token sequence "END IF" or "END REPEAT" can only ever end a block.  So we
- * count what can be recognised and ignore what cannot.
+ * parenthesised group.
+ *
+ * What ignoring those openers does cost is that their closers then have to be
+ * recognised by spelling alone, and the same two tokens can stand next to each
+ * other without any block being closed: a CASE *expression* also ends in a bare
+ * END, and what follows it may happen to be one of those four keywords -- as an
+ * unquoted column alias ("SELECT CASE ... END loop"), or as the LOOP of a
+ * plpgsql loop header whose condition ended in a CASE expression.  Reading that
+ * as a closer loses the CASE's depth release, and the capture then runs to the
+ * end of the input.
+ *
+ * So the loop keeps the one fact that rules such a pairing out: per counted
+ * level, how many IF / LOOP / WHILE / REPEAT tokens have been seen at that
+ * level.  Every genuine opener contributes one, and proper nesting means a
+ * block closed at a level was opened at that same level -- so a zero tally is
+ * proof that no block of that kind is open and that the END is a real bare END,
+ * whereupon the keyword is handed back to the loop as the ordinary token it is.
+ * The tally over-counts freely (function calls, IF EXISTS, aliases all add to
+ * it); over-counting only makes the test more conservative, and the crucial
+ * property is that it never under-counts.
+ *
+ * Note which way that guarantee points: a non-zero tally leaves the closer
+ * reading -- the overwhelmingly common one -- exactly as it was, so the tally
+ * can only turn a provably wrong swallow into a release, never the reverse.
+ * The mirror case it does not resolve is a genuine "END <keyword>" at a level
+ * that also holds an unrelated occurrence of that same keyword; there the
+ * closer reading wins, which is what it should.
  */
 char *
 mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
@@ -24324,10 +24373,14 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 	YYLTYPE		pending_loc = first_token_loc;
 	int			depth = 1;		/* the opening BEGIN */
 	int			end_loc = -1;
+	int		   *seen;			/* seen[depth][kind]: uncounted-block keywords
+								 * seen at each counted nesting level */
+	int			seen_levels = 16;	/* levels seen[] has room for */
 	char	   *buf = yyextra->core_yy_extra.scanbuf;
 	char	   *body;
 
 	MemSet(&pending_lval, 0, sizeof(pending_lval));
+	seen = (int *) palloc0(seen_levels * MYS_UNCOUNTED_KINDS * sizeof(int));
 
 	/*
 	 * This loop owns the token stream until the matching END, so it can look
@@ -24337,6 +24390,8 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 	 */
 	for (;;)
 	{
+		int			kind;
+
 		if (pending >= 0)
 		{
 			tok = pending;
@@ -24351,6 +24406,21 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("unterminated routine body: missing END")));
 
+		kind = mys_uncounted_block_kind(tok);
+		if (kind >= 0)
+		{
+			/*
+			 * This token may open an IF / LOOP / WHILE / REPEAT block at the
+			 * current level -- or be IF(a,b,c), "IF EXISTS", a column alias, or
+			 * the LOOP of a plpgsql loop header.  Telling those apart from the
+			 * tokens around them is precisely what cannot be done reliably, and
+			 * the tally does not need it done: it only has to never miss a real
+			 * opener.
+			 */
+			seen[depth * MYS_UNCOUNTED_KINDS + kind]++;
+			continue;
+		}
+
 		switch (tok)
 		{
 			case BEGIN_P:
@@ -24363,22 +24433,34 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 				 * serves both.
 				 */
 				depth++;
+				if (depth >= seen_levels)
+				{
+					seen_levels *= 2;
+					seen = (int *) repalloc(seen,
+											seen_levels *
+											MYS_UNCOUNTED_KINDS * sizeof(int));
+				}
+				/* the level starts with nothing seen in it */
+				MemSet(&seen[depth * MYS_UNCOUNTED_KINDS], 0,
+					   MYS_UNCOUNTED_KINDS * sizeof(int));
 				break;
 
 			case END_P:
 				{
 					int			this_end_loc = lloc;
 					int			next = mys_yylex(&lval, &lloc, yyscanner);
+					int			next_kind = mys_uncounted_block_kind(next);
 
-					if (next == IF_P || next == LOOP ||
-						next == WHILE || next == REPEAT)
+					if (next_kind >= 0 &&
+						seen[depth * MYS_UNCOUNTED_KINDS + next_kind] > 0)
 					{
 						/*
-						 * "END IF" / "END LOOP" / "END WHILE" / "END REPEAT":
-						 * closes a block whose opener we never counted.  Swallow
-						 * the keyword so the loop cannot see it on its own, and
-						 * leave the depth alone.
+						 * "END IF" / "END LOOP" / "END WHILE" / "END REPEAT",
+						 * with a block of that kind possibly open at this level
+						 * to be closed: an uncounted block closing, so swallow
+						 * the keyword and leave the depth alone.
 						 */
+						seen[depth * MYS_UNCOUNTED_KINDS + next_kind]--;
 						break;
 					}
 
@@ -24387,7 +24469,9 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 						/*
 						 * A bare END, closing a BEGIN block or a CASE
 						 * expression.  Whatever follows is not part of this
-						 * closer, so give it back to the loop.
+						 * closer, so give it back to the loop -- including a
+						 * keyword that only looked like a closer because it sat
+						 * next to this END with no block of its kind open.
 						 */
 						pending = next;
 						pending_lval = lval;

@@ -19,6 +19,39 @@ def _ddl(cluster, *statements):
                 cur.execute(sql)
 
 
+def _expect_unterminated(cluster, cases):
+    """钉住已知局限：这些写法必须以「响亮的报错」失败。
+
+    捕获层的记账保证是单向的（跟踪深度只会 >= 真实深度），所以判不出来时只可能
+    读到输入末尾报 unterminated，不可能提前截断成一段「看起来正常」的过程体。
+    这里把这一点钉死：将来谁把这些用例「修好」，也必须保持失败是响亮的，绝不能
+    变成静默截断。
+    """
+    import pymysql
+
+    cluster.psql("ALTER ROLE halo SET check_function_bodies = off;")
+    try:
+        for i, (tag, body) in enumerate(cases):
+            name = "t002_lim%d" % i
+            try:
+                _ddl(cluster, "CREATE PROCEDURE %s() %s" % (name, body))
+            except pymysql.err.MySQLError as e:
+                assert "unterminated routine body" in str(e), \
+                    "%s: expected a loud 'unterminated routine body', got %r" % (
+                        tag, e)
+            else:
+                out = cluster.psql(
+                    "SELECT prosrc FROM pg_proc WHERE proname='%s';" % name)
+                _ddl(cluster, "DROP PROCEDURE IF EXISTS %s" % name)
+                assert out.strip() == body, \
+                    "%s: silently truncated body: %r" % (tag, out.strip())
+                raise AssertionError(
+                    "%s: now captured correctly -- good, but move it out of the "
+                    "known-limitation list" % tag)
+    finally:
+        cluster.psql("ALTER ROLE halo RESET check_function_bodies;")
+
+
 def _check_bodies(cluster, cases, validate=True):
     """建过程并逐字比对 prosrc。
 
@@ -183,6 +216,167 @@ def run(cluster):
          "BEGIN BEGIN WHILE 1 = 0 DO REPEAT SELECT IF(1, 2, 3); "
          "UNTIL 1 = 1 END REPEAT; END WHILE; END; NULL; END"),
     ], validate=False)
+
+    # ------------- CASE 表达式的裸 END 后面紧跟 IF/LOOP/WHILE/REPEAT（fix round 4）
+    #
+    # "END <关键字>" 这两个 token 的相邻关系并不足以证明它是块的闭合符：CASE 表达式
+    # 也以裸 END 收尾，而它后面完全可以合法地跟这四个关键字之一——最常见的是不带
+    # AS 的列别名（这四个词都在 bare_label_keyword 里）。捕获层靠「本层是否可能有
+    # 该种块开着」来分辨，所以这里对四个关键字 × 多种位置连续取值，而不是只挑一两
+    # 个写法：任何只看相邻 token 的判据必然在其中某一条上暴露。
+    _check_bodies(cluster, [
+        (tag.replace("%s", kw), body.replace("%s", kw))
+        for kw in ("if", "loop", "while", "repeat")
+        for tag, body in [
+            ("alias %s bare",
+             "BEGIN SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END %s; NULL; END"),
+            # AS 形式无歧义，本来就该过；和裸形式放一起才说明差别只在 AS
+            ("alias %s AS form",
+             "BEGIN SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END AS %s; NULL; END"),
+            ("alias %s newline",
+             "BEGIN SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END\n  %s; NULL; END"),
+            # 别名紧挨着过程体自己的 END（后面没有别的语句垫着）
+            ("alias %s last stmt",
+             "BEGIN SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END %s; END"),
+            ("alias %s then FROM",
+             "BEGIN SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END %s FROM t002_t; END"),
+            ("alias %s then comma",
+             "BEGIN SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END %s, 7 AS y; END"),
+            ("alias %s nested CASE",
+             "BEGIN SELECT CASE WHEN 1 = 1 THEN CASE WHEN 2 = 2 THEN 1 ELSE 2 END "
+             "ELSE 3 END %s; END"),
+            ("alias %s in nested BEGIN",
+             "BEGIN BEGIN SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END %s; END; END"),
+            ("alias %s x2",
+             "BEGIN SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END %s; "
+             "SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END %s; END"),
+        ]])
+
+    # 同一层里先有一个同名关键字的其它用法，再出现别名：判定必须按「层」隔离，
+    # 用全局计数会在这两条上翻车（函数调用把配额吃掉，别名就被当成闭合符）。
+    _check_bodies(cluster, [
+        ("IF() then alias if",
+         "BEGIN SELECT IF(1, 2, 3); "
+         "SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END if; END"),
+        ("REPEAT() then alias repeat",
+         "BEGIN SELECT REPEAT('a', 3); "
+         "SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END repeat; END"),
+        ("IF EXISTS then alias if",
+         "BEGIN DROP TABLE IF EXISTS t002_tmp; "
+         "SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END if; END"),
+    ])
+
+    # 别名出现在块里，且块自己的闭合符就在后面：一次误判会连累后面的 END LOOP /
+    # END IF，所以这组同时钉住「别名要放行」和「真闭合符要照旧」。
+    _check_bodies(cluster, [
+        ("alias in LOOP + END LOOP",
+         "BEGIN LOOP SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END loop; LEAVE; "
+         "END LOOP; END"),
+        ("alias in IF + END IF",
+         "BEGIN IF 1 = 1 THEN SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END if; "
+         "END IF; END"),
+        ("alias in WHILE + END WHILE",
+         "BEGIN WHILE 1 = 0 DO IF 1 = 1 THEN "
+         "SELECT CASE WHEN 2 = 2 THEN 1 ELSE 2 END while; END IF; "
+         "END WHILE; NULL; END"),
+        ("alias in REPEAT + END REPEAT",
+         "BEGIN REPEAT SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END repeat; "
+         "UNTIL 1 = 1 END REPEAT; END"),
+        ("alias in labelled BEGIN",
+         "BEGIN lbl: BEGIN SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END loop; "
+         "END lbl; END"),
+    ], validate=False)
+
+    # 本层的计数记的是「可能还开着几个」，不是「一共见过几个」：块闭合掉之后要把
+    # 名额还回去，否则同名关键字当块标签出现在本层的裸 END 后面时又会被吞掉。
+    # （标签与块关键字同名是很别扭的写法——MySQL 里要写成反引号形式——但它是唯一
+    # 能观测到「还名额」这一步的形状，所以留在这里守着。）
+    _check_bodies(cluster, [
+        ("label loop after END LOOP",
+         "BEGIN loop: BEGIN LOOP LEAVE; END LOOP; END loop; NULL; END"),
+        ("label if after END IF",
+         "BEGIN if: BEGIN IF 1 = 1 THEN NULL; END IF; END if; NULL; END"),
+        ("label while after END WHILE",
+         "BEGIN while: BEGIN WHILE 1 = 0 DO NULL; END WHILE; END while; "
+         "NULL; END"),
+        ("label repeat after END REPEAT",
+         "BEGIN repeat: BEGIN REPEAT NULL; UNTIL 1 = 1 END REPEAT; END repeat; "
+         "NULL; END"),
+        ("label loop, no inner LOOP",
+         "BEGIN loop: BEGIN NULL; END loop; NULL; END"),
+    ], validate=False)
+
+    # 反向：真的闭合符所在层里另有同名关键字的无关用法，闭合读法必须照旧胜出。
+    _check_bodies(cluster, [
+        ("IF stmt with IF() inside",
+         "BEGIN IF 1 = 1 THEN SELECT IF(1, 2, 3); END IF; END"),
+        ("IF() before IF stmt",
+         "BEGIN SELECT IF(1, 2, 3); IF 1 = 1 THEN NULL; END IF; END"),
+        ("IF() x3 before IF stmt",
+         "BEGIN SELECT IF(1, 2, 3); SELECT IF(1, 2, 3); SELECT IF(1, 2, 3); "
+         "IF 1 = 1 THEN NULL; END IF; END"),
+        ("IF EXISTS inside IF stmt",
+         "BEGIN IF 1 = 1 THEN DROP TABLE IF EXISTS t002_tmp; END IF; END"),
+        ("REPEAT() before REPEAT blk",
+         "BEGIN SELECT REPEAT('a', 3); REPEAT NULL; UNTIL 1 = 1 END REPEAT; END"),
+        ("END IF x2 sequential",
+         "BEGIN IF 1 = 1 THEN NULL; END IF; IF 2 = 2 THEN NULL; END IF; END"),
+        ("END IF wrapping BEGIN blk",
+         "BEGIN IF 1 = 1 THEN BEGIN NULL; END; END IF; END"),
+        ("END IF wrapping CASE stmt",
+         "BEGIN IF 1 = 1 THEN CASE WHEN 1 = 1 THEN NULL; ELSE NULL; END CASE; "
+         "END IF; END"),
+        ("END IF cond is CASE expr",
+         "BEGIN IF CASE WHEN 1 = 1 THEN true ELSE false END THEN NULL; END IF; END"),
+        ("END REPEAT until CASE expr",
+         "BEGIN REPEAT NULL; UNTIL CASE WHEN 1 = 1 THEN true ELSE false END "
+         "END REPEAT; NULL; END"),
+        ("END WHILE cond CASE expr",
+         "BEGIN WHILE CASE WHEN 1 = 1 THEN false ELSE true END DO NULL; "
+         "END WHILE; END"),
+    ], validate=False)
+
+    # plpgsql 的循环头把条件直接顶在 LOOP 前面，条件又可以是 CASE 表达式，于是
+    # "END LOOP" 两个 token 会在没有任何 LOOP 块打开的地方相邻出现。
+    _check_bodies(cluster, [
+        ("FOR query + CASE expr",
+         "BEGIN FOR r IN SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END LOOP NULL; "
+         "END LOOP; NULL; END"),
+        ("WHILE CASE expr LOOP",
+         "BEGIN WHILE CASE WHEN 1 = 1 THEN false ELSE true END LOOP NULL; "
+         "END LOOP; NULL; END"),
+        ("FOR range + CASE expr",
+         "BEGIN FOR i IN 1..CASE WHEN 1 = 1 THEN 3 ELSE 5 END LOOP NULL; "
+         "END LOOP; NULL; END"),
+        ("FOR range + CASE expr nested",
+         "BEGIN BEGIN FOR i IN 1..CASE WHEN 1 = 1 THEN 3 ELSE 5 END LOOP NULL; "
+         "END LOOP; END; END"),
+    ], validate=False)
+
+    # 每层一份计数，层数不设上限：这条走到 seen[] 的 repalloc 扩容路径
+    _check_bodies(cluster, [
+        ("BEGIN x20",
+         "BEGIN " + "BEGIN " * 20 + "NULL; " + "END; " * 20 + "END"),
+        ("CASE expr x20",
+         "BEGIN SELECT " + "CASE WHEN 1 = 1 THEN " * 20 + "1" +
+         " ELSE 2 END" * 20 + "; END"),
+        ("alias at depth 20",
+         "BEGIN " + "BEGIN " * 20 +
+         "SELECT CASE WHEN 1 = 1 THEN 1 ELSE 2 END loop; " +
+         "END; " * 20 + "END"),
+    ], validate=False)
+
+    # ------------------------------------------------- 已知局限（必须响亮地失败）
+    # 同一个 CASE 表达式内部就有同名关键字的其它用法（这里是 IF()/REPEAT() 调用），
+    # 而它的裸 END 又正好被同名关键字当别名接住。此时本层计数非零，判据只能取
+    # 「闭合符」这一读法。详见 mys_gram.y 里 mys_capture_routine_body 的注释。
+    _expect_unterminated(cluster, [
+        ("IF() inside + alias if",
+         "BEGIN SELECT CASE WHEN 1 = 1 THEN IF(1, 2, 3) ELSE 2 END if; END"),
+        ("REPEAT() inside + alias repeat",
+         "BEGIN SELECT CASE WHEN 1 = 1 THEN REPEAT('a', 3) ELSE 'b' END repeat; "
+         "END"),
+    ])
 
     # ------------------------------------------------------- CREATE FUNCTION 分支
     _ddl(cluster,
