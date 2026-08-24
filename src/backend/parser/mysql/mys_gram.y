@@ -464,6 +464,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 %type <defelt>    create_table_option alter_table_option
 
 %type <node>    opt_routine_body
+%type <str>     mysql_routine_body
 %type <groupclause> group_clause
 %type <node>	opt_publication_for_tables publication_for_tables
 
@@ -11067,7 +11068,52 @@ opt_nulls_order: NULLS_LA FIRST_P			{ $$ = SORTBY_NULLS_FIRST; }
  *****************************************************************************/
 
 CreateFunctionStmt:
-            CREATE opt_or_replace FUNCTION func_name func_args_with_defaults
+			/*
+			 * MySQL spells a routine body as a bare BEGIN ... END block with no
+			 * delimiters and no LANGUAGE clause.  Capture it verbatim and store
+			 * it as a plmysql function; the plmysql compiler parses it later.
+			 */
+			CREATE opt_or_replace FUNCTION func_name func_args_with_defaults
+			RETURNS func_return opt_createfunc_opt_list mysql_routine_body
+				{
+					CreateFunctionStmt *n = makeNode(CreateFunctionStmt);
+					n->is_procedure = false;
+					n->replace = $2;
+					n->funcname = $4;
+					n->parameters = $5;
+					n->returnType = $7;
+					n->options = lappend($8,
+						makeDefElem("language",
+									(Node *) makeString(pstrdup("plmysql")),
+									@9));
+					n->options = lappend(n->options,
+						makeDefElem("as",
+									(Node *) list_make1(makeString($9)),
+									@9));
+					n->sql_body = NULL;
+					$$ = (Node *)n;
+				}
+			| CREATE opt_or_replace PROCEDURE func_name func_args_with_defaults
+			  opt_createfunc_opt_list mysql_routine_body
+				{
+					CreateFunctionStmt *n = makeNode(CreateFunctionStmt);
+					n->is_procedure = true;
+					n->replace = $2;
+					n->funcname = $4;
+					n->parameters = $5;
+					n->returnType = NULL;
+					n->options = lappend($6,
+						makeDefElem("language",
+									(Node *) makeString(pstrdup("plmysql")),
+									@7));
+					n->options = lappend(n->options,
+						makeDefElem("as",
+									(Node *) list_make1(makeString($7)),
+									@7));
+					n->sql_body = NULL;
+					$$ = (Node *)n;
+				}
+			| CREATE opt_or_replace FUNCTION func_name func_args_with_defaults
 			RETURNS func_return opt_createfunc_opt_list opt_routine_body
 				{
 					CreateFunctionStmt *n = makeNode(CreateFunctionStmt);
@@ -11576,6 +11622,40 @@ ReturnStmt:	RETURN a_expr
 					ReturnStmt *r = makeNode(ReturnStmt);
 					r->returnval = (Node *) $2;
 					$$ = (Node *) r;
+				}
+		;
+
+/*
+ * A MySQL routine body: a bare BEGIN ... END block, swallowed as raw text.
+ *
+ * Only the opening BEGIN is a grammar symbol; everything up to and including
+ * the matching END is consumed by mys_capture_routine_body() straight off the
+ * scanner, so none of MySQL's SQL/PSM syntax has to be modelled here.
+ */
+mysql_routine_body:
+			BEGIN_P
+				{
+					int			first_token = -1;
+					int			first_token_loc = 0;
+
+					/*
+					 * To choose between opt_routine_body's "BEGIN ATOMIC ..."
+					 * and this production, bison has already pulled one token
+					 * past BEGIN off the scanner and is holding it as its
+					 * lookahead.  That token is the first token of the body, so
+					 * hand it to the capture routine and clear it: from here
+					 * until the matching END the capture loop, not bison, owns
+					 * the token stream, and bison must re-read afterwards.
+					 */
+					if (yychar != YYEMPTY)
+					{
+						first_token = yychar;
+						first_token_loc = yylloc;
+						yyclearin;
+					}
+
+					$$ = mys_capture_routine_body(yyscanner, @1,
+												  first_token, first_token_loc);
 				}
 		;
 
@@ -24197,3 +24277,163 @@ makeOnClause(Node **expr, JoinExpr *joinExpr)
 
 
 
+/*
+ * mys_stmt_start_token
+ *
+ * Could a new statement begin immediately after the given token?  MySQL spells
+ * two of its block openers with keywords that are also built-in function names
+ * -- IF(expr,a,b) and REPEAT(str,count) -- and the two forms are told apart by
+ * position alone: the statement forms appear where a statement may start, the
+ * function forms only ever inside an expression.
+ *
+ * Note this deliberately answers the weaker question "may a statement start
+ * here", not "does one".  A false positive would over-count block depth and a
+ * false negative would under-count it; either way the capture ends at the wrong
+ * END and the surrounding grammar reports a syntax error, so the failure mode
+ * is loud rather than a silently mangled prosrc.
+ */
+static bool
+mys_stmt_start_token(int tok)
+{
+	switch (tok)
+	{
+		case ';':				/* end of the previous statement */
+		case ':':				/* end of a block label, e.g. "lbl: LOOP" */
+		case BEGIN_P:			/* first statement of a block */
+		case THEN:				/* IF/ELSEIF ... THEN <stmt> */
+		case ELSE:				/* ELSE <stmt> */
+		case DO:				/* WHILE cond DO <stmt> */
+		case LOOP:				/* LOOP <stmt> */
+		case REPEAT:			/* REPEAT <stmt> */
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * mys_capture_routine_body
+ *
+ * See the header comment in mys_gramparse.h.  This is the openHalo analogue of
+ * the technique Babelfish uses for T-SQL routine bodies: rather than teaching
+ * the top-level SQL grammar the whole procedural language, swallow the body as
+ * uninterpreted text and let the plmysql compiler parse it later.
+ */
+char *
+mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
+						 int first_token, int first_token_loc)
+{
+	mys_yy_extra_type *yyextra = mys_yyget_extra(yyscanner);
+	YYSTYPE		lval;
+	YYLTYPE		lloc = body_start_loc;
+	int			tok;
+	int			pending = first_token;	/* token already lexed but not yet
+										 * classified; < 0 means none */
+	YYLTYPE		pending_loc = first_token_loc;
+	int			prev_tok = BEGIN_P;	/* the opening BEGIN */
+	int			depth = 1;		/* the opening BEGIN */
+	int			end_loc = -1;
+	char	   *buf = yyextra->core_yy_extra.scanbuf;
+	char	   *body;
+
+	/*
+	 * This loop owns the token stream until the matching END, so it can look
+	 * ahead freely: a token that turns out to belong to the next construct is
+	 * simply carried over in `pending` and classified on the next iteration.
+	 * No pushback into the scanner is needed.
+	 */
+	for (;;)
+	{
+		if (pending >= 0)
+		{
+			tok = pending;
+			lloc = pending_loc;
+			pending = -1;
+		}
+		else
+			tok = mys_yylex(&lval, &lloc, yyscanner);
+
+		if (tok == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("unterminated routine body: missing END")));
+
+		switch (tok)
+		{
+			case BEGIN_P:
+			case LOOP:
+			case WHILE:
+				depth++;
+				break;
+
+			case CASE:
+
+				/*
+				 * Both MySQL CASE forms are counted: the statement form closes
+				 * with "END CASE" and the expression form with a bare "END", so
+				 * either way exactly one END belongs to this CASE.
+				 */
+				depth++;
+				break;
+
+			case IF_P:
+			case REPEAT:
+
+				/*
+				 * Statement-position IF/REPEAT opens a block; the IF(a,b,c) and
+				 * REPEAT(s,n) function-call forms do not.
+				 */
+				if (mys_stmt_start_token(prev_tok))
+					depth++;
+				break;
+
+			case END_P:
+				if (depth == 1)
+				{
+					/*
+					 * The outermost construct is the routine body's own BEGIN,
+					 * so this END closes it and can carry no "END <keyword>"
+					 * suffix.  Stop without looking ahead, leaving whatever
+					 * follows (typically ';' or end of input) for bison.
+					 */
+					end_loc = lloc;
+					goto done;
+				}
+
+				/*
+				 * "END IF" / "END LOOP" / "END CASE" / "END WHILE" /
+				 * "END REPEAT" close one nesting level, and so does a bare
+				 * "END".  Consume the optional trailing keyword here so the
+				 * main switch never sees it as an opener.
+				 */
+				{
+					int			next = mys_yylex(&lval, &lloc, yyscanner);
+
+					if (next == IF_P || next == LOOP || next == CASE ||
+						next == WHILE || next == REPEAT)
+						tok = next;		/* swallowed as part of this END */
+					else
+					{
+						pending = next;
+						pending_loc = lloc;
+					}
+				}
+
+				depth--;
+				break;
+
+			default:
+				break;
+		}
+
+		prev_tok = tok;
+	}
+
+done:
+	/* end_loc is the offset of the final END; include the keyword itself. */
+	body = palloc(end_loc - body_start_loc + 4);
+	memcpy(body, buf + body_start_loc, end_loc - body_start_loc + 3);
+	body[end_loc - body_start_loc + 3] = '\0';
+
+	return body;
+}

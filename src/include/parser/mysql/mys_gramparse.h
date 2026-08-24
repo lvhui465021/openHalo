@@ -85,6 +85,27 @@ extern int	mys_yylex(YYSTYPE *lvalp, YYLTYPE *llocp,
 #define mys_yyget_extra(yyscanner) (*((mys_yy_extra_type **) (yyscanner)))
 
 extern void mys_parser_init(mys_yy_extra_type *yyext);
+
+/*
+ * Capture the raw text of a MySQL routine body (a bare BEGIN ... END block,
+ * which unlike PostgreSQL's dollar-quoted bodies has no delimiters).  Consumes
+ * tokens from the scanner without interpreting them, tracking nesting of
+ * BEGIN/END, IF/END IF, LOOP/END LOOP, CASE/END CASE, WHILE/END WHILE and
+ * REPEAT/END REPEAT, then returns a palloc'd substring of the original input.
+ *
+ * body_start_loc is the scanner offset of the opening BEGIN token.
+ *
+ * first_token/first_token_loc carry the token bison has already pulled off the
+ * scanner as its lookahead when it reduced the production that calls us (it
+ * needs that lookahead to tell "BEGIN ATOMIC" apart from a bare "BEGIN").  It
+ * is the first token of the body proper; pass first_token < 0 when the caller
+ * holds no such token.
+ */
+extern char *mys_capture_routine_body(core_yyscan_t yyscanner,
+									  int body_start_loc,
+									  int first_token,
+									  int first_token_loc);
+
 extern int	mys_yyparse(core_yyscan_t yyscanner);
 
 #endif							/* MYS_GRAMPARSE_H */
