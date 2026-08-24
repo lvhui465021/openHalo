@@ -89,9 +89,9 @@ extern void mys_parser_init(mys_yy_extra_type *yyext);
 /*
  * Capture the raw text of a MySQL routine body (a bare BEGIN ... END block,
  * which unlike PostgreSQL's dollar-quoted bodies has no delimiters).  Consumes
- * tokens from the scanner without interpreting them, tracking nesting of
- * BEGIN/END, IF/END IF, LOOP/END LOOP, CASE/END CASE, WHILE/END WHILE and
- * REPEAT/END REPEAT, then returns a palloc'd substring of the original input.
+ * tokens from the scanner without interpreting them, tracking block nesting
+ * until the matching END, then returns a palloc'd substring of the original
+ * input.
  *
  * body_start_loc is the scanner offset of the opening BEGIN token.
  *
@@ -100,11 +100,20 @@ extern void mys_parser_init(mys_yy_extra_type *yyext);
  * needs that lookahead to tell "BEGIN ATOMIC" apart from a bare "BEGIN").  It
  * is the first token of the body proper; pass first_token < 0 when the caller
  * holds no such token.
+ *
+ * Symmetrically, locating the final END requires reading one token past it, and
+ * that token belongs to whatever follows the routine body.  When there is one,
+ * it is returned through leftover_token/leftover_lval/leftover_loc so the
+ * caller can reinstate it as the parser's lookahead; leftover_token is left
+ * untouched when the body ran to the end of the input.
  */
 extern char *mys_capture_routine_body(core_yyscan_t yyscanner,
 									  int body_start_loc,
 									  int first_token,
-									  int first_token_loc);
+									  int first_token_loc,
+									  int *leftover_token,
+									  YYSTYPE *leftover_lval,
+									  YYLTYPE *leftover_loc);
 
 extern int	mys_yyparse(core_yyscan_t yyscanner);
 

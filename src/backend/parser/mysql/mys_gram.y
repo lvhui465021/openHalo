@@ -11637,25 +11637,34 @@ mysql_routine_body:
 				{
 					int			first_token = -1;
 					int			first_token_loc = 0;
+					int			leftover = YYEMPTY;
 
 					/*
 					 * To choose between opt_routine_body's "BEGIN ATOMIC ..."
 					 * and this production, bison has already pulled one token
 					 * past BEGIN off the scanner and is holding it as its
 					 * lookahead.  That token is the first token of the body, so
-					 * hand it to the capture routine and clear it: from here
-					 * until the matching END the capture loop, not bison, owns
-					 * the token stream, and bison must re-read afterwards.
+					 * hand it to the capture routine: from here until the
+					 * matching END the capture loop, not bison, owns the token
+					 * stream.
 					 */
 					if (yychar != YYEMPTY)
 					{
 						first_token = yychar;
 						first_token_loc = yylloc;
-						yyclearin;
 					}
 
 					$$ = mys_capture_routine_body(yyscanner, @1,
-												  first_token, first_token_loc);
+												  first_token, first_token_loc,
+												  &leftover, &yylval, &yylloc);
+
+					/*
+					 * Ownership goes back the same way it came: the capture
+					 * had to read one token past the body to find its end, and
+					 * returns it here to serve as bison's lookahead.  Left at
+					 * YYEMPTY, bison simply fetches the next token itself.
+					 */
+					yychar = leftover;
 				}
 		;
 
@@ -24278,133 +24287,32 @@ makeOnClause(Node **expr, JoinExpr *joinExpr)
 
 
 /*
- * mys_skip_balanced_parens
- *
- * Consume tokens through the ')' matching an already-consumed '(', and return
- * the token that follows it (leaving *lval / *lloc describing that token).  If
- * top_commas is not NULL, it receives the number of commas seen at the group's
- * own nesting level, which is how many arguments a call had minus one.
- *
- * What sits between the parentheses is an expression, and an expression cannot
- * leave block nesting unbalanced: a CASE expression carries its own END, and
- * IF()/REPEAT() there are function calls.  The skipped region therefore
- * contributes nothing to the depth count and needs no classification.
- */
-static int
-mys_skip_balanced_parens(core_yyscan_t yyscanner, YYSTYPE *lval, YYLTYPE *lloc,
-						 int *top_commas)
-{
-	int			nesting = 1;
-	int			commas = 0;
-	int			tok;
-
-	for (;;)
-	{
-		tok = mys_yylex(lval, lloc, yyscanner);
-
-		if (tok == 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("unterminated routine body: missing END")));
-
-		if (tok == '(')
-			nesting++;
-		else if (tok == ')' && --nesting == 0)
-			break;
-		else if (tok == ',' && nesting == 1)
-			commas++;
-	}
-
-	if (top_commas != NULL)
-		*top_commas = commas;
-
-	return mys_yylex(lval, lloc, yyscanner);
-}
-
-/*
- * mys_if_opens_block
- *
- * Decide whether an IF token just read from the scanner opens an IF ... END IF
- * block.  In this grammar IF wears three different hats:
- *
- *   1. the block-opening statement, "IF <condition> THEN ... END IF";
- *   2. the three-argument built-in function, "IF(expr, a, b)";
- *   3. a DDL clause modifier, "DROP TABLE IF EXISTS t" / "CREATE TABLE IF NOT
- *      EXISTS t" (there are ~85 such productions in this file).
- *
- * Only the first changes block depth.  Whitespace is no help in telling them
- * apart: unlike the built-in functions that IGNORE_SPACE governs, IF is a
- * reserved word whose call form is a grammar production, so "IF (1,2,3)" with a
- * space is the function just as much as "IF(1,2,3)" is.  We therefore decide
- * from the token stream alone.
- *
- * On return, *last_token / *lloc describe the last token consumed here, which
- * the caller must feed back into the main loop.  Tokens swallowed on the way
- * (NOT, EXISTS, and the contents of a parenthesised group) are never block
- * keywords, so dropping them cannot disturb the depth count.
- */
-static bool
-mys_if_opens_block(core_yyscan_t yyscanner, YYSTYPE *lval, YYLTYPE *lloc,
-				   int *last_token)
-{
-	int			tok = mys_yylex(lval, lloc, yyscanner);
-	bool		opens;
-
-	if (tok == NOT)
-	{
-		tok = mys_yylex(lval, lloc, yyscanner);
-		if (tok == EXISTS)
-		{
-			/*
-			 * "IF NOT EXISTS (SELECT ...) THEN" is a statement whose condition
-			 * is an EXISTS predicate; "CREATE TABLE IF NOT EXISTS t" is the
-			 * clause modifier.  A predicate is followed by its subquery's '(',
-			 * the modifier by the object's name.
-			 */
-			tok = mys_yylex(lval, lloc, yyscanner);
-			opens = (tok == '(');
-		}
-		else
-			opens = true;		/* IF NOT <condition> THEN */
-	}
-	else if (tok == EXISTS)
-	{
-		/* as above, for "IF EXISTS (...)" vs "DROP TABLE IF EXISTS t" */
-		tok = mys_yylex(lval, lloc, yyscanner);
-		opens = (tok == '(');
-	}
-	else if (tok == '(')
-	{
-		int			commas;
-
-		/*
-		 * Either the built-in call "IF(a, b, c)" or a condition that merely
-		 * starts with a parenthesised sub-expression, as in "IF (x = 1) THEN"
-		 * or "IF (SELECT c FROM t) > 0 THEN".  The built-in takes exactly three
-		 * arguments, so two commas at the group's own level identify it; a
-		 * parenthesised condition has none there.
-		 */
-		tok = mys_skip_balanced_parens(yyscanner, lval, lloc, &commas);
-		opens = (commas != 2);
-	}
-	else
-		opens = true;			/* IF <condition> THEN */
-
-	*last_token = tok;
-	return opens;
-}
-
-/*
  * mys_capture_routine_body
  *
  * See the header comment in mys_gramparse.h.  This is the openHalo analogue of
  * the technique Babelfish uses for T-SQL routine bodies: rather than teaching
  * the top-level SQL grammar the whole procedural language, swallow the body as
  * uninterpreted text and let the plmysql compiler parse it later.
+ *
+ * Depth is counted on BEGIN and CASE only, and released on a bare END or on
+ * "END CASE".  Every other block MySQL has -- IF, LOOP, WHILE, REPEAT -- closes
+ * with "END <its own keyword>", so counting neither its opener nor its closer
+ * keeps the books balanced just as well.
+ *
+ * That asymmetry is the whole point.  IF and REPEAT are not reliably
+ * recognisable as block openers: IF is equally the three-argument built-in
+ * IF(a,b,c) and the clause modifier in "DROP TABLE IF EXISTS t", REPEAT is also
+ * REPEAT(str,count), and nothing local to the keyword separates those uses --
+ * not the preceding token, not whitespace before '(', not the shape of the
+ * parenthesised group.  Their closers, by contrast, are unambiguous: the two
+ * token sequence "END IF" or "END REPEAT" can only ever end a block.  So we
+ * count what can be recognised and ignore what cannot.
  */
 char *
 mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
-						 int first_token, int first_token_loc)
+						 int first_token, int first_token_loc,
+						 int *leftover_token, YYSTYPE *leftover_lval,
+						 YYLTYPE *leftover_loc)
 {
 	mys_yy_extra_type *yyextra = mys_yyget_extra(yyscanner);
 	YYSTYPE		lval;
@@ -24412,11 +24320,14 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 	int			tok;
 	int			pending = first_token;	/* token already lexed but not yet
 										 * classified; < 0 means none */
+	YYSTYPE		pending_lval;
 	YYLTYPE		pending_loc = first_token_loc;
 	int			depth = 1;		/* the opening BEGIN */
 	int			end_loc = -1;
 	char	   *buf = yyextra->core_yy_extra.scanbuf;
 	char	   *body;
+
+	MemSet(&pending_lval, 0, sizeof(pending_lval));
 
 	/*
 	 * This loop owns the token stream until the matching END, so it can look
@@ -24443,85 +24354,56 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 		switch (tok)
 		{
 			case BEGIN_P:
-			case LOOP:
-			case WHILE:
-				depth++;
-				break;
-
 			case CASE:
 
 				/*
-				 * Both MySQL CASE forms are counted: the statement form closes
-				 * with "END CASE" and the expression form with a bare "END", so
-				 * either way exactly one END belongs to this CASE.
+				 * A compound statement, or either form of CASE.  The CASE
+				 * statement closes with "END CASE" and the CASE expression with
+				 * a bare END, and both are released below, so one count here
+				 * serves both.
 				 */
 				depth++;
 				break;
 
-			case IF_P:
-				{
-					int			next;
-
-					if (mys_if_opens_block(yyscanner, &lval, &lloc, &next))
-						depth++;
-
-					pending = next;
-					pending_loc = lloc;
-					break;
-				}
-
-			case REPEAT:
-				{
-					int			next = mys_yylex(&lval, &lloc, yyscanner);
-
-					/*
-					 * REPEAT needs none of IF's case analysis.  It is never a
-					 * clause modifier, and its statement form is
-					 * "REPEAT <stmt> ... UNTIL c END REPEAT", which never puts a
-					 * parenthesised group right after the keyword -- so a '('
-					 * here means the built-in REPEAT(str, count).
-					 */
-					if (next != '(')
-						depth++;
-
-					pending = next;
-					pending_loc = lloc;
-					break;
-				}
-
 			case END_P:
-				if (depth == 1)
 				{
-					/*
-					 * The outermost construct is the routine body's own BEGIN,
-					 * so this END closes it and can carry no "END <keyword>"
-					 * suffix.  Stop without looking ahead, leaving whatever
-					 * follows (typically ';' or end of input) for bison.
-					 */
-					end_loc = lloc;
-					goto done;
-				}
-
-				/*
-				 * "END IF" / "END LOOP" / "END CASE" / "END WHILE" /
-				 * "END REPEAT" close one nesting level, and so does a bare
-				 * "END".  Consume the optional trailing keyword here so the
-				 * main switch never sees it as an opener.
-				 */
-				{
+					int			this_end_loc = lloc;
 					int			next = mys_yylex(&lval, &lloc, yyscanner);
 
-					if (next != IF_P && next != LOOP && next != CASE &&
-						next != WHILE && next != REPEAT)
+					if (next == IF_P || next == LOOP ||
+						next == WHILE || next == REPEAT)
 					{
+						/*
+						 * "END IF" / "END LOOP" / "END WHILE" / "END REPEAT":
+						 * closes a block whose opener we never counted.  Swallow
+						 * the keyword so the loop cannot see it on its own, and
+						 * leave the depth alone.
+						 */
+						break;
+					}
+
+					if (next != CASE)
+					{
+						/*
+						 * A bare END, closing a BEGIN block or a CASE
+						 * expression.  Whatever follows is not part of this
+						 * closer, so give it back to the loop.
+						 */
 						pending = next;
+						pending_lval = lval;
 						pending_loc = lloc;
 					}
-					/* otherwise it is swallowed as part of this END */
-				}
+					/* else "END CASE", whose keyword belongs to this closer */
 
-				depth--;
-				break;
+					depth--;
+
+					if (depth == 0)
+					{
+						end_loc = this_end_loc;
+						goto done;
+					}
+					break;
+				}
 
 			default:
 				break;
@@ -24533,6 +24415,19 @@ done:
 	body = palloc(end_loc - body_start_loc + 4);
 	memcpy(body, buf + body_start_loc, end_loc - body_start_loc + 3);
 	body[end_loc - body_start_loc + 3] = '\0';
+
+	/*
+	 * Recognising the final END meant reading the token after it, to be sure it
+	 * was not the "IF" of an "END IF".  That token belongs to whatever follows
+	 * the routine body, so hand it back for the caller to reinstate as the
+	 * parser's lookahead rather than dropping it.
+	 */
+	if (pending >= 0)
+	{
+		*leftover_token = pending;
+		*leftover_lval = pending_lval;
+		*leftover_loc = pending_loc;
+	}
 
 	return body;
 }
