@@ -24278,37 +24278,62 @@ makeOnClause(Node **expr, JoinExpr *joinExpr)
 
 
 /*
- * mys_stmt_start_token
+ * mys_keyword_is_function_call
  *
- * Could a new statement begin immediately after the given token?  MySQL spells
- * two of its block openers with keywords that are also built-in function names
- * -- IF(expr,a,b) and REPEAT(str,count) -- and the two forms are told apart by
- * position alone: the statement forms appear where a statement may start, the
- * function forms only ever inside an expression.
+ * MySQL spells two of its block openers with keywords that are also built-in
+ * function names: IF(expr,a,b) and REPEAT(str,count).  MySQL's own lexer tells
+ * the two apart by adjacency -- a built-in function name must be followed
+ * *immediately* by '(', with no whitespace or comment in between; a name
+ * followed by whitespace is not a function call.  (That is precisely what the
+ * IGNORE_SPACE SQL mode relaxes.)  Reproduce that same test here, so that we
+ * classify exactly what MySQL classifies.
  *
- * Note this deliberately answers the weaker question "may a statement start
- * here", not "does one".  A false positive would over-count block depth and a
- * false negative would under-count it; either way the capture ends at the wrong
- * END and the surrounding grammar reports a syntax error, so the failure mode
- * is loud rather than a silently mangled prosrc.
+ * kw_loc is the scanner offset of the keyword and kw_len its length.
+ * next_token must already have been read: the scanner parks a '\0' just past
+ * the token it most recently returned and only restores it on the following
+ * call, so buf[kw_loc + kw_len] is trustworthy only once the token after the
+ * keyword has been fetched.
  */
 static bool
-mys_stmt_start_token(int tok)
+mys_keyword_is_function_call(const char *buf, int kw_loc, int kw_len,
+							 int next_token)
 {
-	switch (tok)
+	return next_token == '(' && buf[kw_loc + kw_len] == '(';
+}
+
+/*
+ * mys_skip_balanced_parens
+ *
+ * Consume tokens through the ')' matching an already-consumed '(', and return
+ * the token that follows it (leaving *lval / *lloc describing that token).
+ *
+ * What sits between the parentheses is an expression, and an expression cannot
+ * leave block nesting unbalanced: a CASE expression carries its own END, and
+ * IF()/REPEAT() there are function calls.  The skipped region therefore
+ * contributes nothing to the depth count and needs no classification.
+ */
+static int
+mys_skip_balanced_parens(core_yyscan_t yyscanner, YYSTYPE *lval, YYLTYPE *lloc)
+{
+	int			nesting = 1;
+	int			tok;
+
+	for (;;)
 	{
-		case ';':				/* end of the previous statement */
-		case ':':				/* end of a block label, e.g. "lbl: LOOP" */
-		case BEGIN_P:			/* first statement of a block */
-		case THEN:				/* IF/ELSEIF ... THEN <stmt> */
-		case ELSE:				/* ELSE <stmt> */
-		case DO:				/* WHILE cond DO <stmt> */
-		case LOOP:				/* LOOP <stmt> */
-		case REPEAT:			/* REPEAT <stmt> */
-			return true;
-		default:
-			return false;
+		tok = mys_yylex(lval, lloc, yyscanner);
+
+		if (tok == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("unterminated routine body: missing END")));
+
+		if (tok == '(')
+			nesting++;
+		else if (tok == ')' && --nesting == 0)
+			break;
 	}
+
+	return mys_yylex(lval, lloc, yyscanner);
 }
 
 /*
@@ -24330,7 +24355,6 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 	int			pending = first_token;	/* token already lexed but not yet
 										 * classified; < 0 means none */
 	YYLTYPE		pending_loc = first_token_loc;
-	int			prev_tok = BEGIN_P;	/* the opening BEGIN */
 	int			depth = 1;		/* the opening BEGIN */
 	int			end_loc = -1;
 	char	   *buf = yyextra->core_yy_extra.scanbuf;
@@ -24377,15 +24401,58 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 				break;
 
 			case IF_P:
-			case REPEAT:
+				{
+					int			kw_loc = lloc;
+					int			next = mys_yylex(&lval, &lloc, yyscanner);
 
-				/*
-				 * Statement-position IF/REPEAT opens a block; the IF(a,b,c) and
-				 * REPEAT(s,n) function-call forms do not.
-				 */
-				if (mys_stmt_start_token(prev_tok))
-					depth++;
-				break;
+					if (mys_keyword_is_function_call(buf, kw_loc, 2, next))
+					{
+						/*
+						 * "IF(" with nothing in between is the built-in
+						 * function -- unless a THEN follows the parenthesised
+						 * group, which makes it the statement form written
+						 * without a space, e.g. "IF(x > 1) THEN".  Skipping the
+						 * group to find out is safe; see the comment on
+						 * mys_skip_balanced_parens.
+						 */
+						next = mys_skip_balanced_parens(yyscanner, &lval, &lloc);
+						if (next == THEN)
+							depth++;
+					}
+					else
+					{
+						/*
+						 * "IF <condition> THEN ... END IF".  Note the condition
+						 * may still start with '(' -- "IF (SELECT c FROM t) > 0
+						 * THEN" -- which is why the adjacency test above, not
+						 * the mere presence of a parenthesis, is what decides.
+						 */
+						depth++;
+					}
+
+					pending = next;
+					pending_loc = lloc;
+					break;
+				}
+
+			case REPEAT:
+				{
+					int			kw_loc = lloc;
+					int			next = mys_yylex(&lval, &lloc, yyscanner);
+
+					/*
+					 * REPEAT needs no equivalent second chance: its statement
+					 * form is "REPEAT <stmt> ... UNTIL c END REPEAT", which
+					 * never puts a parenthesised group directly after the
+					 * keyword.
+					 */
+					if (!mys_keyword_is_function_call(buf, kw_loc, 6, next))
+						depth++;
+
+					pending = next;
+					pending_loc = lloc;
+					break;
+				}
 
 			case END_P:
 				if (depth == 1)
@@ -24409,14 +24476,13 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 				{
 					int			next = mys_yylex(&lval, &lloc, yyscanner);
 
-					if (next == IF_P || next == LOOP || next == CASE ||
-						next == WHILE || next == REPEAT)
-						tok = next;		/* swallowed as part of this END */
-					else
+					if (next != IF_P && next != LOOP && next != CASE &&
+						next != WHILE && next != REPEAT)
 					{
 						pending = next;
 						pending_loc = lloc;
 					}
+					/* otherwise it is swallowed as part of this END */
 				}
 
 				depth--;
@@ -24425,8 +24491,6 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 			default:
 				break;
 		}
-
-		prev_tok = tok;
 	}
 
 done:

@@ -94,6 +94,76 @@ def run(cluster):
     assert src == ("BEGIN UPDATE t002_t SET c = CASE WHEN 1 = 1 THEN 1 "
                    "ELSE 2 END; NULL; END"), "CASE expression miscounted: %r" % src
 
+    # CASE 表达式的 THEN/ELSE 后面跟的是表达式，不是语句：这里的 IF()/REPEAT()
+    # 仍然是函数调用。（fix round 1 / 发现 1：靠「前一个 token 是不是语句起始位置」
+    # 判定会在这里判错，THEN 后面的 IF( 被当成开块，depth 多算一层，一路吃到
+    # EOF 报 "unterminated routine body: missing END"。）
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t002_casethenif",
+         "CREATE PROCEDURE t002_casethenif() "
+         "BEGIN SELECT CASE WHEN 1 = 1 THEN IF(1, 2, 3) ELSE 0 END; END")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_casethenif';")
+    src = out.strip()
+    assert src == "BEGIN SELECT CASE WHEN 1 = 1 THEN IF(1, 2, 3) ELSE 0 END; END", \
+        "IF() after CASE-expression THEN miscounted: %r" % src
+
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t002_caseelserepeat",
+         "CREATE PROCEDURE t002_caseelserepeat() "
+         "BEGIN SELECT CASE WHEN 1 = 0 THEN 'x' ELSE REPEAT('a', 3) END; END")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_caseelserepeat';")
+    src = out.strip()
+    assert src == ("BEGIN SELECT CASE WHEN 1 = 0 THEN 'x' "
+                   "ELSE REPEAT('a', 3) END; END"), \
+        "REPEAT() after CASE-expression ELSE miscounted: %r" % src
+
+    # 无空格写法的语句形式 IF(cond) THEN：紧邻的 '(' 让它看起来像函数调用，
+    # 但括号组之后跟着 THEN，说明是语句形式。
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t002_ifnospace",
+         "CREATE PROCEDURE t002_ifnospace() "
+         "BEGIN IF(1 = 1) THEN NULL; END IF; NULL; END")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_ifnospace';")
+    src = out.strip()
+    assert src == "BEGIN IF(1 = 1) THEN NULL; END IF; NULL; END", \
+        "IF(cond) THEN misjudged as function call: %r" % src
+
+    # 条件本身以括号子表达式开头的语句形式：IF (SELECT ...) > 0 THEN。
+    # 括号组后面不是 THEN，所以「括号组 + 紧跟 THEN」单独一条规则也不够，
+    # 必须靠 IF 与 '(' 之间有无空白来判定。
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t002_ifparenexpr",
+         "CREATE PROCEDURE t002_ifparenexpr() "
+         "BEGIN IF (SELECT count(*) FROM t002_t) > 0 THEN NULL; END IF; NULL; END")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_ifparenexpr';")
+    src = out.strip()
+    assert src == ("BEGIN IF (SELECT count(*) FROM t002_t) > 0 THEN NULL; "
+                   "END IF; NULL; END"), \
+        "IF (subquery) > 0 THEN miscounted: %r" % src
+
+    # fix round 1 / 发现 2：DECLARE ... HANDLER FOR <condition> <stmt>，handler
+    # 后面那条语句是 IF ... END IF。它前面是一个 condition 名（标识符），旧的
+    # 「语句起始位置」集合里没有它，会漏算一层，END IF 提前把 depth 归零。
+    #
+    # 这个过程体 plmysql（M1 阶段仍等价于 plpgsql）编译不了，所以临时关掉
+    # check_function_bodies —— 本用例要钉的是 mys_gram.y 的原文捕获，不是
+    # plmysql 能不能编译 HANDLER。GUC 走 ALTER ROLE + 新建连接下发：MySQL 协议
+    # 的 SET 不认这个 PG GUC（会报 1292 Unknown system variable）。
+    cluster.psql("ALTER ROLE halo SET check_function_bodies = off;")
+    try:
+        _ddl(cluster,
+             "DROP PROCEDURE IF EXISTS t002_handler",
+             "CREATE PROCEDURE t002_handler() BEGIN "
+             "DECLARE CONTINUE HANDLER FOR SQLEXCEPTION "
+             "IF 1 = 1 THEN NULL; END IF; NULL; END")
+    finally:
+        cluster.psql("ALTER ROLE halo RESET check_function_bodies;")
+    out = cluster.psql("SELECT prosrc FROM pg_proc WHERE proname='t002_handler';")
+    src = out.strip()
+    assert src == ("BEGIN DECLARE CONTINUE HANDLER FOR SQLEXCEPTION "
+                   "IF 1 = 1 THEN NULL; END IF; NULL; END"), \
+        "IF after HANDLER FOR miscounted: %r" % src
+
     # CREATE FUNCTION 分支同样要走捕获路径
     _ddl(cluster,
          "DROP FUNCTION IF EXISTS t002_f",
