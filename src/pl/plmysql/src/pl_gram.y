@@ -166,21 +166,18 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 		PLMySQL_case_when		*casewhen;
 }
 
-%type <declhdr> decl_sect
+%type <declhdr> mysql_decl_sect
 %type <varname> decl_varname
-%type <boolean>	decl_const decl_notnull exit_type
-%type <expr>	decl_defval decl_cursor_query
+%type <list>	decl_varnames
+%type <boolean>	exit_type
+%type <expr>	decl_defval
 %type <dtype>	decl_datatype
-%type <oid>		decl_collate
-%type <datum>	decl_cursor_args
-%type <list>	decl_cursor_arglist
 
 %type <expr>	expr_until_semi
 %type <expr>	expr_until_then expr_until_loop opt_expr_until_when
 %type <expr>	opt_exitcond
 
 %type <var>		cursor_variable
-%type <datum>	decl_cursor_arg
 %type <forvariable>	for_variable
 %type <ival>	foreach_slice
 %type <stmt>	for_control
@@ -191,7 +188,7 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %type <list>	proc_sect stmt_elsifs stmt_else
 %type <loop_body>	loop_body
 %type <stmt>	proc_stmt pl_block
-%type <stmt>	stmt_assign stmt_if stmt_loop stmt_while stmt_exit
+%type <stmt>	stmt_assign stmt_set stmt_if stmt_loop stmt_while stmt_exit
 %type <stmt>	stmt_return stmt_execsql
 %type <stmt>	stmt_dynexecute stmt_for stmt_call stmt_getdiag
 %type <stmt>	stmt_open stmt_fetch stmt_move stmt_close stmt_null
@@ -212,7 +209,6 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %type <datum>	getdiag_target
 %type <ival>	getdiag_item
 
-%type <ival>	opt_scrollable
 %type <fetch>	opt_fetch_direction
 
 %type <ival>	opt_transaction_chain
@@ -338,6 +334,7 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %token <keyword>	K_SCHEMA
 %token <keyword>	K_SCHEMA_NAME
 %token <keyword>	K_SCROLL
+%token <keyword>	K_SET
 %token <keyword>	K_SIGNAL
 %token <keyword>	K_SLICE
 %token <keyword>	K_SQLEXCEPTION
@@ -410,7 +407,41 @@ opt_semi		:
 				| ';'
 				;
 
-pl_block		: decl_sect K_BEGIN proc_sect exception_sect K_END opt_label
+/*
+ * MySQL spells a block as
+ *		[label:] BEGIN [<declarations>] [<statements>] END [label]
+ * with the declarations *inside* the block, right after BEGIN, each one an
+ * ordinary statement of its own.  (PL/pgSQL puts them before BEGIN instead.)
+ *
+ * Three mechanisms inherited from the PL/pgSQL original have to survive this
+ * repositioning; each is called out where it appears below:
+ *
+ *	1. opt_block_label's plmysql_ns_push() pairs with the plmysql_ns_pop()
+ *	   at the end of this rule.  Exactly one push and one pop per pl_block.
+ *	2. plmysql_IdentifierLookup must be IDENTIFIER_LOOKUP_DECLARE while the
+ *	   names being declared are scanned, so that the scanner does not resolve
+ *	   a name that is only now being declared as a reference to some outer
+ *	   variable of the same name, and back to IDENTIFIER_LOOKUP_NORMAL
+ *	   afterwards.  Since each DECLARE is a separate statement here, the
+ *	   toggle is per-DECLARE rather than per-section.
+ *	3. plmysql_add_initdatums(NULL) forgets datums made before this block,
+ *	   and plmysql_add_initdatums(&initvarnos) then collects exactly the
+ *	   datums this block declared, for block-entry initialization.  The two
+ *	   calls must bracket the whole declaration section: the reset lives in
+ *	   a mid-rule action right after K_BEGIN so that it runs exactly once per
+ *	   block whether or not any DECLARE follows, and the collect lives in
+ *	   mysql_decl_sect, which likewise reduces exactly once per block.  (Do
+ *	   not move the reset into mysql_decl_stmt: it would then run once per
+ *	   DECLARE, and each run would drop the variables declared by the
+ *	   preceding DECLAREs of the same block out of initvarnos, leaving them
+ *	   uninitialized at block entry.)
+ */
+pl_block		: opt_block_label K_BEGIN
+					{
+						/* Forget any variables created before this block */
+						plmysql_add_initdatums(NULL);
+					}
+				  mysql_decl_sect proc_sect exception_sect K_END opt_label
 					{
 						PLMySQL_stmt_block *new;
 
@@ -419,13 +450,13 @@ pl_block		: decl_sect K_BEGIN proc_sect exception_sect K_END opt_label
 						new->cmd_type	= PLMYSQL_STMT_BLOCK;
 						new->lineno		= plmysql_location_to_lineno(@2);
 						new->stmtid		= ++plmysql_curr_compile->nstatements;
-						new->label		= $1.label;
-						new->n_initvars = $1.n_initvars;
-						new->initvarnos = $1.initvarnos;
-						new->body		= $3;
-						new->exceptions	= $4;
+						new->label		= $1;
+						new->n_initvars = $4.n_initvars;
+						new->initvarnos = $4.initvarnos;
+						new->body		= $5;
+						new->exceptions	= $6;
 
-						check_labels($1.label, $6, @6);
+						check_labels($1, $8, @8);
 						plmysql_ns_pop();
 
 						$$ = (PLMySQL_stmt *)new;
@@ -433,230 +464,114 @@ pl_block		: decl_sect K_BEGIN proc_sect exception_sect K_END opt_label
 				;
 
 
-decl_sect		: opt_block_label
+mysql_decl_sect	:
 					{
-						/* done with decls, so resume identifier lookup */
-						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
-						$$.label	  = $1;
+						$$.label	  = NULL;
 						$$.n_initvars = 0;
 						$$.initvarnos = NULL;
 					}
-				| opt_block_label decl_start
+				| mysql_decl_stmts
 					{
-						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
-						$$.label	  = $1;
-						$$.n_initvars = 0;
-						$$.initvarnos = NULL;
-					}
-				| opt_block_label decl_start decl_stmts
-					{
-						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
-						$$.label	  = $1;
-						/* Remember variables declared in decl_stmts */
+						$$.label	  = NULL;
+						/* Remember variables declared in mysql_decl_stmts */
 						$$.n_initvars = plmysql_add_initdatums(&($$.initvarnos));
 					}
 				;
 
-decl_start		: K_DECLARE
+mysql_decl_stmts : mysql_decl_stmts mysql_decl_stmt
+				| mysql_decl_stmt
+				;
+
+/*
+ * DECLARE var[, var...] type [DEFAULT expr];
+ *
+ * Unlike PL/pgSQL's declaration syntax, one DECLARE can name several
+ * variables of the same type.
+ */
+mysql_decl_stmt	: K_DECLARE
 					{
-						/* Forget any variables created before block */
-						plmysql_add_initdatums(NULL);
 						/*
-						 * Disable scanner lookup of identifiers while
-						 * we process the decl_stmts
+						 * Disable scanner lookup of identifiers while the
+						 * names being declared, and the type name, are
+						 * scanned.  Bison performs this mid-rule reduction
+						 * as its default action for the state reached by
+						 * shifting K_DECLARE, without reading a lookahead
+						 * token, so the flag is already set when the first
+						 * declared name is scanned.
 						 */
 						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_DECLARE;
 					}
-				;
-
-decl_stmts		: decl_stmts decl_stmt
-				| decl_stmt
-				;
-
-decl_stmt		: decl_statement
-				| K_DECLARE
+				  decl_varnames decl_datatype decl_defval
 					{
-						/* We allow useless extra DECLAREs */
-					}
-				| LESS_LESS any_identifier GREATER_GREATER
-					{
-						/*
-						 * Throw a helpful error if user tries to put block
-						 * label just before BEGIN, instead of before DECLARE.
-						 */
-						ereport(ERROR,
-								(errcode(ERRCODE_SYNTAX_ERROR),
-								 errmsg("block label must be placed before DECLARE, not after"),
-								 parser_errposition(@1)));
-					}
-				;
-
-decl_statement	: decl_varname decl_const decl_datatype decl_collate decl_notnull decl_defval
-					{
-						PLMySQL_variable	*var;
+						ListCell   *lc;
+						int			lineno = plmysql_location_to_lineno(@1);
 
 						/*
-						 * If a collation is supplied, insert it into the
-						 * datatype.  We assume decl_datatype always returns
-						 * a freshly built struct not shared with other
-						 * variables.
+						 * decl_defval has already eaten the terminating
+						 * semicolon (either directly, or via the
+						 * read_sql_expression() that reads the default
+						 * expression), and this reduction is likewise
+						 * bison's default action for its state, so no
+						 * further token has been scanned yet: resuming
+						 * identifier lookup here takes effect before the
+						 * first token of whatever follows is read.
 						 */
-						if (OidIsValid($4))
+						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
+
+						foreach(lc, $3)
 						{
-							if (!OidIsValid($3->collation))
-								ereport(ERROR,
-										(errcode(ERRCODE_DATATYPE_MISMATCH),
-										 errmsg("collations are not supported by type %s",
-												format_type_be($3->typoid)),
-										 parser_errposition(@4)));
-							$3->collation = $4;
+							char			 *name = strVal(lfirst(lc));
+							PLMySQL_variable *var;
+							PLMySQL_type	 *typ;
+
+							/*
+							 * plmysql_build_variable() takes ownership of the
+							 * PLMySQL_type it is handed and may modify it, so
+							 * when one DECLARE names several variables each
+							 * one needs its own copy rather than a shared
+							 * pointer to the struct decl_datatype built.
+							 *
+							 * The default-value expression, in contrast, is
+							 * deliberately shared: PLMySQL_expr is read-only
+							 * once built, and exec_stmt_block() evaluates it
+							 * separately for each variable it initializes.
+							 */
+							typ = palloc(sizeof(PLMySQL_type));
+							memcpy(typ, $4, sizeof(PLMySQL_type));
+
+							var = plmysql_build_variable(name, lineno,
+														 typ, true);
+							var->default_val = $5;
+						}
+					}
+				;
+
+decl_varnames	: decl_varname
+					{
+						$$ = list_make1(makeString($1.name));
+					}
+				| decl_varnames ',' decl_varname
+					{
+						ListCell   *lc;
+
+						/*
+						 * decl_varname rejects a name that is already
+						 * declared in this block, but the variables of this
+						 * DECLARE are not built until the whole statement has
+						 * been reduced, so that check cannot see the names
+						 * listed earlier in this same DECLARE.  Close the gap
+						 * here, so that every name is checked against every
+						 * name preceding it in the block.
+						 */
+						foreach(lc, $1)
+						{
+							if (strcmp(strVal(lfirst(lc)), $3.name) == 0)
+								yyerror("duplicate declaration");
 						}
 
-						var = plmysql_build_variable($1.name, $1.lineno,
-													 $3, true);
-						var->isconst = $2;
-						var->notnull = $5;
-						var->default_val = $6;
-
-						/*
-						 * The combination of NOT NULL without an initializer
-						 * can't work, so let's reject it at compile time.
-						 */
-						if (var->notnull && var->default_val == NULL)
-							ereport(ERROR,
-									(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-									 errmsg("variable \"%s\" must have a default value, since it's declared NOT NULL",
-											var->refname),
-									 parser_errposition(@5)));
-					}
-				| decl_varname opt_scrollable K_CURSOR
-					{ plmysql_ns_push($1.name, PLMYSQL_LABEL_OTHER); }
-				  decl_cursor_args decl_is_for decl_cursor_query
-					{
-						PLMySQL_var *new;
-						PLMySQL_expr *curname_def;
-						char		buf[NAMEDATALEN * 2 + 64];
-						char		*cp1;
-						char		*cp2;
-
-						/* pop local namespace for cursor args */
-						plmysql_ns_pop();
-
-						new = (PLMySQL_var *)
-							plmysql_build_variable($1.name, $1.lineno,
-												   plmysql_build_datatype(REFCURSOROID,
-																		  -1,
-																		  InvalidOid,
-																		  NULL),
-												   true);
-
-						curname_def = palloc0(sizeof(PLMySQL_expr));
-
-						/* Note: refname has been truncated to NAMEDATALEN */
-						cp1 = new->refname;
-						cp2 = buf;
-						/*
-						 * Don't trust standard_conforming_strings here;
-						 * it might change before we use the string.
-						 */
-						if (strchr(cp1, '\\') != NULL)
-							*cp2++ = ESCAPE_STRING_SYNTAX;
-						*cp2++ = '\'';
-						while (*cp1)
-						{
-							if (SQL_STR_DOUBLE(*cp1, true))
-								*cp2++ = *cp1;
-							*cp2++ = *cp1++;
-						}
-						strcpy(cp2, "'::pg_catalog.refcursor");
-						curname_def->query = pstrdup(buf);
-						curname_def->parseMode = RAW_PARSE_PLPGSQL_EXPR;
-						new->default_val = curname_def;
-
-						new->cursor_explicit_expr = $7;
-						if ($5 == NULL)
-							new->cursor_explicit_argrow = -1;
-						else
-							new->cursor_explicit_argrow = $5->dno;
-						new->cursor_options = CURSOR_OPT_FAST_PLAN | $2;
+						$$ = lappend($1, makeString($3.name));
 					}
 				;
-
-opt_scrollable :
-					{
-						$$ = 0;
-					}
-				| K_NO K_SCROLL
-					{
-						$$ = CURSOR_OPT_NO_SCROLL;
-					}
-				| K_SCROLL
-					{
-						$$ = CURSOR_OPT_SCROLL;
-					}
-				;
-
-decl_cursor_query :
-					{
-						$$ = read_sql_stmt();
-					}
-				;
-
-decl_cursor_args :
-					{
-						$$ = NULL;
-					}
-				| '(' decl_cursor_arglist ')'
-					{
-						PLMySQL_row *new;
-						int i;
-						ListCell *l;
-
-						new = palloc0(sizeof(PLMySQL_row));
-						new->dtype = PLMYSQL_DTYPE_ROW;
-						new->refname = "(unnamed row)";
-						new->lineno = plmysql_location_to_lineno(@1);
-						new->rowtupdesc = NULL;
-						new->nfields = list_length($2);
-						new->fieldnames = palloc(new->nfields * sizeof(char *));
-						new->varnos = palloc(new->nfields * sizeof(int));
-
-						i = 0;
-						foreach (l, $2)
-						{
-							PLMySQL_variable *arg = (PLMySQL_variable *) lfirst(l);
-							Assert(!arg->isconst);
-							new->fieldnames[i] = arg->refname;
-							new->varnos[i] = arg->dno;
-							i++;
-						}
-						list_free($2);
-
-						plmysql_adddatum((PLMySQL_datum *) new);
-						$$ = (PLMySQL_datum *) new;
-					}
-				;
-
-decl_cursor_arglist : decl_cursor_arg
-					{
-						$$ = list_make1($1);
-					}
-				| decl_cursor_arglist ',' decl_cursor_arg
-					{
-						$$ = lappend($1, $3);
-					}
-				;
-
-decl_cursor_arg : decl_varname decl_datatype
-					{
-						$$ = (PLMySQL_datum *)
-							plmysql_build_variable($1.name, $1.lineno,
-												   $2, true);
-					}
-				;
-
-decl_is_for		:	K_IS |		/* Oracle */
-					K_FOR;		/* SQL standard */
 
 decl_varname	: T_WORD
 					{
@@ -716,12 +631,6 @@ decl_varname	: T_WORD
 					}
 				;
 
-decl_const		:
-					{ $$ = false; }
-				| K_CONSTANT
-					{ $$ = true; }
-				;
-
 decl_datatype	:
 					{
 						/*
@@ -731,30 +640,6 @@ decl_datatype	:
 						$$ = read_datatype(yychar);
 						yyclearin;
 					}
-				;
-
-decl_collate	:
-					{ $$ = InvalidOid; }
-				| K_COLLATE T_WORD
-					{
-						$$ = get_collation_oid(list_make1(makeString($2.ident)),
-											   false);
-					}
-				| K_COLLATE unreserved_keyword
-					{
-						$$ = get_collation_oid(list_make1(makeString(pstrdup($2))),
-											   false);
-					}
-				| K_COLLATE T_CWORD
-					{
-						$$ = get_collation_oid($2.idents, false);
-					}
-				;
-
-decl_notnull	:
-					{ $$ = false; }
-				| K_NOT K_NULL
-					{ $$ = true; }
 				;
 
 decl_defval		: ';'
@@ -793,6 +678,8 @@ proc_sect		:
 proc_stmt		: pl_block ';'
 						{ $$ = $1; }
 				| stmt_assign
+						{ $$ = $1; }
+				| stmt_set
 						{ $$ = $1; }
 				| stmt_if
 						{ $$ = $1; }
@@ -909,6 +796,68 @@ stmt_assign		: T_DATUM
 													   NULL, NULL);
 
 						$$ = (PLMySQL_stmt *)new;
+					}
+				;
+
+/*
+ * MySQL spells assignment "SET var = expr;".  Everything after the SET is
+ * handled exactly as stmt_assign handles a bare "var := expr;": the target
+ * datum token is pushed back so that read_sql_construct() captures the whole
+ * "var = expr" text and hands it to the core parser in the matching
+ * RAW_PARSE_PLPGSQL_ASSIGNn mode.
+ *
+ * The T_WORD/T_CWORD alternatives exist only to turn "SET notavariable = 1"
+ * into a message naming the offending word, instead of a bare syntax error;
+ * this mirrors what getdiag_target does.
+ *
+ * MySQL also allows "SET a = 1, b = 2;"; that is left for M2.
+ */
+stmt_set		: K_SET T_DATUM
+					{
+						PLMySQL_stmt_assign *new;
+						RawParseMode pmode;
+
+						/* see how many names identify the datum */
+						switch ($2.ident ? 1 : list_length($2.idents))
+						{
+							case 1:
+								pmode = RAW_PARSE_PLPGSQL_ASSIGN1;
+								break;
+							case 2:
+								pmode = RAW_PARSE_PLPGSQL_ASSIGN2;
+								break;
+							case 3:
+								pmode = RAW_PARSE_PLPGSQL_ASSIGN3;
+								break;
+							default:
+								elog(ERROR, "unexpected number of names");
+								pmode = 0; /* keep compiler quiet */
+						}
+
+						check_assignable($2.datum, @2);
+						new = palloc0(sizeof(PLMySQL_stmt_assign));
+						new->cmd_type = PLMYSQL_STMT_ASSIGN;
+						new->lineno   = plmysql_location_to_lineno(@1);
+						new->stmtid = ++plmysql_curr_compile->nstatements;
+						new->varno = $2.datum->dno;
+						/* Push back the head name to include it in the stmt */
+						plmysql_push_back_token(T_DATUM);
+						new->expr = read_sql_construct(';', 0, 0, ";",
+													   pmode,
+													   false, true,
+													   NULL, NULL);
+
+						$$ = (PLMySQL_stmt *)new;
+					}
+				| K_SET T_WORD
+					{
+						/* just to give a better message than "syntax error" */
+						word_is_not_variable(&($2), @2);
+					}
+				| K_SET T_CWORD
+					{
+						/* just to give a better message than "syntax error" */
+						cword_is_not_variable(&($2), @2);
 					}
 				;
 
@@ -1106,7 +1055,7 @@ stmt_elsifs		:
 					{
 						$$ = NIL;
 					}
-				| stmt_elsifs K_ELSIF expr_until_then proc_sect
+				| stmt_elsifs elseif_key expr_until_then proc_sect
 					{
 						PLMySQL_if_elsif *new;
 
@@ -1117,6 +1066,17 @@ stmt_elsifs		:
 
 						$$ = lappend($1, new);
 					}
+				;
+
+/*
+ * MySQL spells this ELSEIF.  Task 4 moved "elseif" into the reserved keyword
+ * table as K_ELSEIF, where the core scanner resolves it before the (still
+ * present) unreserved "elsif"/"elseif" -> K_ELSIF entries are consulted, so
+ * the inherited K_ELSIF production alone no longer accepts MySQL's spelling.
+ * Accept both: K_ELSIF is what "elsif" still lexes to.
+ */
+elseif_key		: K_ELSEIF
+				| K_ELSIF
 				;
 
 stmt_else		:
