@@ -20,7 +20,9 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
+#include "libpq/libpq-be.h"
 #include "miscadmin.h"
+#include "nodes/nodes.h"
 #include "plmysql.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -228,6 +230,23 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 	ResourceOwner procedure_resowner;
 	volatile Datum retval = (Datum) 0;
 	int			rc;
+
+	/*
+	 * plmysql routines carry MySQL dialect semantics that only hold when the
+	 * MySQL parser and executor engines are active, which InitParserEngine()
+	 * and InitExecutorEngine() only select for MySQL-protocol sessions.  Refuse
+	 * to run rather than silently misinterpret the body.
+	 *
+	 * The validator deliberately does NOT perform this check: pg_restore and
+	 * logical replication replay DDL over the PostgreSQL protocol, and blocking
+	 * creation there would break backup/restore.
+	 */
+	if (MyProcPort == NULL ||
+		nodeTag(MyProcPort->protocol_handler) != T_MySQLProtocol)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("plmysql routines can only be executed over the MySQL protocol"),
+				 errhint("Connect to the MySQL listener port instead of the PostgreSQL port.")));
 
 	nonatomic = fcinfo->context &&
 		IsA(fcinfo->context, CallContext) &&
