@@ -59,6 +59,7 @@ case MYSQL_COMPAT_MODE:
 | `src/test/mysql/t/test_002_routine_body_capture.py` | Task 3 的测试 |
 | `src/test/mysql/t/test_003_declare_set.py` | Task 4/5 的测试 |
 | `src/test/mysql/t/test_004_protocol_scope.py` | Task 6 的测试 |
+| `src/test/mysql/t/test_005_auto_increment.py` | M1 收尾补的 AUTO_INCREMENT 自动化回归测试（原本只手动验证过一次） |
 | `src/test/mysql/Makefile` | `make check` 入口 |
 
 **新建目录 `src/pl/plmysql/`** — MySQL 过程语言（克隆自 `src/pl/plpgsql/`）
@@ -593,7 +594,7 @@ git commit -m "feat(plmysql): clone plpgsql into plmysql procedural language ske
 ### Task 3: mys_gram.y 过程体原文捕获
 
 **Files:**
-- Modify: `src/backend/parser/mysql/mys_gram.y`（`CreateFunctionStmt` 产生式区，约 11070-11169 行；`mysql_routine_body`/`opt_routine_body` 区，约 11628-11700 行；文件末尾 C 代码区的 `mys_capture_routine_body` 及其辅助函数，约 24289-24517 行）
+- Modify: `src/backend/parser/mysql/mys_gram.y`（`CreateFunctionStmt` 产生式区，约 11070-11169 行；`mysql_routine_body`/`opt_routine_body` 区，约 11628-11700 行；文件末尾 C 代码区的 `mys_capture_routine_body` 及其辅助函数，约 24289-24572 行）
 - Modify: `src/include/parser/mysql/mys_gramparse.h`
 - Test: `src/test/mysql/t/test_002_routine_body_capture.py`
 
@@ -884,7 +885,7 @@ done:
 }
 ```
 
-（完整实现见 `src/backend/parser/mysql/mys_gram.y` 约 24289-24517 行，含更详细的行内注释；上面已略去部分逐行讲解性注释，核心逻辑与真实代码一致。）
+（完整实现见 `src/backend/parser/mysql/mys_gram.y` 约 24289-24572 行，含更详细的行内注释；上面已略去部分逐行讲解性注释，核心逻辑与真实代码一致。另外真实代码里 `seen` 数组的 `repalloc` 扩容路径会把新增出来的那一半清零（defense-in-depth，不是必需但省得留一个没断言过的隐含前提），上面的代码块为了篇幅省略了这一行，不影响正确性。）
 
 - [ ] **Step 5: 增加语法产生式**
 
@@ -1644,12 +1645,12 @@ git commit -m "feat(plmysql): reject routine execution outside MySQL protocol se
 
 ## M1 完成标准
 
-- `make check -C src/test/mysql` 全绿（5 个测试文件）
+- `make check -C src/test/mysql` 全绿（6 个测试文件，含 M1 收尾补的 `test_005_auto_increment.py`）
 - MySQL 协议下 `CREATE FUNCTION f() RETURNS INT BEGIN DECLARE v INT DEFAULT 1; SET v = v + 41; RETURN v; END;` + `SELECT f()` 返回 42（存储过程内裸 `SELECT` 回传结果集是 M5 能力，M1 不支持，须响亮报错——见 Task 5 的 `_known_limitation_bare_select`）
 - 对标 spec §M1 的四项语法可用：`DECLARE`（含一条声明多变量）、`SET` 赋值、`IF/ELSEIF/ELSE/END IF`、`RETURN`（存储函数）
 - `pg_proc.prolang` 指向 `plmysql`，`prosrc` 存原始过程体文本（含 `BEGIN`/`END`）
 - 嵌套 `BEGIN...END` 与 `IF(a,b,c)` 函数调用形式均不导致过程体截断
-- PostgreSQL 协议下调用 plmysql 例程报错，但创建成功（`pg_restore` 链路可用）
+- PostgreSQL 协议下调用 plmysql 例程报错，但创建成功——`pg_restore`/逻辑复制回放 DDL 不会被协议保护拦下。**限定**：这只保证创建语句本身能过，不保证过程体一定能通过校验器的语法检查——`plmysql_validator` 在 `check_function_bodies` 开启时仍会用 PG 协议会话当时选中的标准解析器去校验过程体，所以过程体如果用了真正的 MySQL 方言语法（反引号标识符、MySQL 专属内置函数等），`pg_restore` 照样会在校验这一步报错；这条保证只覆盖"过程体恰好也是合法标准 SQL"的情况（见 `pl_handler.c` 的 `plmysql_validator` 注释，M1 收尾时已修正为准确表述）
 - `src/pl/plpgsql/` 零改动：`git diff --stat src/pl/plpgsql/` 输出为空
 - `AUTO_INCREMENT` 触发器链路未受影响：MySQL 协议下建一张带 `AUTO_INCREMENT` 的表、插入两行、确认自增列为 1 和 2
 
