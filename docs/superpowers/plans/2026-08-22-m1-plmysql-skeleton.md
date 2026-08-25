@@ -1380,10 +1380,12 @@ Expected: `5/5 passed`。
 
 - [ ] **Step 5: 验证 M1 目标场景端到端可用**
 
+> **M1/M5 边界说明（Task 5 实现后补记）**：下面原本用过程体裸 `SELECT v;` + `CALL` 读回结果，这条路径是 M5 才有的能力（见 Task 4 Step 1 后的说明）。已改为存储函数 `RETURN` 形式，语义（`DECLARE`+`SET`+读到 42）不变。
+
 ```bash
 cd /home/unvdb/pg_github/openHalo/tmp_install/bin && ./psql -h 127.0.0.1 -p 55432 -c "SELECT 1" >/dev/null && mysql -h 127.0.0.1 -P 53306 -u halo -e "
-CREATE PROCEDURE m1_demo() BEGIN DECLARE v INT DEFAULT 1; SET v = v + 41; SELECT v; END;
-CALL m1_demo();"
+CREATE FUNCTION m1_demo() RETURNS INT BEGIN DECLARE v INT DEFAULT 1; SET v = v + 41; RETURN v; END;
+SELECT m1_demo();"
 ```
 
 Expected: 输出一行 `42`。
@@ -1402,7 +1404,7 @@ git commit -m "feat(plmysql): reject routine execution outside MySQL protocol se
 ## M1 完成标准
 
 - `make check -C src/test/mysql` 全绿（5 个测试文件）
-- MySQL 协议下 `CREATE PROCEDURE p() BEGIN DECLARE v INT DEFAULT 1; SET v = v + 41; SELECT v; END;` + `CALL p()` 返回 42
+- MySQL 协议下 `CREATE FUNCTION f() RETURNS INT BEGIN DECLARE v INT DEFAULT 1; SET v = v + 41; RETURN v; END;` + `SELECT f()` 返回 42（存储过程内裸 `SELECT` 回传结果集是 M5 能力，M1 不支持，须响亮报错——见 Task 5 的 `_known_limitation_bare_select`）
 - 对标 spec §M1 的四项语法可用：`DECLARE`（含一条声明多变量）、`SET` 赋值、`IF/ELSEIF/ELSE/END IF`、`RETURN`（存储函数）
 - `pg_proc.prolang` 指向 `plmysql`，`prosrc` 存原始过程体文本（含 `BEGIN`/`END`）
 - 嵌套 `BEGIN...END` 与 `IF(a,b,c)` 函数调用形式均不导致过程体截断
