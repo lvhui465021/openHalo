@@ -593,7 +593,7 @@ git commit -m "feat(plmysql): clone plpgsql into plmysql procedural language ske
 ### Task 3: mys_gram.y 过程体原文捕获
 
 **Files:**
-- Modify: `src/backend/parser/mysql/mys_gram.y`（`CreateFunctionStmt` 产生式区，约 11069-11123 行；`opt_routine_body` 区，约 11582-11601 行）
+- Modify: `src/backend/parser/mysql/mys_gram.y`（`CreateFunctionStmt` 产生式区，约 11070-11169 行；`mysql_routine_body`/`opt_routine_body` 区，约 11628-11700 行；文件末尾 C 代码区的 `mys_capture_routine_body` 及其辅助函数，约 24289-24517 行）
 - Modify: `src/include/parser/mysql/mys_gramparse.h`
 - Test: `src/test/mysql/t/test_002_routine_body_capture.py`
 
@@ -601,7 +601,7 @@ git commit -m "feat(plmysql): clone plpgsql into plmysql procedural language ske
 - Consumes: Task 2 的 `plmysql` 语言注册
 - Produces:
   - bison 产生式 `mysql_routine_body`，归约结果为 `char *`（过程体原文，含外层 `BEGIN`/`END`）
-  - C 辅助函数 `char *mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc)`，声明于 `mys_gramparse.h`
+  - C 辅助函数 `char *mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc, int first_token, int first_token_loc, int *leftover_token, YYSTYPE *leftover_lval, YYLTYPE *leftover_loc)`，声明于 `mys_gramparse.h`（最终签名比最初设想多 5 个参数，见下方 Step 3/4 的实现后补记）
   - `CreateFunctionStmt.options` 中固定包含 `makeDefElem("language", (Node *)makeString("plmysql"), -1)` 与 `makeDefElem("as", (Node *)list_make1(makeString(body)), -1)`
 
 - [ ] **Step 1: 写失败测试**
@@ -665,21 +665,80 @@ Expected: `not ok - test_002_routine_body_capture`，pymysql 抛语法错误（�
 /*
  * Capture the raw text of a MySQL routine body (a bare BEGIN ... END block,
  * which unlike PostgreSQL's dollar-quoted bodies has no delimiters).  Consumes
- * tokens from the scanner without interpreting them, tracking nesting of
- * BEGIN/END, IF/END IF, LOOP/END LOOP, CASE/END CASE, WHILE/END WHILE and
- * REPEAT/END REPEAT, then returns a palloc'd substring of the original input.
+ * tokens from the scanner without interpreting them, tracking block nesting
+ * until the matching END, then returns a palloc'd substring of the original
+ * input.
  *
  * body_start_loc is the scanner offset of the opening BEGIN token.
+ *
+ * first_token/first_token_loc carry the token bison has already pulled off the
+ * scanner as its lookahead when it reduced the production that calls us (it
+ * needs that lookahead to tell "BEGIN ATOMIC" apart from a bare "BEGIN").  It
+ * is the first token of the body proper; pass first_token < 0 when the caller
+ * holds no such token.
+ *
+ * Symmetrically, locating the final END requires reading one token past it, and
+ * that token belongs to whatever follows the routine body.  When there is one,
+ * it is returned through leftover_token/leftover_lval/leftover_loc so the
+ * caller can reinstate it as the parser's lookahead; leftover_token is left
+ * untouched when the body ran to the end of the input.
  */
 extern char *mys_capture_routine_body(core_yyscan_t yyscanner,
-									  int body_start_loc);
+									  int body_start_loc,
+									  int first_token,
+									  int first_token_loc,
+									  int *leftover_token,
+									  YYSTYPE *leftover_lval,
+									  YYLTYPE *leftover_loc);
 ```
+
+> **实现后补记**：brief 最初给的是两参数签名（`yyscanner`、`body_start_loc`）。实现时发现两头各有一个真实存在的 token 交接问题，缺一个参数都会导致错位或吞掉不该吞的 token：
+>
+> 1. **入口端**：`mysql_routine_body: BEGIN_P` 这条归约要不要走捕获路径，取决于下一个 token 是不是 `ATOMIC`（否则会撞上 `opt_routine_body` 的 `BEGIN_P ATOMIC ...` 分支）。bison 为了做这个判断，已经在归约前把 `BEGIN` 之后的第一个 token 读进了自己的 `yychar`（LALR 前瞻）。捕获函数如果自己再从头 `mys_yylex()`，会跳过这个已经被消费掉的 token——`BEGIN NULL; END` 会漏掉 `NULL`，深度计数从第一步就错位。所以 `first_token`/`first_token_loc` 让调用方把 bison 手里的前瞻原样转交进来。
+> 2. **出口端**：判断某个 `END`是不是过程体的收尾，需要再往后多读一个 token（用来分辨裸 `END` 和 `END IF`/`END LOOP` 之类）。这个多读的 token 属于过程体之后的内容（通常是 `;` 或下一条语句的开头），不能被捕获函数悄悄吃掉——否则在 `MULTI_STATEMENTS` 连接下两条相邻的 `CREATE PROCEDURE` 会被粘连，第二条语句的第一个 token 丢失。`leftover_token`/`leftover_lval`/`leftover_loc` 就是为了把这个 token 交还给调用方，重新塞回 bison 的 `yychar`。
 
 - [ ] **Step 4: 实现捕获函数**
 
-在 `src/backend/parser/mysql/mys_gram.y` 文件末尾的 C 代码区（`%%` 之后的辅助函数区，与 `base_yylex`/其他 `mys_*` 辅助函数同一区域）追加：
+在 `src/backend/parser/mysql/mys_gram.y` 文件末尾的 C 代码区（`%%` 之后的辅助函数区，与 `base_yylex`/其他 `mys_*` 辅助函数同一区域）追加。
+
+> **实现后补记（ROUND-0 设计已作废，以下是 4 轮修复后收敛的最终设计）**：下面这版是最终形态，与最初写下的 ROUND-0 版本差别很大，值得先说清楚为什么——免得未来有人照着某个旧 commit 或直觉重新实现一遍已经被证伪的方案。
+>
+> ROUND-0 的思路是给 `IF`/`REPEAT` 做一次性分类：看下一个 token 是不是 `'('` 来判断是函数调用还是语句形式；`LOOP`/`WHILE`/`REPEAT` 一律计入深度。这条路线连续 3 轮修复都在同一个问题上翻车——`IF` 在 MySQL 语法里同时是语句块开头、三参数内置函数 `IF(a,b,c)`、以及 `DROP TABLE IF EXISTS`/`CREATE TABLE IF NOT EXISTS` 的子句修饰符，`REPEAT` 同时是块开头和 `REPEAT(str,count)` 函数。每一版新判据（下一个 token 是不是 `'('`、关键字与 `'('` 之间有没有空白、括号组顶层逗号数、`EXISTS`/`NOT EXISTS` 特判……）都能被构造出一个新的反例打穿，因为这些判据本质上是在局部窥探几个 token 去逼近 MySQL 自己靠 LALR 全局上下文才能分清的边界。
+>
+> 第 3 轮索性放弃了"必须认出 `IF`/`REPEAT`"这个前提：捕获层真正要回答的只是"哪个 `END` 是过程体的结尾"，而 MySQL 除 `BEGIN` 块和 `CASE` 表达式外，其余块全部以 `END <自己的关键字>` 收尾（`END IF`/`END LOOP`/`END WHILE`/`END REPEAT`）——这两个 token 的组合是无歧义的，即使单独的 `IF`/`LOOP`/`WHILE`/`REPEAT` 不是。于是 `IF`/`LOOP`/`WHILE`/`REPEAT` 在开合两端都不计数，只留 `BEGIN`/`CASE` 计深度，靠"裸 `END` 后面紧跟这四个关键字之一就当闭合符吞掉"来配平。这个版本比 ROUND-0 简单得多，但留了一个新缺口：CASE **表达式**也以裸 `END` 收尾，它后面完全可能合法地跟着这四个词中的一个（plpgsql 风格 `... CASE ... END LOOP`，或不写 `AS` 的列别名 `CASE ... END if`）——仅凭"这两个 token 相邻"无法证明它们有语法关系。
+>
+> 第 4 轮补上了这个缺口，办法是给每个计深度的层（`BEGIN`/`CASE`）各留一份"未计数关键字"的计数：`seen[depth][kind]`。遇到 `IF`/`LOOP`/`WHILE`/`REPEAT` 就在当前层对应槽位 `+1`（不判断它是不是真的开块，函数调用、`IF EXISTS`、列别名统统加）；遇到裸 `END` 紧跟这四个关键字之一，只有当前层该槽位 `> 0` 才当作闭合符消费（并 `-1`），槽位为 `0` 就说明这一层不可能有该种块开着，于是这个 `END` 就是本层自己的裸闭合符，深度照常 `-1`，那个关键字塞回 `pending` 交还给主循环重新分类。
+>
+> 这个设计有一条可以直接证明的单向正确性：计数只会**多算不会少算**（每种误判都是把一个本不该算作"可能开着"的东西计了进去），所以"计数为 0"这件事永远是真的（一旦为 0，这一层确实没有任何该种未计数块打开过）——但"计数非 0"不代表真的有该种块打开着。也就是说唯一可能出错的方向是**该放行的裸 `END` 被误当成了闭合符**（少减了一次深度），而这个方向的后果只是深度多留了一层，捕获会一路读到输入末尾、以 `unterminated routine body: missing END` 报错退出，**不可能**把过程体在错误的位置截断成一段看起来正常但实际残缺的文本。1020 条语料的新旧对拍实测中，新版本对旧版本 0 回归、0 条静默错误捕获，仅剩的失败形状（同一个 CASE 表达式内既有该关键字的其它用法、其裸 `END` 又恰好被同名关键字当作别名接住）全部报错退出，不是截断。
+>
+> `LOOP`/`WHILE`/`REPEAT` 因此**不再在任何一端被计入深度**——这与 ROUND-0"三者都计入深度"的设计相反，是本节要特别提醒的一点。
 
 ```c
+/*
+ * The blocks whose openers mys_capture_routine_body() deliberately does not
+ * count, one slot each in its per-level tally.  Returns -1 for a token that
+ * does not name one of them.
+ */
+#define MYS_UNCOUNTED_KINDS 4
+
+static int
+mys_uncounted_block_kind(int tok)
+{
+	switch (tok)
+	{
+		case IF_P:
+			return 0;
+		case LOOP:
+			return 1;
+		case WHILE:
+			return 2;
+		case REPEAT:
+			return 3;
+		default:
+			return -1;
+	}
+}
+
 /*
  * mys_capture_routine_body
  *
@@ -687,29 +746,44 @@ extern char *mys_capture_routine_body(core_yyscan_t yyscanner,
  * the technique Babelfish uses for T-SQL routine bodies: rather than teaching
  * the top-level SQL grammar the whole procedural language, swallow the body as
  * uninterpreted text and let the plmysql compiler parse it later.
+ *
+ * Depth is counted on BEGIN and CASE only, and released on a bare END or on
+ * "END CASE".  Every other block MySQL has -- IF, LOOP, WHILE, REPEAT -- closes
+ * with "END <its own keyword>", so counting neither its opener nor its closer
+ * keeps the books balanced just as well.  See the implementer's note above the
+ * code block for why that asymmetry is the point, and for the per-level tally
+ * (`seen[depth][kind]`) that makes a bare END next to one of those four
+ * keywords safe to tell apart from a genuine "END <keyword>" closer.
  */
 char *
-mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc)
+mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
+						 int first_token, int first_token_loc,
+						 int *leftover_token, YYSTYPE *leftover_lval,
+						 YYLTYPE *leftover_loc)
 {
 	mys_yy_extra_type *yyextra = mys_yyget_extra(yyscanner);
 	YYSTYPE		lval;
-	YYLTYPE		lloc;
+	YYLTYPE		lloc = body_start_loc;
 	int			tok;
-	int			pending = -1;   /* token already lexed but not yet classified */
-	YYLTYPE		pending_loc = 0;
-	int			depth = 1;      /* the opening BEGIN */
+	int			pending = first_token;	/* token already lexed but not yet
+										 * classified; < 0 means none */
+	YYSTYPE		pending_lval;
+	YYLTYPE		pending_loc = first_token_loc;
+	int			depth = 1;		/* the opening BEGIN */
 	int			end_loc = -1;
+	int		   *seen;			/* seen[depth][kind]: uncounted-block keywords
+								 * seen at each counted nesting level */
+	int			seen_levels = 16;	/* levels seen[] has room for */
 	char	   *buf = yyextra->core_yy_extra.scanbuf;
 	char	   *body;
 
-	/*
-	 * This loop owns the token stream until the matching END, so it can look
-	 * ahead freely: a token that turns out to belong to the next construct is
-	 * simply carried over in `pending` and classified on the next iteration.
-	 * No pushback into the scanner is needed.
-	 */
+	MemSet(&pending_lval, 0, sizeof(pending_lval));
+	seen = (int *) palloc0(seen_levels * MYS_UNCOUNTED_KINDS * sizeof(int));
+
 	for (;;)
 	{
+		int			kind;
+
 		if (pending >= 0)
 		{
 			tok = pending;
@@ -717,66 +791,70 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc)
 			pending = -1;
 		}
 		else
-		{
 			tok = mys_yylex(&lval, &lloc, yyscanner);
-		}
 
 		if (tok == 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("unterminated routine body: missing END")));
 
+		/* IF / LOOP / WHILE / REPEAT: bump this level's tally, don't classify */
+		kind = mys_uncounted_block_kind(tok);
+		if (kind >= 0)
+		{
+			seen[depth * MYS_UNCOUNTED_KINDS + kind]++;
+			continue;
+		}
+
 		switch (tok)
 		{
 			case BEGIN_P:
 			case CASE:
-			case LOOP:
-			case WHILE:
-			case REPEAT:
 				depth++;
-				break;
-
-			case IF_P:
+				if (depth >= seen_levels)
 				{
-					/*
-					 * Statement-position IF opens a block; the IF(a,b,c)
-					 * function-call form does not.  Distinguish by the next
-					 * token: '(' means the function form.
-					 */
-					int		next = mys_yylex(&lval, &lloc, yyscanner);
-
-					if (next != '(')
-						depth++;
-					pending = next;
-					pending_loc = lloc;
-					continue;
+					seen_levels *= 2;
+					seen = (int *) repalloc(seen,
+											seen_levels *
+											MYS_UNCOUNTED_KINDS * sizeof(int));
 				}
+				MemSet(&seen[depth * MYS_UNCOUNTED_KINDS], 0,
+					   MYS_UNCOUNTED_KINDS * sizeof(int));
+				break;
 
 			case END_P:
 				{
-					/*
-					 * "END IF" / "END LOOP" / "END CASE" / "END WHILE" /
-					 * "END REPEAT" close one nesting level, and so does a bare
-					 * "END".  Consume the optional trailing keyword here so the
-					 * main switch never sees it as an opener.
-					 */
-					int		close_loc = lloc;
-					int		next = mys_yylex(&lval, &lloc, yyscanner);
+					int			this_end_loc = lloc;
+					int			next = mys_yylex(&lval, &lloc, yyscanner);
+					int			next_kind = mys_uncounted_block_kind(next);
 
-					if (next != IF_P && next != LOOP && next != CASE &&
-						next != WHILE && next != REPEAT)
+					if (next_kind >= 0 &&
+						seen[depth * MYS_UNCOUNTED_KINDS + next_kind] > 0)
 					{
+						/* "END IF"/"END LOOP"/"END WHILE"/"END REPEAT" closing
+						 * an uncounted block open at this level: swallow the
+						 * keyword, give the name back, leave depth alone. */
+						seen[depth * MYS_UNCOUNTED_KINDS + next_kind]--;
+						break;
+					}
+
+					if (next != CASE)
+					{
+						/* bare END: whatever follows isn't part of this
+						 * closer, hand it back to the loop */
 						pending = next;
+						pending_lval = lval;
 						pending_loc = lloc;
 					}
+					/* else "END CASE", whose keyword belongs to this closer */
 
 					depth--;
 					if (depth == 0)
 					{
-						end_loc = close_loc;
+						end_loc = this_end_loc;
 						goto done;
 					}
-					continue;
+					break;
 				}
 
 			default:
@@ -790,24 +868,69 @@ done:
 	memcpy(body, buf + body_start_loc, end_loc - body_start_loc + 3);
 	body[end_loc - body_start_loc + 3] = '\0';
 
+	/*
+	 * Locating the final END meant reading one token past it; that token
+	 * belongs to whatever follows the routine body, so hand it back for the
+	 * caller to reinstate as the parser's lookahead rather than dropping it.
+	 */
+	if (pending >= 0)
+	{
+		*leftover_token = pending;
+		*leftover_lval = pending_lval;
+		*leftover_loc = pending_loc;
+	}
+
 	return body;
 }
 ```
 
-> **实现者注意**：`END_P` 分支在 `depth` 归零时通过 `goto done` 跳出，此时可能已经多读了一个 token（`pending`）——这没有问题，因为该 token 属于 `CREATE PROCEDURE` 语句之后的内容（通常是 `;` 或 EOF），主语法不再需要它。若实测发现主语法在 `mysql_routine_body` 归约后仍需要该 token，改为在 `depth == 0` 时不做前瞻。
+（完整实现见 `src/backend/parser/mysql/mys_gram.y` 约 24289-24517 行，含更详细的行内注释；上面已略去部分逐行讲解性注释，核心逻辑与真实代码一致。）
 
 - [ ] **Step 5: 增加语法产生式**
 
-在 `src/backend/parser/mysql/mys_gram.y` 的 `opt_routine_body` 产生式（约 11582 行）**之前**插入新产生式：
+在 `src/backend/parser/mysql/mys_gram.y` 的 `opt_routine_body` 产生式（约 11671 行）**之前**插入新产生式：
 
 ```
 mysql_routine_body:
 			BEGIN_P
 				{
-					$$ = mys_capture_routine_body(yyscanner, @1);
+					int			first_token = -1;
+					int			first_token_loc = 0;
+					int			leftover = YYEMPTY;
+
+					/*
+					 * To choose between opt_routine_body's "BEGIN ATOMIC ..."
+					 * and this production, bison has already pulled one token
+					 * past BEGIN off the scanner and is holding it as its
+					 * lookahead.  That token is the first token of the body, so
+					 * hand it to the capture routine: from here until the
+					 * matching END the capture loop, not bison, owns the token
+					 * stream.
+					 */
+					if (yychar != YYEMPTY)
+					{
+						first_token = yychar;
+						first_token_loc = yylloc;
+					}
+
+					$$ = mys_capture_routine_body(yyscanner, @1,
+												  first_token, first_token_loc,
+												  &leftover, &yylval, &yylloc);
+
+					/*
+					 * Ownership goes back the same way it came: the capture
+					 * had to read one token past the body to find its end, and
+					 * returns it here to serve as bison's lookahead.  Left at
+					 * YYEMPTY, bison simply fetches the next token itself.
+					 */
+					yychar = leftover;
 				}
 		;
 ```
+
+> **实现后补记**：brief 原版是 `$$ = mys_capture_routine_body(yyscanner, @1);`——两个参数、且不处理 bison 的前瞻 token。实测这个版本会丢 token：`mysql_routine_body: BEGIN_P .` 要不要归约到这条产生式，取决于下一个 token 是不是 `ATOMIC`（否则会和 `opt_routine_body: BEGIN_P ATOMIC ...` 冲突），bison 为了做这个判断已经把 `BEGIN` 之后的第一个 token 读进了自己的 `yychar`——如果捕获函数自己重新 `mys_yylex()`，`BEGIN NULL; END` 会漏掉 `NULL`。同理，捕获函数结束时也会多读一个属于过程体之外的 token（用来判断最后那个 `END` 是不是裸的），这个 token 不能被扔掉，否则 `MULTI_STATEMENTS` 连接下两条相邻的 `CREATE PROCEDURE ... END; CREATE PROCEDURE ...` 会被粘连出语法错误。`yychar`/`yylval`/`yylloc`/`YYEMPTY` 都是 bison 在 `%pure-parser` 下于 action 里可以直接读写的局部变量（action 被内联进 `yyparse`），上面的写法就是把这一对交接做完整：入口把 `yychar` 转交给 `first_token`，出口把 `leftover` 写回 `yychar`。
+>
+> 顺带一提，brief 原本担心的"`BEGIN_P ATOMIC` 与裸 `BEGIN_P` 会撞出 shift/reduce 冲突"实测**没有发生**——两条产生式的前瞻集不相交（`mysql_routine_body` 的前瞻集是 `FOLLOW(mysql_routine_body)`，不含 `ATOMIC`），bison 靠 default reduction 正常区分，`%expect 47` 未变。真正需要处理的不是冲突，而是上面这条前瞻 token 的交接。
 
 在 `%type <str>` 声明区（与其他 `<str>` 类型的非终结符放在一起）加入：
 
@@ -815,7 +938,7 @@ mysql_routine_body:
 %type <str>		mysql_routine_body
 ```
 
-在 `CreateFunctionStmt` 产生式组（约 11069 行起）中，为 `PROCEDURE` 与 `FUNCTION` 各增加一条 MySQL 分支。以 `PROCEDURE` 为例，在现有 `| CREATE opt_or_replace PROCEDURE func_name func_args_with_defaults opt_createfunc_opt_list opt_routine_body` 分支**之前**插入：
+在 `CreateFunctionStmt` 产生式组（约 11070 行起）中，为 `PROCEDURE` 与 `FUNCTION` 各增加一条 MySQL 分支。以 `PROCEDURE` 为例，在现有 `| CREATE opt_or_replace PROCEDURE func_name func_args_with_defaults opt_createfunc_opt_list opt_routine_body` 分支**之前**插入：
 
 ```
 			| CREATE opt_or_replace PROCEDURE func_name func_args_with_defaults
@@ -892,7 +1015,7 @@ cd /home/unvdb/pg_github/openHalo && make -j$(nproc) && make install && cd src/t
 
 Expected: `3/3 passed`。
 
-若 bison 报 shift/reduce 冲突，需调整 `mysql_routine_body` 与 `opt_routine_body` 的优先级——两者都可以在 `opt_createfunc_opt_list` 之后出现 `BEGIN_P`，冲突点在于 `BEGIN_P ATOMIC` 与裸 `BEGIN_P`。解决方式是把 `mysql_routine_body` 改为 `BEGIN_P` 后前瞻一个 token，非 `ATOMIC` 才走捕获路径。
+> **实现后补记**：实测未出现新增 shift/reduce 冲突，`%expect 47` 保持不变（改前改后都是 47，已用 `bison -d` 对新旧两版 `.y` 分别验证）。原因见上面 Step 5 的补记：`mysql_routine_body` 与 `opt_routine_body: BEGIN_P ATOMIC ...` 的前瞻集不相交，不构成冲突；真正的坑是前瞻 token 的交接（同一补记），而不是文法优先级。
 
 - [ ] **Step 8: Commit**
 
@@ -1009,8 +1132,10 @@ git commit -m "feat(plmysql): switch keyword tables to MySQL SQL/PSM vocabulary"
 
 **Files:**
 - Modify: `src/pl/plmysql/src/pl_gram.y`
-- Modify: `src/pl/plmysql/src/pl_comp.c`（若块结构变化影响 `plmysql_compile` 的入口符号）
+- Modify: `src/pl/plmysql/src/pl_reserved_kwlist.h`（新增 `K_SET`，见 Step 4 补记）、`src/pl/plmysql/src/pl_unreserved_kwlist.h`（删除已死的 `elseif -> K_ELSIF` 条目，见 Step 5 补记）
 - Test: `src/test/mysql/t/test_003_declare_set.py`（Task 4 已创建，本任务追加断言）
+
+> **实现后补记**：brief 原版预留了 `pl_comp.c`（"若块结构变化影响 `plmysql_compile` 的入口符号"）——实测这个条件没有成立：`pl_function : comp_options pl_block opt_semi` 这条入口产生式不变，`pl_block` 只是内部形状变了，`pl_comp.c` 全程未改动。实际改到的是两张关键字表，brief 没有预料到。
 
 **Interfaces:**
 - Consumes: Task 4 的关键字 token（`K_DECLARE` 等）
@@ -1019,7 +1144,7 @@ git commit -m "feat(plmysql): switch keyword tables to MySQL SQL/PSM vocabulary"
   - 新非终结符 `mysql_decl_sect`（`%type <declhdr>`）、`mysql_decl_stmts`、`mysql_decl_stmt`、`decl_varnames`（`%type <list>`，元素为 `String` 节点）、`stmt_set`（`%type <stmt>`）
   - `DECLARE` 出现在 `BEGIN` 之后（与克隆来的 `DECLARE ... BEGIN` 顺序相反），支持一条声明多个同类型变量
   - `SET var = expr` 归约为 `PLMySQL_stmt_assign`
-  - `IF`/`ELSEIF`/`RETURN` 沿用克隆来的产生式，不新增
+  - `IF`/`RETURN` 沿用克隆来的产生式，不新增；`ELSEIF` 需要新增一条 `elseif_key : K_ELSEIF | K_ELSIF` 薄产生式（见下方 Step 5 的实现后补记，原因是 Task 4 把 `elseif` 挪进了保留字表）
 
 - [ ] **Step 1: 确认测试当前失败**
 
@@ -1051,28 +1176,34 @@ decl_start		: K_DECLARE  { plmysql_add_initdatums(NULL);
 MySQL 结构是 `BEGIN` 在前、`DECLARE` 在块内且是独立语句。替换为：
 
 ```
-pl_block		: opt_block_label K_BEGIN mysql_decl_sect proc_sect K_END opt_label
+pl_block		: opt_block_label K_BEGIN
+					{
+						/* Forget any variables created before this block */
+						plmysql_add_initdatums(NULL);
+					}
+				  mysql_decl_sect proc_sect exception_sect K_END opt_label
 					{
 						PLMySQL_stmt_block *new;
 
 						new = palloc0(sizeof(PLMySQL_stmt_block));
+
 						new->cmd_type	= PLMYSQL_STMT_BLOCK;
 						new->lineno		= plmysql_location_to_lineno(@2);
 						new->stmtid		= ++plmysql_curr_compile->nstatements;
 						new->label		= $1;
-						new->n_initvars = $3.n_initvars;
-						new->initvarnos = $3.initvarnos;
-						new->body		= $4;
-						new->exceptions	= NULL;
+						new->n_initvars = $4.n_initvars;
+						new->initvarnos = $4.initvarnos;
+						new->body		= $5;
+						new->exceptions	= $6;
 
-						check_labels($1, $6, @6);
+						check_labels($1, $8, @8);
 						plmysql_ns_pop();
 
 						$$ = (PLMySQL_stmt *)new;
 					}
 				;
 
-mysql_decl_sect	: /*EMPTY*/
+mysql_decl_sect	:
 					{
 						$$.label	  = NULL;
 						$$.n_initvars = 0;
@@ -1081,6 +1212,7 @@ mysql_decl_sect	: /*EMPTY*/
 				| mysql_decl_stmts
 					{
 						$$.label	  = NULL;
+						/* Remember variables declared in mysql_decl_stmts */
 						$$.n_initvars = plmysql_add_initdatums(&($$.initvarnos));
 					}
 				;
@@ -1100,7 +1232,13 @@ mysql_decl_stmts: mysql_decl_stmts mysql_decl_stmt
 %type <stmt>    stmt_set
 ```
 
-并保留原有的 `%type <declhdr> decl_sect`（若 `decl_sect` 及其分支已无引用则一并删除，同时删除 `decl_start` 产生式）。
+`decl_sect`、`decl_start` 及其 `%type` 声明整个删除（改写后不再被任何产生式引用）。级联删除还波及游标声明相关的一整批非终结符——`decl_stmts`、`decl_stmt`、`decl_statement`、`decl_const`、`decl_collate`、`decl_notnull`、`opt_scrollable`、`decl_cursor_query`、`decl_cursor_args`、`decl_cursor_arglist`、`decl_cursor_arg`、`decl_is_for` 及对应 `%type`——它们只被 `decl_statement` 的游标分支引用，`decl_sect` 一删就成了不可达代码；留着会让 bison 报约 14 条 useless-nonterminal 告警，一并删掉后零告警。MySQL 的 `DECLARE c CURSOR FOR ...` 语法与 plpgsql 的形状不同，本来就要留到后续里程碑重写，不是本任务的损失。
+
+> **实现后补记（严重问题：`plmysql_add_initdatums(NULL)` 的调用位置）**：brief 原版把这次重置放进 `mysql_decl_stmt` 的 mid-rule action（即每条 `DECLARE` 执行一次，见下面 Step 3 的补记），代码评审和变异测试都证实这是一个真实的 bug，不是风格问题：`plmysql_add_initdatums()` 的语义是"收集自上次调用以来新建的 datum，并把内部的 `datums_last` 推到当前的变量计数"。如果块里有两条 `DECLARE`，第二条执行 `add_initdatums(NULL)` 时会把 `datums_last` 推过第一条已声明的变量，相当于让解释器"忘记"它们——`mysql_decl_sect` 归约时收集到的 `initvarnos` 就只剩最后一条 `DECLARE` 的变量，前面几条声明的变量在块入口不会被初始化（不报错，静默地是 NULL）。
+>
+> 修复是把这次重置挪到 `pl_block` 里紧跟 `K_BEGIN` 之后的 mid-rule action（如上），使其对每个块**恰好执行一次**，与 `mysql_decl_sect` 归约时的 `add_initdatums(&initvarnos)`（同样每块恰好一次）配对——这是一条从产生式结构直接得到的保证，不依赖块里有几条 `DECLARE`。变异测试把重置挪回 brief 的位置后，`DECLARE a,b,c,d ... ; SET s = a+b+c+d` 这类求和用例从预期值变成 `NULL`，三层嵌套变量遮蔽用例也从正确值变成 `NULL`，实证了这条 bug 的真实后果。
+
+> **实现后补记（保留 `exception_sect`，偏离 brief）**：brief 原版把 `pl_block` 里的 `exception_sect` 整段删掉，改成硬编码 `new->exceptions = NULL`。实现时改为保留（`new->exceptions = $6`），理由有两条：其一，对 MySQL 输入这个非终结符总是归约为空（当前 MySQL 语法里没有任何路径能推导到 `K_EXCEPTION`），行为与删掉它完全一致；其二，删掉它会让 `proc_exceptions`/`proc_exception`/`proc_conditions`/`proc_condition` 一并变成不可达的 useless nonterminal，bison 每次构建都会刷一串告警，而 M4（CONTINUE HANDLER、`SIGNAL`/`RESIGNAL`，见文末「后续计划」表）正需要这套异常处理脚手架继续留在语法里。实测冲突数不受影响（改前改后 `%expect` 均为 0）。
 
 - [ ] **Step 3: 实现 DECLARE 语句（支持一条声明多个变量）**
 
@@ -1110,20 +1248,31 @@ MySQL 的 `DECLARE a, b, c INT DEFAULT 0;` 一条语句声明多个同类型变�
 mysql_decl_stmt	: K_DECLARE
 					{
 						/*
-						 * Suppress identifier resolution while the names being
-						 * declared are scanned, then restore it in the trailing
-						 * action.  MySQL allows DECLARE only at the head of a
-						 * block, but each DECLARE is its own statement, so the
-						 * toggle is per-statement rather than per-section.
+						 * Disable scanner lookup of identifiers while the
+						 * names being declared, and the type name, are
+						 * scanned.  Bison performs this mid-rule reduction
+						 * as its default action for the state reached by
+						 * shifting K_DECLARE, without reading a lookahead
+						 * token, so the flag is already set when the first
+						 * declared name is scanned.
 						 */
-						plmysql_add_initdatums(NULL);
 						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_DECLARE;
 					}
-				  decl_varnames decl_datatype decl_defval ';'
+				  decl_varnames decl_datatype decl_defval
 					{
 						ListCell   *lc;
-						int			lno = plmysql_location_to_lineno(@1);
+						int			lineno = plmysql_location_to_lineno(@1);
 
+						/*
+						 * decl_defval has already eaten the terminating
+						 * semicolon (either directly, or via the
+						 * read_sql_expression() that reads the default
+						 * expression), and this reduction is likewise
+						 * bison's default action for its state, so no
+						 * further token has been scanned yet: resuming
+						 * identifier lookup here takes effect before the
+						 * first token of whatever follows is read.
+						 */
 						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
 
 						foreach(lc, $3)
@@ -1133,15 +1282,22 @@ mysql_decl_stmt	: K_DECLARE
 							PLMySQL_type	 *typ;
 
 							/*
-							 * decl_datatype returns a freshly built struct that
-							 * plmysql_build_variable takes ownership of, so each
-							 * variable needs its own copy when one DECLARE names
-							 * several.
+							 * plmysql_build_variable() takes ownership of the
+							 * PLMySQL_type it is handed and may modify it, so
+							 * when one DECLARE names several variables each
+							 * one needs its own copy rather than a shared
+							 * pointer to the struct decl_datatype built.
+							 *
+							 * The default-value expression, in contrast, is
+							 * deliberately shared: PLMySQL_expr is read-only
+							 * once built, and exec_stmt_block() evaluates it
+							 * separately for each variable it initializes.
 							 */
 							typ = palloc(sizeof(PLMySQL_type));
 							memcpy(typ, $4, sizeof(PLMySQL_type));
 
-							var = plmysql_build_variable(name, lno, typ, true);
+							var = plmysql_build_variable(name, lineno,
+														 typ, true);
 							var->default_val = $5;
 						}
 					}
@@ -1153,6 +1309,23 @@ decl_varnames	: decl_varname
 					}
 				| decl_varnames ',' decl_varname
 					{
+						ListCell   *lc;
+
+						/*
+						 * decl_varname rejects a name that is already
+						 * declared in this block, but the variables of this
+						 * DECLARE are not built until the whole statement has
+						 * been reduced, so that check cannot see the names
+						 * listed earlier in this same DECLARE.  Close the gap
+						 * here, so that every name is checked against every
+						 * name preceding it in the block.
+						 */
+						foreach(lc, $1)
+						{
+							if (strcmp(strVal(lfirst(lc)), $3.name) == 0)
+								yyerror("duplicate declaration");
+						}
+
 						$$ = lappend($1, makeString($3.name));
 					}
 				;
@@ -1160,25 +1333,77 @@ decl_varnames	: decl_varname
 
 `decl_varname`、`decl_datatype`、`decl_defval` 三个非终结符直接沿用克隆来的定义，不改动。
 
-> **实现者注意**：`decl_defval` 返回的 `PLMySQL_expr *` 在多变量场景下被多个变量共享。plpgsql 的执行器在块初始化时对每个变量独立求值同一个表达式，共享是安全的（表达式节点只读）。但若后续 M2 引入表达式级缓存，需要重新评估这一点。
+> **实现后补记**：这里有两处偏离了 brief 原文：
+>
+> 1. **`plmysql_add_initdatums(NULL)` 不在这条产生式里**——brief 原版把它放在 `K_DECLARE` 的 mid-rule action 里，即每条 `DECLARE` 执行一次。这正是上面 Step 2 补记说的严重 bug 的来源：一个块里第二条 `DECLARE` 的重置会把第一条 `DECLARE` 已声明的变量挤出 `mysql_decl_sect` 收集的 `initvarnos` 区间，导致它们在块入口不被初始化（静默地是 NULL，编译期不报错）。修复后这次重置整个搬到了 `pl_block` 的 `K_BEGIN` 之后，每块只执行一次；`mysql_decl_stmt` 不再需要关心它。
+> 2. **末尾没有多余的 `';'`**——brief 写的是 `decl_varnames decl_datatype decl_defval ';'`，但 `decl_defval` 自身的两个产生式分支都已经吃掉了终止分号（`decl_defval : ';' | decl_defkey {...} read_sql_expression(';', ";")` 一类），照抄 brief 会变成要求源码里写两个分号，实测编译不过、也不是任何合法 MySQL 语法能触发的写法，已经去掉。
+>
+> 另外，`decl_varnames` 的第二条分支比 brief 原版多了一段重名检查：`decl_varname` 自己的重名检查只能看到"当前块里已经声明过的变量"，而同一条 `DECLARE a, b, c ...` 里的变量要等整条语句归约完才会真正 build，所以 `DECLARE a, a INT` 这种同一条语句内部的重名，`decl_varname` 单独看不出来，需要在 `decl_varnames` 里补一次"新名字与本条已收集的名字逐一比对"。
 
 - [ ] **Step 4: 增加 SET 赋值产生式**
 
 plpgsql 的赋值语法是 `var := expr`（`stmt_assign`）。MySQL 用 `SET var = expr`。在 `proc_stmt` 的可选分支中增加：
 
 ```
-stmt_set		: K_SET assign_var '=' expr ';'
+/*
+ * MySQL spells assignment "SET var = expr;".  Everything after the SET is
+ * handled exactly as stmt_assign handles a bare "var := expr;": the target
+ * datum token is pushed back so that read_sql_construct() captures the whole
+ * "var = expr" text and hands it to the core parser in the matching
+ * RAW_PARSE_PLPGSQL_ASSIGNn mode.
+ *
+ * The T_WORD/T_CWORD alternatives exist only to turn "SET notavariable = 1"
+ * into a message naming the offending word, instead of a bare syntax error;
+ * this mirrors what getdiag_target does.
+ *
+ * MySQL also allows "SET a = 1, b = 2;"; that is left for M2.
+ */
+stmt_set		: K_SET T_DATUM
 					{
 						PLMySQL_stmt_assign *new;
+						RawParseMode pmode;
 
+						/* see how many names identify the datum */
+						switch ($2.ident ? 1 : list_length($2.idents))
+						{
+							case 1:
+								pmode = RAW_PARSE_PLPGSQL_ASSIGN1;
+								break;
+							case 2:
+								pmode = RAW_PARSE_PLPGSQL_ASSIGN2;
+								break;
+							case 3:
+								pmode = RAW_PARSE_PLPGSQL_ASSIGN3;
+								break;
+							default:
+								elog(ERROR, "unexpected number of names");
+								pmode = 0; /* keep compiler quiet */
+						}
+
+						check_assignable($2.datum, @2);
 						new = palloc0(sizeof(PLMySQL_stmt_assign));
 						new->cmd_type = PLMYSQL_STMT_ASSIGN;
 						new->lineno   = plmysql_location_to_lineno(@1);
-						new->stmtid   = ++plmysql_curr_compile->nstatements;
-						new->varno    = $2->dno;
-						new->expr     = $4;
+						new->stmtid = ++plmysql_curr_compile->nstatements;
+						new->varno = $2.datum->dno;
+						/* Push back the head name to include it in the stmt */
+						plmysql_push_back_token(T_DATUM);
+						new->expr = read_sql_construct(';', 0, 0, ";",
+													   pmode,
+													   false, true,
+													   NULL, NULL);
 
 						$$ = (PLMySQL_stmt *)new;
+					}
+				| K_SET T_WORD
+					{
+						/* just to give a better message than "syntax error" */
+						word_is_not_variable(&($2), @2);
+					}
+				| K_SET T_CWORD
+					{
+						/* just to give a better message than "syntax error" */
+						cword_is_not_variable(&($2), @2);
 					}
 				;
 ```
@@ -1187,9 +1412,25 @@ stmt_set		: K_SET assign_var '=' expr ';'
 
 MySQL 也支持 `SET a = 1, b = 2;` 多重赋值。本任务只实现单赋值形式，多重赋值留到 M2。
 
+> **实现后补记**：brief 原版写的是 `K_SET assign_var '=' expr ';'`，实现时发现这条产生式引用了这份语法里根本不存在的两个非终结符——`assign_var` 和通用的 `expr`。原因是 brief 是照着更老版本 plpgsql 赋值语法的印象写的，但克隆来的 PG14 版 `stmt_assign` 早已改成"把目标 token 推回扫描器、整条 `var = expr` 原样交给核心解析器按 `RAW_PARSE_PLPGSQL_ASSIGN{1,2,3}` 模式解析"这种做法（见上面已有的 `stmt_assign : T_DATUM {...}` 产生式），不是自己拼一棵表达式树。`stmt_set` 因此照 `stmt_assign` 的模式实现：`K_SET T_DATUM` 之后 `plmysql_push_back_token(T_DATUM)` 把目标名吐回去，再用 `read_sql_construct()` 一次性吃掉 `var = expr;`。副产品是 `SET blk.x = 99` 这种限定名目标（`ASSIGN2` 路径）也自然支持了，不需要额外产生式。
+>
+> 另外 brief 说"`K_SET` 在克隆来的语法中未被使用"——实测这句话本身也不准确：`K_SET` 在 Task 4 之前**根本不存在于任何关键字表**（Task 4 的关键字表清单里没有它），需要在 `pl_reserved_kwlist.h` 里补上 `PG_KEYWORD("set", K_SET)`（MySQL 5.7 中 `SET` 是保留字）。这意味着过程体内部原本可能用到的 PG 侧 `SET <guc> = ...` 语句（走 `stmt_execsql`）不再能用——`SET` 现在总是被解析成变量赋值，赋值目标不是已知变量会报点名的错误（`word_is_not_variable`/`cword_is_not_variable`），而不是静默地退回 SQL 语句。这是一处已知取舍；若要保留过程体内的 SQL `SET`，正确做法是在 `stmt_set` 里对非 `T_DATUM` 目标回退到 `make_execsql_stmt`，留给 M2 评估。
+
 - [ ] **Step 5: 补测 IF / RETURN 继承自克隆是否可用**
 
-spec 的 M1 目标含「`IF`/`RETURN` 可跑」。这两者不需要新写产生式——MySQL 的 `IF cond THEN ... ELSEIF ... ELSE ... END IF;` 与 `RETURN expr;` 和 plpgsql 语法一致（plpgsql 的 `K_ELSIF` 关键字表同时收录了 `elseif` 拼写），克隆后应直接可用。但必须验证 Step 2 的块结构改写没有破坏它们。
+spec 的 M1 目标含「`IF`/`RETURN` 可跑」。`IF`/`RETURN` 本身不需要新写产生式——MySQL 的 `IF cond THEN ... ELSEIF ... ELSE ... END IF;` 与 `RETURN expr;` 和 plpgsql 语法一致，克隆后直接可用。但必须验证 Step 2 的块结构改写没有破坏它们，`ELSEIF` 拼写还额外需要下面补记里的一条小产生式。
+
+> **实现后补记（`ELSEIF` 的坑）**：brief 这里的假设——"plpgsql 的 `K_ELSIF` 关键字表同时收录了 `elseif` 拼写，克隆后应直接可用"——在 Task 4 之后不再成立。Task 4 把 `elseif` 从非保留字表移进了保留字表（映射到新 token `K_ELSEIF`），而保留字是交给核心扫描器优先解析的，会在非保留字表被查询之前就命中。于是非保留字表里那条 `elseif -> K_ELSIF` 的老映射从此永远走不到（非引号标识符被保留字表截胡，引号标识符走 `!quoted` 分支被排除在保留字之外），克隆来的 `stmt_elsifs ... K_ELSIF ...` 产生式只认 `ELSIF`，不再认 MySQL 实际使用的 `ELSEIF` 拼写。
+>
+> 修复是新增一条薄产生式，把两个 token 都收进来：
+>
+> ```
+> elseif_key		: K_ELSEIF
+> 				| K_ELSIF
+> 				;
+> ```
+>
+> `stmt_elsifs` 的产生式相应从 `stmt_elsifs K_ELSIF expr_until_then proc_sect` 改成 `stmt_elsifs elseif_key expr_until_then proc_sect`。同时顺手删掉了非保留字表里那条已经走不到的死条目（`pl_unreserved_kwlist.h` 里的 `elseif -> K_ELSIF`），它同时也违反了"同一个词不能出现在两张关键字表里"的约定。测试覆盖了 `ELSEIF`、`ELSIF`、以及两种拼写混用的多分支链条。
 
 > **M1/M5 边界说明（实现后补记）**：下面的代码块最初每一段都用过程体内裸 `SELECT`（`SELECT r;`/`SELECT a;`）配合 `CALL` 读回结果，这条路径不在 M1 范围——见 Task 4 Step 1 后补的说明，原因和处理方式相同。实际实现改为「函数用 `RETURN`、过程写表再读回」，语义不变。以下代码块已同步为实际实现的写法。
 
@@ -1280,12 +1521,12 @@ cd /home/unvdb/pg_github/openHalo && make -j$(nproc) && make install && cd src/t
 
 Expected: `4/4 passed`。
 
-bison 冲突处理：`K_SET` 在克隆来的语法中未被使用，新增 `stmt_set` 本身不应产生冲突；块结构改写（`mysql_decl_sect` 可为空且 `proc_sect` 也可为空）是更可能的冲突源。若 `pl_gram.y` 顶部的 `%expect 0` 导致构建失败，必须实际消解冲突而不是提高 `%expect` 数值——用 `bison -Wcounterexamples` 定位冲突路径。
+> **实现后补记**：实测改前改后 bison 冲突数均为 0，`pl_gram.y` 顶部的 `%expect 0` 未改动，也没有出现 useless rule/nonterminal 告警（Step 2 补记提到的游标产生式级联删除清理掉了本来会有的那批告警）。块结构改写（`mysql_decl_sect` 可空、`proc_sect` 也可空）和新增的 `stmt_set`/`elseif_key` 都没有引入新冲突。若未来改动确实撞出冲突，仍然应该用 `bison -Wcounterexamples` 实际定位并消解，而不是调高 `%expect`。
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/pl/plmysql/src/pl_gram.y src/pl/plmysql/src/pl_comp.c src/test/mysql/t/test_003_declare_set.py
+git add src/pl/plmysql/src/pl_gram.y src/pl/plmysql/src/pl_reserved_kwlist.h src/pl/plmysql/src/pl_unreserved_kwlist.h src/test/mysql/t/test_003_declare_set.py
 git commit -m "feat(plmysql): implement MySQL block structure, DECLARE and SET"
 ```
 
