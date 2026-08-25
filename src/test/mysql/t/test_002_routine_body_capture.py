@@ -367,9 +367,12 @@ def run(cluster):
     ], validate=False)
 
     # ------------------------------------------------- 已知局限（必须响亮地失败）
-    # 同一个 CASE 表达式内部就有同名关键字的其它用法（这里是 IF()/REPEAT() 调用），
-    # 而它的裸 END 又正好被同名关键字当别名接住。此时本层计数非零，判据只能取
-    # 「闭合符」这一读法。详见 mys_gram.y 里 mys_capture_routine_body 的注释。
+    # 一般形状：某个计数层（BEGIN 或 CASE 表达式开的）里，只要出现过同一个关键字
+    # 的未配对用法——函数调用、IF EXISTS、别名，任何会让该层计数非零的写法都算——
+    # 紧接着这一层自己的裸 END 后面又跟了同一个关键字，判据就只能取「闭合符」这
+    # 一读法，而不是把 END 还给主语法。下面用 CASE 表达式 + IF()/REPEAT() 函数
+    # 调用来实例化这个形状（目前只有 CASE 表达式的裸 END 能落进这个位置，见
+    # mys_gram.y 里 mys_capture_routine_body 的注释）。详见该函数注释。
     _expect_unterminated(cluster, [
         ("IF() inside + alias if",
          "BEGIN SELECT CASE WHEN 1 = 1 THEN IF(1, 2, 3) ELSE 2 END if; END"),

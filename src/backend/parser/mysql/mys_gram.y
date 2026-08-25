@@ -24333,12 +24333,19 @@ mys_uncounted_block_kind(int tok)
  *
  * What ignoring those openers does cost is that their closers then have to be
  * recognised by spelling alone, and the same two tokens can stand next to each
- * other without any block being closed: a CASE *expression* also ends in a bare
- * END, and what follows it may happen to be one of those four keywords -- as an
- * unquoted column alias ("SELECT CASE ... END loop"), or as the LOOP of a
- * plpgsql loop header whose condition ended in a CASE expression.  Reading that
- * as a closer loses the CASE's depth release, and the capture then runs to the
- * end of the input.
+ * other without any block being closed.  The general shape of the risk: any
+ * counted level -- one opened by BEGIN or by a CASE expression -- whose own
+ * bare END is immediately followed by one of those four keywords, where the
+ * level also holds an unrelated, unbalanced occurrence of that same keyword
+ * (from a function call, an "IF EXISTS" clause, an alias, or anything else
+ * that bumps the tally without opening a real block of that kind).  In
+ * practice today only a CASE *expression*'s bare END can be adjacent to one
+ * of those keywords this way -- as an unquoted column alias ("SELECT CASE
+ * ... END loop"), or as the LOOP of a plpgsql loop header whose condition
+ * ended in a CASE expression -- because a BEGIN block's own closing END is a
+ * statement terminator, not something an expression-position token can sit
+ * directly against.  Reading that adjacency as a closer loses the level's
+ * depth release, and the capture then runs to the end of the input.
  *
  * So the loop keeps the one fact that rules such a pairing out: per counted
  * level, how many IF / LOOP / WHILE / REPEAT tokens have been seen at that
@@ -24435,10 +24442,26 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 				depth++;
 				if (depth >= seen_levels)
 				{
+					int			old_seen_levels = seen_levels;
+
 					seen_levels *= 2;
 					seen = (int *) repalloc(seen,
 											seen_levels *
 											MYS_UNCOUNTED_KINDS * sizeof(int));
+
+					/*
+					 * repalloc() does not zero the newly-grown region.
+					 * Every level's slot is unconditionally MemSet just
+					 * below before anything ever reads it, and the initial
+					 * allocation above is palloc0'd, so this is not
+					 * currently load-bearing -- but zero the whole grown
+					 * region here anyway as defense in depth, so that
+					 * invariant does not have to keep holding by hand as
+					 * this function is edited further.
+					 */
+					MemSet(&seen[old_seen_levels * MYS_UNCOUNTED_KINDS], 0,
+						   (seen_levels - old_seen_levels) *
+						   MYS_UNCOUNTED_KINDS * sizeof(int));
 				}
 				/* the level starts with nothing seen in it */
 				MemSet(&seen[depth * MYS_UNCOUNTED_KINDS], 0,
@@ -24477,7 +24500,39 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 						pending_lval = lval;
 						pending_loc = lloc;
 					}
-					/* else "END CASE", whose keyword belongs to this closer */
+
+					/*
+					 * else: "END CASE", whose keyword belongs to this closer
+					 * -- consumed here without being counted or handed back.
+					 *
+					 * This unconditionally assumes that a literal CASE token
+					 * can only ever appear right after a bare END as the
+					 * closer of a genuine CASE *statement* (whose opening
+					 * CASE was counted above), never as some unrelated token
+					 * that happens to sit next to a different bare END (a
+					 * CASE expression's, or a BEGIN block's).  CASE is a
+					 * reserved word, so nothing today can put it in a
+					 * position immediately after an unrelated bare END --
+					 * not as a column alias, not as anything else -- which
+					 * is what makes the assumption hold; it is not proven
+					 * unreachable for all future grammar changes, only
+					 * unreachable for the grammar as it stands.
+					 *
+					 * This is the one place in this function where getting
+					 * that wrong would fail *silently* instead of loudly.
+					 * Every other misjudgment here can only ever turn a real
+					 * closer into a swallowed one (over-counting is always
+					 * safe), and at worst that runs the capture to EOF and
+					 * raises "unterminated routine body" -- loud, never
+					 * silent.  This branch is different: if a bare END
+					 * belonging to some other block were ever followed by an
+					 * unrelated literal CASE token, it would swallow that
+					 * CASE into this closer without counting it against
+					 * anything, silently truncating the captured body by one
+					 * token instead of erroring.  If a future grammar change
+					 * ever makes CASE reachable in such a position, this
+					 * branch needs to be revisited.
+					 */
 
 					depth--;
 

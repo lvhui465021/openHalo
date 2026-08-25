@@ -1069,11 +1069,14 @@ stmt_elsifs		:
 				;
 
 /*
- * MySQL spells this ELSEIF.  Task 4 moved "elseif" into the reserved keyword
- * table as K_ELSEIF, where the core scanner resolves it before the (still
- * present) unreserved "elsif"/"elseif" -> K_ELSIF entries are consulted, so
- * the inherited K_ELSIF production alone no longer accepts MySQL's spelling.
- * Accept both: K_ELSIF is what "elsif" still lexes to.
+ * MySQL spells this ELSEIF.  Task 4 moved "elseif" out of the unreserved
+ * keyword table and into the reserved one as K_ELSEIF, where the core
+ * scanner resolves it before the unreserved table is ever consulted, so the
+ * inherited K_ELSIF production alone no longer accepts MySQL's spelling.
+ * Only "elsif" remains in the unreserved table (pl_unreserved_kwlist.h),
+ * still resolving to K_ELSIF; "elseif" is now reserved-only
+ * (pl_reserved_kwlist.h), resolving to K_ELSEIF.  Accept both spellings
+ * here: K_ELSIF is what "elsif" still lexes to.
  */
 elseif_key		: K_ELSEIF
 				| K_ELSIF
