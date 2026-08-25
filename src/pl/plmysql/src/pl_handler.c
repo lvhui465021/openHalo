@@ -33,6 +33,7 @@
 static bool plmysql_extra_checks_check_hook(char **newvalue, void **extra, GucSource source);
 static void plmysql_extra_warnings_assign_hook(const char *newvalue, void *extra);
 static void plmysql_extra_errors_assign_hook(const char *newvalue, void *extra);
+static void plmysql_require_mysql_protocol(void);
 
 PG_MODULE_MAGIC;
 
@@ -212,6 +213,35 @@ _PG_init(void)
 	inited = true;
 }
 
+/*
+ * plmysql_require_mysql_protocol
+ *
+ * plmysql routines carry MySQL dialect semantics that only hold when the
+ * MySQL parser and executor engines are active, which InitParserEngine()
+ * and InitExecutorEngine() only select for MySQL-protocol sessions.  Refuse
+ * to run rather than silently misinterpret the body.
+ *
+ * Shared by plmysql_call_handler (named functions/procedures/triggers) and
+ * plmysql_inline_handler (anonymous "DO $$ ... $$ LANGUAGE plmysql" blocks)
+ * -- both are real compile+execute entry points and both need the same
+ * guard; plmysql is a TRUSTED language, so any role with USAGE can reach
+ * either one.
+ *
+ * plmysql_validator() deliberately does NOT call this: pg_restore and
+ * logical replication replay DDL over the PostgreSQL protocol, and blocking
+ * creation there would break backup/restore.
+ */
+static void
+plmysql_require_mysql_protocol(void)
+{
+	if (MyProcPort == NULL ||
+		nodeTag(MyProcPort->protocol_handler) != T_MySQLProtocol)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("plmysql routines can only be executed over the MySQL protocol"),
+				 errhint("Connect to the MySQL listener port instead of the PostgreSQL port.")));
+}
+
 /* ----------
  * plmysql_call_handler
  *
@@ -231,22 +261,7 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 	volatile Datum retval = (Datum) 0;
 	int			rc;
 
-	/*
-	 * plmysql routines carry MySQL dialect semantics that only hold when the
-	 * MySQL parser and executor engines are active, which InitParserEngine()
-	 * and InitExecutorEngine() only select for MySQL-protocol sessions.  Refuse
-	 * to run rather than silently misinterpret the body.
-	 *
-	 * The validator deliberately does NOT perform this check: pg_restore and
-	 * logical replication replay DDL over the PostgreSQL protocol, and blocking
-	 * creation there would break backup/restore.
-	 */
-	if (MyProcPort == NULL ||
-		nodeTag(MyProcPort->protocol_handler) != T_MySQLProtocol)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("plmysql routines can only be executed over the MySQL protocol"),
-				 errhint("Connect to the MySQL listener port instead of the PostgreSQL port.")));
+	plmysql_require_mysql_protocol();
 
 	nonatomic = fcinfo->context &&
 		IsA(fcinfo->context, CallContext) &&
@@ -342,6 +357,8 @@ plmysql_inline_handler(PG_FUNCTION_ARGS)
 	ResourceOwner simple_eval_resowner;
 	Datum		retval;
 	int			rc;
+
+	plmysql_require_mysql_protocol();
 
 	/*
 	 * Connect to SPI manager
