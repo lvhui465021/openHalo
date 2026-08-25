@@ -927,6 +927,8 @@ git commit -m "feat(plmysql): capture bare BEGIN...END routine body text in MySQ
 def run(cluster):
     with cluster.mysql() as conn:
         with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS t003_out")
+            cur.execute("CREATE TABLE t003_out (v INT)")
             cur.execute("DROP PROCEDURE IF EXISTS t003_p")
             cur.execute("""
                 CREATE PROCEDURE t003_p()
@@ -934,15 +936,18 @@ def run(cluster):
                     DECLARE v INT DEFAULT 1;
                     DECLARE w INT;
                     SET w = v + 41;
-                    SELECT w;
+                    INSERT INTO t003_out VALUES (w);
                 END
             """)
             cur.execute("CALL t003_p()")
+            cur.execute("SELECT v FROM t003_out")
             row = cur.fetchone()
             assert row == (42,), "expected (42,), got %r" % (row,)
 ```
 
-> 这个测试要到 Task 5 才会变绿——Task 4 只提供词法层的关键字 token，语法产生式是 Task 5 的工作。本任务自身的验收标准是 Step 4 的关键字表生成检查。
+> **M1/M5 边界说明（Task 5 实现后补记）**：这个测试要到 Task 5 才会变绿——Task 4 只提供词法层的关键字 token，语法产生式是 Task 5 的工作。本任务自身的验收标准是 Step 4 的关键字表生成检查。
+>
+> 上面的代码块最初写的是过程体内裸 `SELECT w;`，靠 `CALL` 把结果集读回客户端。Task 5 实现时发现这条路径必然失败（`query has no destination for result data`，plpgsql 执行器行为）——按设计文档 §4.7/§4.6，「未被 INTO 消费的裸 SELECT 回传结果集」是 M5 的 CALL OUT/多结果集回写能力，不在 M1 范围内，Task 4/5 的 brief 在这一点上假设有误。上面的代码块已同步改为「过程写表、SELECT 读回」的写法，语义（DECLARE 两个变量、SET 赋值、结果是 42）与原版一致，只是不再依赖 M5 才有的能力。M1 阶段所有需要"从过程体拿到计算结果"的测试都应该走这个模式，或者用存储函数的 `RETURN`；裸 `SELECT` 在 M1 阶段必须响亮报错而不是静默丢结果，Task 5 的测试套件里有专门钉住这一点的用例（`_known_limitation_bare_select`，见 `test_003_declare_set.py`）。
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -1186,15 +1191,17 @@ MySQL 也支持 `SET a = 1, b = 2;` 多重赋值。本任务只实现单赋值�
 
 spec 的 M1 目标含「`IF`/`RETURN` 可跑」。这两者不需要新写产生式——MySQL 的 `IF cond THEN ... ELSEIF ... ELSE ... END IF;` 与 `RETURN expr;` 和 plpgsql 语法一致（plpgsql 的 `K_ELSIF` 关键字表同时收录了 `elseif` 拼写），克隆后应直接可用。但必须验证 Step 2 的块结构改写没有破坏它们。
 
+> **M1/M5 边界说明（实现后补记）**：下面的代码块最初每一段都用过程体内裸 `SELECT`（`SELECT r;`/`SELECT a;`）配合 `CALL` 读回结果，这条路径不在 M1 范围——见 Task 4 Step 1 后补的说明，原因和处理方式相同。实际实现改为「函数用 `RETURN`、过程写表再读回」，语义不变。以下代码块已同步为实际实现的写法。
+
 在 `src/test/mysql/t/test_003_declare_set.py` 的 `run()` 末尾追加：
 
 ```python
-    # IF/ELSEIF/ELSE 继承自克隆，块结构改写后仍须可用
+    # IF/ELSEIF/ELSE 继承自克隆，块结构改写后仍须可用（存储函数 + RETURN 观察结果）
     with cluster.mysql() as conn:
         with conn.cursor() as cur:
-            cur.execute("DROP PROCEDURE IF EXISTS t003_if")
+            cur.execute("DROP FUNCTION IF EXISTS t003_if")
             cur.execute("""
-                CREATE PROCEDURE t003_if(n INT)
+                CREATE FUNCTION t003_if(n INT) RETURNS TEXT
                 BEGIN
                     DECLARE r TEXT;
                     IF n < 0 THEN
@@ -1204,11 +1211,11 @@ spec 的 M1 目标含「`IF`/`RETURN` 可跑」。这两者不需要新写产生
                     ELSE
                         SET r = 'pos';
                     END IF;
-                    SELECT r;
+                    RETURN r;
                 END
             """)
             for arg, want in ((-1, 'neg'), (0, 'zero'), (1, 'pos')):
-                cur.execute("CALL t003_if(%s)", (arg,))
+                cur.execute("SELECT t003_if(%s)", (arg,))
                 row = cur.fetchone()
                 assert row == (want,), "n=%d: expected %r, got %r" % (arg, want, row)
 
@@ -1227,21 +1234,42 @@ spec 的 M1 目标含「`IF`/`RETURN` 可跑」。这两者不需要新写产生
             row = cur.fetchone()
             assert row == (40,), "expected (40,), got %r" % (row,)
 
-    # 一条 DECLARE 声明多个同类型变量
+    # 一条 DECLARE 声明多个同类型变量（存储函数 + RETURN 观察结果）
     with cluster.mysql() as conn:
         with conn.cursor() as cur:
-            cur.execute("DROP PROCEDURE IF EXISTS t003_multi")
+            cur.execute("DROP FUNCTION IF EXISTS t003_multi")
             cur.execute("""
-                CREATE PROCEDURE t003_multi()
+                CREATE FUNCTION t003_multi() RETURNS INT
                 BEGIN
                     DECLARE a, b, c INT DEFAULT 5;
                     SET a = a + b + c;
-                    SELECT a;
+                    RETURN a;
                 END
             """)
-            cur.execute("CALL t003_multi()")
+            cur.execute("SELECT t003_multi()")
             row = cur.fetchone()
             assert row == (15,), "expected (15,), got %r" % (row,)
+
+    # 已知局限：过程体内裸 SELECT 必须响亮失败（M5 才会让它把结果集传回客户端）
+    with cluster.mysql() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP PROCEDURE IF EXISTS t003_baresel")
+            cur.execute("""
+                CREATE PROCEDURE t003_baresel()
+                BEGIN
+                    DECLARE v INT DEFAULT 42;
+                    SELECT v;
+                END
+            """)
+            try:
+                cur.execute("CALL t003_baresel()")
+            except pymysql.err.MySQLError as e:
+                assert "no destination for result data" in str(e), \
+                    "bare SELECT failed for an unexpected reason: %r" % (e,)
+            else:
+                raise AssertionError(
+                    "a bare SELECT now returns to the client -- that's M5 work, "
+                    "move this case out of the known-limitation list")
 ```
 
 - [ ] **Step 6: 构建并运行测试确认通过**
