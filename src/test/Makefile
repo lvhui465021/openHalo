@@ -33,11 +33,35 @@ SUBDIRS += ssl
 endif
 endif
 
+# openHalo: src/test/mysql (the MySQL-protocol/plmysql integration suite)
+# needs pymysql to run at all, and there is no configure-time probe for
+# Python *module* availability to key off of (with_python only governs
+# PL/Python).  Unlike the PG_TEST_EXTRA-gated suites above, this suite is
+# self-contained (it starts its own isolated cluster, like regress/
+# isolation/recovery do) rather than reliant on external system config, so
+# it does not need opt-in via PG_TEST_EXTRA -- only a check that its one
+# Python dependency is actually importable, so that a plain "make
+# check-world" degrades to a skip notice instead of a hard failure on a
+# host without it.  Respects an already-set PYTHONPATH (e.g. a sandbox that
+# cannot pip-install and instead points PYTHONPATH at a vendored copy; see
+# src/test/mysql's own reports for that workaround).
+ifeq ($(PYTHON),)
+MYSQL_TEST_PYTHON = python3
+else
+MYSQL_TEST_PYTHON = $(PYTHON)
+endif
+HAVE_PYMYSQL := $(shell $(MYSQL_TEST_PYTHON) -c "import pymysql" >/dev/null 2>&1 && echo yes || echo no)
+ifeq ($(HAVE_PYMYSQL),yes)
+SUBDIRS += mysql
+else
+$(info skipping src/test/mysql: `$(MYSQL_TEST_PYTHON) -c "import pymysql"` failed; install pymysql (e.g. pip3 install pymysql) or set PYTHONPATH to enable this suite)
+endif
+
 # We don't build or execute these by default, but we do want "make
 # clean" etc to recurse into them.  (We must filter out those that we
 # have conditionally included into SUBDIRS above, else there will be
 # make confusion.)
-ALWAYS_SUBDIRS = $(filter-out $(SUBDIRS),examples kerberos ldap ssl)
+ALWAYS_SUBDIRS = $(filter-out $(SUBDIRS),examples kerberos ldap ssl mysql)
 
 # We want to recurse to all subdirs for all standard targets, except that
 # installcheck and install should not recurse into the subdirectory "modules".
