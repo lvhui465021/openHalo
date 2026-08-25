@@ -229,7 +229,24 @@ _PG_init(void)
  *
  * plmysql_validator() deliberately does NOT call this: pg_restore and
  * logical replication replay DDL over the PostgreSQL protocol, and blocking
- * creation there would break backup/restore.
+ * creation there would break backup/restore for any routine whose CREATE
+ * statement reaches this validator at all.
+ *
+ * That does not mean restore is fully supported over the PG protocol,
+ * though.  When check_function_bodies is on (PostgreSQL's default, and
+ * pg_dump/pg_restore do not turn it off), plmysql_validator() still calls
+ * plmysql_compile(), which validates the body's embedded SQL expressions via
+ * check_sql_expr() -> raw_parser() (see pl_gram.c).  raw_parser() dispatches
+ * through the *session's* parserengine (parser.c), and InitParserEngine()
+ * only selects the MySQL-dialect parser engine for MySQL-protocol sessions
+ * -- over the plain PostgreSQL protocol it always falls back to the
+ * standard PostgreSQL parser (parsereng.c).  So restoring a plmysql routine
+ * whose body actually uses MySQL-dialect SQL (backtick identifiers,
+ * MySQL-only builtin functions, etc.) still fails at validation time over
+ * the PG protocol; the protocol exemption above only helps routines whose
+ * bodies happen to also be valid standard SQL.  Making the validator skip
+ * body-checking off-protocol would be a real fix, but that's out of scope
+ * here -- deferred to M2.
  */
 static void
 plmysql_require_mysql_protocol(void)
