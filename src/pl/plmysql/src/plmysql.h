@@ -977,6 +977,8 @@ typedef struct PLMySQL_stmt_execsql
 	bool		into;			/* INTO supplied? */
 	bool		strict;			/* INTO STRICT flag */
 	bool		mod_stmt_set;	/* is mod_stmt valid yet? */
+	bool		is_select;		/* bare SELECT: result set goes to the client
+								 * (MySQL semantics), not to a PL target */
 	PLMySQL_variable *target;	/* INTO target (record or row) */
 } PLMySQL_stmt_execsql;
 
@@ -1089,6 +1091,8 @@ typedef struct PLMySQL_function
 	unsigned int nstatements;	/* counter for assigning stmtids */
 	bool		requires_procedure_resowner;	/* contains CALL or DO? */
 	bool		has_handlers;	/* body contains a MySQL DECLARE HANDLER? */
+	int			n_resultsets;	/* number of bare SELECTs that stream result
+								 * sets to the client (MySQL semantics) */
 
 	/* these fields change when the function is used */
 	struct PLMySQL_execstate *cur_estate;

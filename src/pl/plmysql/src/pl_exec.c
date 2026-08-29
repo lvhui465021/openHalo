@@ -16,6 +16,8 @@
 
 #include "postgres.h"
 
+
+
 #include <ctype.h>
 
 #include "access/detoast.h"
@@ -315,6 +317,7 @@ static int	exec_stmt_fetch(PLMySQL_execstate *estate,
 int			plmysql_last_signal_errno = 0;
 int			plmysql_caught_mysql_errno = 0;
 
+
 static int	exec_stmt_close(PLMySQL_execstate *estate,
 							PLMySQL_stmt_close *stmt);
 static int	exec_stmt_exit(PLMySQL_execstate *estate,
@@ -521,6 +524,7 @@ plmysql_exec_function(PLMySQL_function *func, FunctionCallInfo fcinfo,
 	 */
 	estate.err_text = gettext_noop("during initialization of execution state");
 	copy_plmysql_datums(&estate, func);
+
 
 	/*
 	 * Store the actual call argument values into the appropriate variables

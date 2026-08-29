@@ -49,6 +49,10 @@
 #include "catalog/pg_type.h"
 #include "commands/alter.h"
 #include "commands/defrem.h"
+#include "commands/mysql/mys_uservar.h"
+#include "nodes/mysql/mys_parsenodes.h"
+#include "parser/parsereng.h"
+#include "libpq/libpq-be.h"
 #include "commands/extension.h"
 #include "commands/proclang.h"
 #include "executor/execdesc.h"
@@ -2356,18 +2360,47 @@ ExecuteCallStmt(CallStmt *stmt, ParamListInfo params, bool atomic, DestReceiver 
 		tupTypmod = HeapTupleHeaderGetTypMod(td);
 		retdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
 
-		tstate = begin_tup_output_tupdesc(dest, retdesc,
-										  &TTSOpsHeapTuple);
-
 		rettupdata.t_len = HeapTupleHeaderGetDatumLength(td);
 		ItemPointerSetInvalid(&(rettupdata.t_self));
 		rettupdata.t_tableOid = InvalidOid;
 		rettupdata.t_data = td;
 
-		slot = ExecStoreHeapTuple(&rettupdata, tstate->slot, false);
-		tstate->dest->receiveSlot(slot, tstate->dest, CMDTAG_UNKNOWN);
+		if (database_compat_mode == MYSQL_COMPAT_MODE && MyProcPort != NULL &&
+			nodeTag(MyProcPort->protocol_handler) == T_MySQLProtocol &&
+			!stmt->inProc)
+		{
+			/*
+			 * MySQL semantics: the CALL statement itself produces no result
+			 * set.  Write each output value back into the caller's
+			 * @variable named by the corresponding outarg; the client reads
+			 * them back with SELECT @var.
+			 */
+			for (int outidx = 0; outidx < list_length(stmt->outargs); outidx++)
+			{
+				Node	   *outarg = (Node *) list_nth(stmt->outargs, outidx);
+				bool		isnull;
+				Datum		value;
 
-		end_tup_output(tstate);
+				value = heap_getattr(&rettupdata, outidx + 1, retdesc,
+									 &isnull);
+				if (IsA(outarg, UserVarRef))
+					mysSetUserVarForPl(
+						((UserVarRef *) outarg)->userVarName,
+						value,
+						TupleDescAttr(retdesc, outidx)->atttypid,
+						isnull);
+			}
+		}
+		else
+		{
+			tstate = begin_tup_output_tupdesc(dest, retdesc,
+											  &TTSOpsHeapTuple);
+
+			slot = ExecStoreHeapTuple(&rettupdata, tstate->slot, false);
+			tstate->dest->receiveSlot(slot, tstate->dest, CMDTAG_UNKNOWN);
+
+			end_tup_output(tstate);
+		}
 
 		ReleaseTupleDesc(retdesc);
 	}

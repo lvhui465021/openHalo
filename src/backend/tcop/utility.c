@@ -2050,27 +2050,24 @@ UtilityReturnsTuples(Node *parsetree)
                 
                 if (database_compat_mode == MYSQL_COMPAT_MODE)
                 {
-                    if (MyProcPort && nodeTag(MyProcPort->protocol_handler) == T_MySQLProtocol)
-                    {
-                        if (!stmt->inProc)
-                        {
-                            return false;
-                        }
-                        else
-                        {
-                            /* Nothing to do */
-                        }
-                    }
-                    else
-                    {
-                        /* Nothing to do */
-                    }
+                    /*
+                     * MySQL semantics: a CALL produces no result set of its
+                     * own -- OUT/INOUT values are written back into the
+                     * caller's @variables (mys_utility.c) and are read back
+                     * with SELECT @var.  Forwarding the output record to the
+                     * client from here produced a malformed row packet.
+                     * (Nested CALLs running inside a procedure body keep the
+                     * old behaviour: their output row is consumed by the
+                     * procedure machinery, not by the client.)
+                     */
+                    if (MyProcPort && nodeTag(MyProcPort->protocol_handler) == T_MySQLProtocol &&
+                        !stmt->inProc)
+                        return false;
                 }
                 else
                 {
                     /* Nothing to do */
                 }
-                
 
 				return (stmt->funcexpr->funcresulttype == RECORDOID);
 			}

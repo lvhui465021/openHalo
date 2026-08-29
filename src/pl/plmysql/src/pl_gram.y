@@ -3319,6 +3319,12 @@ make_execsql_stmt(int firsttoken, int location, PLword *word)
 
 	execsql = palloc0(sizeof(PLMySQL_stmt_execsql));
 	execsql->cmd_type = PLMYSQL_STMT_EXECSQL;
+	execsql->is_select = (firsttoken == T_WORD && word != NULL &&
+						  !word->quoted && word->ident != NULL &&
+						  pg_strcasecmp(word->ident, "select") == 0 &&
+						  !have_into);
+	if (execsql->is_select)
+		plmysql_curr_compile->n_resultsets++;
 	execsql->lineno  = plmysql_location_to_lineno(location);
 	execsql->stmtid  = ++plmysql_curr_compile->nstatements;
 	execsql->sqlstmt = expr;
