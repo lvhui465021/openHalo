@@ -99,6 +99,11 @@ extern int autoCommit;
 extern uint64 mys_sqlMode;
 extern int default_week_format;
 
+/* Textual sql_mode as SET by the client; NULL means untouched (MySQL 5.7
+ * default spelling).  Used to record routine CREATE-time sql_mode snapshots.
+ */
+extern char *mysGetSqlModeText(void);
+
 extern HTAB *globalSystemVars;
 extern HTAB *globalSystemVarsLock;
 

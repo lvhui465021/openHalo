@@ -80,6 +80,25 @@
 uint64 mys_sqlMode = MYS_MODE_ONLY_FULL_GROUP_BY | MYS_MODE_STRICT_TRANS_TABLES | MYS_MODE_NO_ZERO_IN_DATE |
                      MYS_MODE_NO_ZERO_DATE | MYS_MODE_ERROR_FOR_DIVISION_BY_ZERO | MYS_MODE_NO_AUTO_CREATE_USER |
                      MYS_MODE_NO_ENGINE_SUBSTITUTION;
+
+/*
+ * The textual form of the session sql_mode.  mys_sqlMode is a bitmask that
+ * only keeps the handful of modes the adapter models; stored routines need
+ * the exact CREATE-time text to record as their sql_mode snapshot, so we
+ * remember whatever the client SET it to.  NULL means "untouched", i.e. the
+ * MySQL 5.7 default spelling below.
+ */
+#define MYS_DEFAULT_SQL_MODE_TEXT "STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION"
+static char *mysSqlModeText = NULL;
+
+char *
+mysGetSqlModeText(void)
+{
+	if (mysSqlModeText == NULL)
+		mysSqlModeText = pstrdup(MYS_DEFAULT_SQL_MODE_TEXT);
+	return mysSqlModeText;
+}
+
 int autoCommit = 2;
 int default_week_format = 0;
 extern bool needCommitTrx;
@@ -1436,6 +1455,9 @@ applySystemVarValue(const char *varName, const char *varValue)
         uint64 tempSqlMode = 0;
 
         isStrictTransTablesOn = false;
+
+        /* Remember the exact text for routine sql_mode snapshots. */
+        mysSqlModeText = pstrdup(varValue);
 
         /* Need a modifiable copy of string */
         rawValue = pstrdup(varValue);

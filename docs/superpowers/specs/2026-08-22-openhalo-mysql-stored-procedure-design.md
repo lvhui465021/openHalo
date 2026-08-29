@@ -122,7 +122,7 @@ openHalo 已经实现了按会话切换的解析/执行引擎机制，新增语�
 |---|---|---|
 | `CREATE PROCEDURE`/`CREATE FUNCTION ... RETURNS` | ✅ | — |
 | `IN`/`OUT`/`INOUT` 参数 | ✅ | — |
-| `DEFINER = user` | ⚠️ 接受语法；例程仍由创建者拥有、以 invoker rights 执行，host 部分未保存 | 低 |
+| `DEFINER = user` | ✅ `user@host` 原文记录于 `pg_proc.proconfig`（`plmysql.definer`），`SHOW CREATE`/`mysql.proc`/information_schema 视图按记录值展示；执行归属仍为创建者（invoker-based） | — |
 | `COMMENT 'string'` | ✅（持久化到 `pg_description`，并由 aux_mysql 1.7 元数据视图公开） | — |
 | `LANGUAGE SQL` | ✅ MySQL no-op 特性；例程仍选定 `plmysql` | — |
 | `[NOT] DETERMINISTIC` | ✅ 映射为 STABLE / VOLATILE | — |
@@ -143,15 +143,15 @@ openHalo 已经实现了按会话切换的解析/执行引擎机制，新增语�
 
 | 语法项 | 现状 | plpgsql 映射目标 |
 |---|---|---|
-| `[label:] BEGIN...END [label]` | ⚠️ 仅支持 `<<label>> BEGIN...END label`，原生 MySQL `label:` 前缀未做 | `PLMySQL_stmt_block` |
+| `[label:] BEGIN...END [label]` | ✅ 原生 `label:` 拼写与 `<<label>>` 双拼写均已支持（label 仅限普通标识符，与 MySQL 一致） | `PLMySQL_stmt_block` |
 | `DECLARE v[,v2] type [DEFAULT expr]` | ✅（M1，支持一条声明多变量） | `PLMySQL_var` |
 | `SET var = expr` | ✅（M1 本地变量；`SET @uservar = expr` 于本次会话补上，透传给 SPI） | `PLMySQL_stmt_assign` |
 | `SELECT ... INTO var`（例程内） | ✅（M1） | `PLMySQL_stmt_execsql`(into) |
 | `IF/ELSEIF/ELSE/END IF` | ✅（M1） | `PLMySQL_stmt_if` |
 | `CASE ... END CASE` | ✅（M2） | `PLMySQL_stmt_case` |
-| `[label:] LOOP...END LOOP` | ⚠️ 仅 `<<label>>` 拼写，循环语义已完成 | `PLMySQL_stmt_loop` |
-| `[label:] WHILE c DO...END WHILE` | ⚠️ 仅 `<<label>>` 拼写，循环语义已完成 | `PLMySQL_stmt_while` |
-| `[label:] REPEAT...UNTIL c END REPEAT` | ⚠️ 仅 `<<label>>` 拼写，循环语义已完成 | `stmt_loop` + 尾部 exit |
+| `[label:] LOOP...END LOOP` | ✅ `label:`/`<<label>>` 双拼写，循环语义已完成 | `PLMySQL_stmt_loop` |
+| `[label:] WHILE c DO...END WHILE` | ✅ `label:`/`<<label>>` 双拼写，循环语义已完成 | `PLMySQL_stmt_while` |
+| `[label:] REPEAT...UNTIL c END REPEAT` | ✅ `label:`/`<<label>>` 双拼写，循环语义已完成 | `stmt_loop` + 尾部 exit |
 | `LEAVE label` / `ITERATE label` | ✅（M2） | `stmt_exit`(is_exit=true/false) |
 | `RETURN expr`（FUNCTION） | ✅（M1） | `PLMySQL_stmt_return` |
 
@@ -353,11 +353,18 @@ EXIT handler 复用 plpgsql 原生 `EXCEPTION WHEN` 机制（零新增）；CONT
 
 ### 4.9 元数据层修正
 
-保留视图路线（`mysql.proc`/`mys_informa_schema.procedures/routines` 继续投影 `pg_proc`），不新建独立目录表——Babelfish 的 `sys.procedures` 同样是视图 + 窄侧表补充 `pg_proc` 存不下的列，验证了这条路线本身没问题。需要修正：
+保留视图路线（`mysql.proc`/`mys_informa_schema.procedures/functions/routines` 继续投影 `pg_proc`），不新建独立目录表。最终落地时没有采用 Babelfish 的窄侧表（`sys.babelfish_function_ext`）补充方案，而是用 **`pg_proc.proconfig` + 自定义 GUC**（`plmysql.definer`/`plmysql.sql_mode`/`plmysql.created`/`plmysql.last_altered`，由 plmysql 扩展注册）承载 `pg_proc` 存不下的列，理由：
 
-- 保持 `ROUTINE_BODY`/`language = 'SQL'`：这是 MySQL 5.7 的协议值，内部 `prolang = plmysql` 不应泄露；aux_mysql 1.7 已补齐可由 `pg_proc` 表达的 COMMENT 投影
-- 若要完成 MySQL 的创建时语义，需要新增窄侧表（仿 `sys.babelfish_function_ext`）承载 `sql_mode` 创建时快照、`DEFINER` 原始 host 部分（`user@host` 中 `pg_proc.proowner` 只能存角色，存不下 `@host` 通配部分）与时间戳
-- `mysql.get_proc_def()`/`get_func_def()` 的 `SHOW CREATE` 格式化需要改为直接输出 `prosrc`（现在存的就是原文，不用再从 PG 语法反推）
+- `proconfig` 随 `pg_proc` 行整体 dump/restore 与逻辑复制，无需在恢复路径上补写窄侧表（窄侧表的行在 `pg_restore`/逻辑复制重建例程后必然丢失或需要额外钩子）
+- 函数级 GUC 在调用时由 fmgr 自动应用到会话，plmysql 编译器/执行器可以零成本读取快照（执行期 `plmysql.sql_mode` 即创建时值，为 §G 的"创建时记录、执行时应用"铺路）
+- 零新目录代码、零孤儿行清理责任（DROP 例程时随行删除）
+
+已落地内容（2026-08-29 晚）：
+
+- 语法层 `DEFINER=user@host` 原文经选项 `SET` 子句写入 `proconfig`（创建/替换路径；`mys_utility.c` 在执行期按会话 `sql_mode` 与当前时间追加 `sql_mode`/`created`/`last_altered`，避免在 PREPARE 解析期快照到错误值）
+- `mysql.proc`/`mys_informa_schema.{procedures,functions,routines}` 与 `SHOW CREATE` 读取 `proconfig` 展示真实 definer/sql_mode/时间戳；无记录时（如旧版本重建的例程）回退到原展示值（owner@%、默认 sql_mode、`2024-1-1`）
+- `mysql.get_proc_def()`/`get_func_def()` 直接输出 `prosrc`（本来存的就是原文）并在头部渲染记录的 DEFINER
+- 仍保持 `ROUTINE_BODY`/`language = 'SQL'`：这是 MySQL 5.7 的协议值，内部 `prolang = plmysql` 不应泄露
 
 ### 4.10 触发器：预留但不实现
 
@@ -400,9 +407,9 @@ Babelfish（AWS 的 SQL Server 兼容层）验证了"clone plpgsql 建新 PL"是
 | M1 | 语法层过程体捕获（§4.2）+ `src/pl/plmysql/` 骨架（克隆改名，`DECLARE`/赋值/`IF`/`RETURN` 可跑） | ✅ 完成 |
 | M2 | 完整流程控制（`LOOP`/`WHILE`/`REPEAT`/`LEAVE`/`ITERATE`/`CASE`）+ 局部变量完整语义 | ✅ 完成 |
 | M3 | 游标（`DECLARE CURSOR`/`OPEN`/`FETCH`/`CLOSE`）+ EXIT HANDLER（复用 plpgsql EXCEPTION） | ✅ 完成 |
-| M4 | CONTINUE HANDLER（§4.5，含游标 NOT FOUND 联动）+ `SIGNAL`/`RESIGNAL`（§4.8）+ `GET DIAGNOSTICS` | ✅ 完成；**错误码表扩充未做**（仍是 §4.8 提到的 ~14 条，未扩到预估的 40–60 条），反向 errno→MySQL 规范 SQLSTATE 映射也未做 |
+| M4 | CONTINUE HANDLER（§4.5，含游标 NOT FOUND 联动）+ `SIGNAL`/`RESIGNAL`（§4.8）+ `GET DIAGNOSTICS` | ✅ 完成；错误码体系（§4.8）三项均已落地：正向表已扩至 44 条（含存储过程/DDL 常用 errno，`errorConvertor.c`），errno→SQLSTATE 双向/规范性反向映射在 `pl_exec_ext.c` 的 `mysql_errno_sqlstate_map`（28 条三元组：errno/PG SQLSTATE/MySQL 规范 SQLSTATE） |
 | M5 | CALL 链路 OUT/INOUT 回写（§4.6）+ 多结果集协议打通（§4.7） | ✅ 完成（多结果集协议打通是 2026-08-29 补的：编译期 `is_select`/`n_resultsets` 标记早就有，执行期一直没接上，`CALL` 内裸 `SELECT`/`EXECUTE` 预处理语句会报 "no destination for result data"；另外例程体内 `SET @uservar = expr` 与 MySQL 形态的 `EXECUTE stmtname [USING ...]` 当时也还不能用，一并修了） |
-| M6 | 元数据视图修正（§4.9）+ `DEFINER`/`COMMENT` 语法补全 + 触发器预留验证（§4.10，不实现触发器本身） | ⚠️ 部分完成：COMMENT 已在 aux_mysql 1.7 的视图公开；`language`/`ROUTINE_BODY = 'SQL'` 是正确的 MySQL 值；`sql_mode` 快照、时间戳、原始 DEFINER host 与触发器预留验证未做 |
+| M6 | 元数据视图修正（§4.9）+ `DEFINER`/`COMMENT` 语法补全 + 触发器预留验证（§4.10，不实现触发器本身） | ✅ 完成（2026-08-29 晚）：`DEFINER` 的 `user@host` 原文、创建时 `sql_mode` 快照、`created`/`last_altered` 时间戳以函数级 GUC 形式写入 `pg_proc.proconfig`（`plmysql.definer`/`plmysql.sql_mode`/`plmysql.created`/`plmysql.last_altered`，由 plmysql 扩展定义并随 dump/restore 自动携带），`mysql.proc`/`mys_informa_schema.routines/procedures/functions` 视图与 `SHOW CREATE` 全部改读真实值（无记录时回退到原展示值）；触发器入口预留已验证：三态枚举、编译器 switch、`plmysql_exec_trigger`/`plmysql_exec_event_trigger` 执行器、调用分派与语法 guard（如 1336 动态 SQL 拒绝）均就位 |
 
 **2026-08-29 追加修复**（运行时正确性问题，不改变上述里程碑范围）：
 - `DECLARE` 声明顺序校验（§E）此前对变量、游标声明完全不生效，且 HANDLER 动作体若自身是嵌套块会清空外层块的顺序/HANDLER 收集状态——已改为保存/恢复栈
@@ -416,15 +423,15 @@ Babelfish（AWS 的 SQL Server 兼容层）验证了"clone plpgsql 建新 PL"是
 
 1. **CONTINUE HANDLER 性能代价**：逐语句 savepoint 有开销，需要实测大循环内 CONTINUE HANDLER 的性能表现，评估是否需要"仅对可能触发对应条件的语句包裹"的静态分析优化（Babelfish 论文/注释提到过这个方向但未确认其是否真正实现，需要在 M4 阶段针对 openHalo 场景单独验证）。
 2. **`SET` 语句歧义**：MySQL 模式下 `SET` 已被系统变量/用户变量语法占用，例程内 `SET localvar = expr` 需要与现有 `MysVariableSetStmt` 语法在 `plmysql` 编译器内部（不是主语法）做区分，具体消歧规则需要在 M1 实现时敲定。
-3. **原生 `label:` 拼写**：当前只接受 `<<label>>`；需要调整 plmysql 标签文法后才可完整兼容 mysqldump 的 MySQL SQL/PSM 文本。
-4. **反向错误码表的规范化选择**：非单射的反向映射（如多个 SQLSTATE 对应同一 MySQL errno）需要逐条人工选定规范源，M4 阶段需要一份人工审核的映射表，不能全自动生成。
-5. **`sql_mode` 快照的实际使用范围**：本设计只提到需要落地存储，具体哪些 `sql_mode` 位在执行期实际生效（如 `STRICT_TRANS_TABLES` 影响类型截断行为）超出本次存储过程设计范围，需要与 openHalo 现有类型系统兼容性工作对齐，本文档不展开。
+3. **原生 `label:` 拼写**：✅ 已支持（2026-08-29 晚）。实现要点：plmysql 语句以 `T_WORD` 开头时（`SELECT` 等经 `stmt_execsql` 的 T_WORD 分支捕获整句），不能在 bison 里用 `T_WORD ':'` 双 token 产生式区分 label——bison 需要两 token 前瞻，而 pl_scanner 的动作内 `yylex()` 与 bison 的 lookahead 缓冲错位，会导致所有 T_WORD 开头的语句解析错乱（`SELECT CASE WHEN...` 报 `missing "WHEN"`）。正确做法是把 `标识符 + ':'` 在 scanner 层合并为单一 `T_WORD_COLON` token（`pl_scanner.c`），与 `A.B`/`A:=`/`A[B]` 的既有组合机制同构；label 只接受普通标识符（`T_WORD`），不接受关键字/引号标识符，符合 MySQL 语义。
+4. **反向错误码表的规范化选择**：非单射的反向映射（如多个 SQLSTATE 对应同一 MySQL errno）需要逐条人工选定规范源，M4 阶段需要一份人工审核的映射表，不能全自动生成。✅ 已按 MySQL 5.7 手册附录逐条人工选定（`pl_exec_ext.c` 的 28 条三元组）。
+5. **`sql_mode` 快照的实际使用范围**：快照已落地存储（`plmysql.sql_mode` proconfig GUC），但具体哪些 `sql_mode` 位在执行期实际生效（如 `STRICT_TRANS_TABLES` 影响类型截断行为）仍超出本次存储过程设计范围，需要与 openHalo 现有类型系统兼容性工作对齐，本文档不展开。
 
 ---
 
 ## 8. 测试策略
 
-现状：MySQL 协议回归位于 `src/test/mysql/t/test_000` 至 `test_015`，覆盖过程体、流程控制、游标/HANDLER、OUT/INOUT、多结果集、动态 SQL、扩展升级、dump/restore、例程特性以及递归/函数限制；`make -C src/test/mysql check` 当前为 **16/16 通过**。
+现状：MySQL 协议回归位于 `src/test/mysql/t/test_000` 至 `test_016`，覆盖过程体、流程控制、游标/HANDLER、OUT/INOUT、多结果集、动态 SQL、扩展升级、dump/restore、例程特性、递归/函数限制，以及 2026-08-29 晚新增的元数据（DEFINER/sql_mode 快照/时间戳/`SHOW CREATE`）、原生 `label:` 拼写与错误码映射回归；`make -C src/test/mysql check` 当前为 **17/17 通过**。
 
 后续需补充：
 

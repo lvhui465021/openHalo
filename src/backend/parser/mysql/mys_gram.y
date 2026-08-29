@@ -180,6 +180,8 @@ static Node *makeColumnRef(char *colname, List *indirection,
 static Node *makeTypeCast(Node *arg, TypeName *typename, int location);
 static Node *makeStringConst(char *str, int location);
 static Node *makeStringConstCast(char *str, int location, TypeName *typename);
+static DefElem *mys_make_routine_meta_item(const char *name, const char *value,
+										   int location);
 static Node *makeIntConst(int val, int location);
 static Node *makeFloatConst(char *str, int location);
 static Node *makeBitStringConst(char *str, int location);
@@ -421,7 +423,7 @@ static char *mys_return_body_text;
 %type <node>	RowSecurityOptionalWithCheck RowSecurityOptionalExpr
 %type <list>	RowSecurityDefaultToRole RowSecurityOptionalToRole
 
-%type <str>		iso_level opt_encoding
+%type <str>		iso_level opt_encoding opt_definer user
 %type <rolespec> grantee
 %type <list>	grantee_list
 %type <accesspriv> privilege
@@ -11100,6 +11102,9 @@ CreateFunctionStmt:
 						makeDefElem("as",
 									(Node *) list_make1(makeString($10)),
 									@10));
+					if ($3 != NULL)
+						n->options = lappend(n->options,
+							mys_make_routine_meta_item("plmysql.definer", $3, @3));
 					n->sql_body = NULL;
 					$$ = (Node *)n;
 				}
@@ -11120,6 +11125,9 @@ CreateFunctionStmt:
 						makeDefElem("as",
 									(Node *) list_make1(makeString($8)),
 									@8));
+					if ($3 != NULL)
+						n->options = lappend(n->options,
+							mys_make_routine_meta_item("plmysql.definer", $3, @3));
 					n->sql_body = NULL;
 					$$ = (Node *)n;
 				}
@@ -11155,6 +11163,9 @@ CreateFunctionStmt:
 							makeDefElem("as",
 										(Node *) list_make1(makeString(body)),
 										@10));
+						if ($3 != NULL)
+							n->options = lappend(n->options,
+								mys_make_routine_meta_item("plmysql.definer", $3, @3));
 						n->sql_body = NULL;
 					}
 					else
@@ -11213,13 +11224,13 @@ opt_or_replace:
 		;
 
 opt_definer:
-            /* empty */
-            | DEFINER '=' user
+            /* empty */							{ $$ = NULL; }
+            | DEFINER '=' user						{ $$ = $3; }
         ;
 
 user:
-            RoleId
-            | RoleId '@' RoleId
+            RoleId									{ $$ = $1; }
+            | RoleId '@' RoleId						{ $$ = psprintf("%s@%s", $1, $3); }
         ;
 
 func_args:	'(' func_args_list ')'					{ $$ = $2; }
@@ -23347,6 +23358,25 @@ makeStringConstCast(char *str, int location, TypeName *typename)
 	Node *s = makeStringConst(str, location);
 
 	return makeTypeCast(s, typename, -1);
+}
+
+/*
+ * Build a "set" DefElem for CREATE/ALTER FUNCTION options that records one
+ * plmysql.* routine metadata value (definer, sql_mode snapshot, timestamps).
+ * The native CreateFunction()/AlterFunction() path stores the wrapped
+ * VariableSetStmt into pg_proc.proconfig; the GUCs themselves are defined by
+ * the plmysql extension.  Passing NULL value yields no item.
+ */
+static DefElem *
+mys_make_routine_meta_item(const char *name, const char *value, int location)
+{
+	VariableSetStmt *v = makeNode(VariableSetStmt);
+
+	v->kind = VAR_SET_VALUE;
+	v->name = pstrdup(name);
+	v->args = list_make1(makeStringConst((char *) value, location));
+
+	return makeDefElem("set", (Node *) v, location);
 }
 
 static Node *

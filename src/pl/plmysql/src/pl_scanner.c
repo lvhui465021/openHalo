@@ -245,7 +245,19 @@ plmysql_yylex(void)
 		else
 		{
 			/* not A.B, so just process A */
-			push_back_token(tok2, &aux2);
+
+			/*
+			 * MySQL's native "<label>:" prefix spelling.  Hold the ':' back
+			 * from the pushback buffer until after the keyword/variable
+			 * classification: if the word ends up as a plain T_WORD at
+			 * statement start and the next token is ':', merge the pair
+			 * into a single T_WORD_COLON token.  Splitting the pair in the
+			 * grammar would need two-token lookahead at statement start,
+			 * desyncing bison's lookahead buffer from the scanner (which
+			 * would break every T_WORD-led statement, e.g. SELECT).
+			 */
+			if (tok2 != ':')
+				push_back_token(tok2, &aux2);
 
 			/*
 			 * See if it matches a variable name, except in the context where
@@ -281,7 +293,24 @@ plmysql_yylex(void)
 				tok1 = UnreservedPLKeywordTokens[kwnum];
 			}
 			else
+			{
 				tok1 = T_WORD;
+
+				/*
+				 * No statement-start restriction: AT_STMT_START (a
+				 * plpgsql-era macro) does not recognize K_DO/K_REPEAT/...
+				 * contexts, and "T_WORD ':'" cannot otherwise appear in
+				 * the syntax, so merging is safe everywhere.
+				 */
+				if (tok2 == ':')
+				{
+					tok1 = T_WORD_COLON;
+					/* Adjust token length to include ident ':' */
+					aux1.leng = aux2.lloc - aux1.lloc + aux2.leng;
+				}
+			}
+			if (tok2 == ':' && (tok1 != T_WORD_COLON))
+				push_back_token(tok2, &aux2);
 		}
 	}
 	else

@@ -168,6 +168,33 @@ initErrorCodeHashTable(void)
     initErrorCode(ERRCODE_T_R_DEADLOCK_DETECTED, 1213);
     initErrorCode(ERRCODE_LOCK_NOT_AVAILABLE, 1205);
     initErrorCode(ERRCODE_QUERY_CANCELED, 1317);
+
+    /*
+     * Broader DDL/DML/routine map (the spec's 40-60 entry target): errno
+     * chosen per common scenario, MySQL 5.7 names in the comments.
+     */
+    initErrorCode(ERRCODE_DUPLICATE_DATABASE, 1007);            /* ER_DB_CREATE_EXISTS */
+    initErrorCode(ERRCODE_UNDEFINED_DATABASE, 1049);            /* ER_BAD_DB_ERROR */
+    initErrorCode(ERRCODE_UNDEFINED_SCHEMA, 1049);              /* ER_BAD_DB_ERROR */
+    initErrorCode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION, 1045); /* ER_ACCESS_DENIED_ERROR */
+    initErrorCode(ERRCODE_INSUFFICIENT_PRIVILEGE, 1142);        /* ER_TABLEACCESS_DENIED_ERROR */
+    initErrorCode(ERRCODE_DUPLICATE_COLUMN, 1060);              /* ER_DUP_FIELDNAME */
+    initErrorCode(ERRCODE_DUPLICATE_FUNCTION, 1304);            /* ER_SP_ALREADY_EXISTS */
+    initErrorCode(ERRCODE_UNDEFINED_OBJECT, 1091);              /* ER_CANT_DROP_FIELD_OR_KEY */
+    initErrorCode(ERRCODE_DATATYPE_MISMATCH, 1366);             /* ER_TRUNCATED_WRONG_VALUE_FOR_FIELD */
+    initErrorCode(ERRCODE_INVALID_COLUMN_REFERENCE, 1054);      /* ER_BAD_FIELD_ERROR */
+    initErrorCode(ERRCODE_DUPLICATE_ALIAS, 1066);               /* ER_NONUNIQ_TABLE */
+    initErrorCode(ERRCODE_READ_ONLY_SQL_TRANSACTION, 1792);     /* ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION */
+    initErrorCode(ERRCODE_T_R_SERIALIZATION_FAILURE, 1213);     /* ER_LOCK_DEADLOCK */
+    initErrorCode(ERRCODE_T_R_DEADLOCK_DETECTED, 1213);         /* ER_LOCK_DEADLOCK */
+    initErrorCode(ERRCODE_FEATURE_NOT_SUPPORTED, 1235);         /* ER_NOT_SUPPORTED_YET */
+    initErrorCode(ERRCODE_INVALID_CURSOR_STATE, 1325);          /* ER_SP_CURSOR_NOT_OPEN */
+    initErrorCode(ERRCODE_DUPLICATE_CURSOR, 1324);              /* ER_SP_CURSOR_ALREADY_OPEN */
+    initErrorCode(ERRCODE_CARDINALITY_VIOLATION, 1172);         /* ER_TOO_MANY_ROWS */
+    initErrorCode(ERRCODE_PROGRAM_LIMIT_EXCEEDED, 1114);        /* ER_TOO_MANY_TABLES */
+    initErrorCode(ERRCODE_CONNECTION_FAILURE, 2006);            /* ER_SERVER_GONE_ERROR */
+    initErrorCode(ERRCODE_CANNOT_CONNECT_NOW, 1040);            /* ER_CON_COUNT_ERROR */
+    initErrorCode(ERRCODE_TOO_MANY_CONNECTIONS, 1040);          /* ER_CON_COUNT_ERROR */
     //initErrorCode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION, 
     //              HALO_ERR_DATA_TOO_LONG);
     //initErrorCode(ERRCODE_INVALID_TEXT_REPRESENTATION, 

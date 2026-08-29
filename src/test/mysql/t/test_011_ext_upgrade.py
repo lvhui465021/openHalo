@@ -73,7 +73,7 @@ def run(cluster):
     _sql(cluster, "CREATE EXTENSION plmysql;")
     _sql(cluster, "ALTER EXTENSION aux_mysql UPDATE;")
     out = _sql(cluster, "SELECT extversion FROM pg_extension WHERE extname = 'aux_mysql';")
-    assert out.strip() == "1.7", out
+    assert out.strip() == "1.8", out
     out = _sql(cluster, "SELECT count(*) FROM pg_language WHERE lanname = 'plmysql';")
     assert out.strip() == "1", out
 

@@ -274,7 +274,7 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
  */
 %token <str>	IDENT UIDENT FCONST SCONST USCONST BCONST XCONST Op
 %token <ival>	ICONST PARAM
-%token			TYPECAST DOT_DOT COLON_EQUALS EQUALS_GREATER
+%token <str>		TYPECAST DOT_DOT COLON_EQUALS EQUALS_GREATER T_WORD_COLON
 %token			LESS_EQUALS GREATER_EQUALS NOT_EQUALS
 
 /*
@@ -2651,6 +2651,25 @@ opt_block_label	:
 						plmysql_ns_push($2, PLMYSQL_LABEL_BLOCK);
 						$$ = $2;
 					}
+				| T_WORD_COLON
+					{
+						/*
+						 * MySQL's native <label>: prefix spelling; the
+						 * scanner merges "ident ':'" into one T_WORD_COLON
+						 * token so the parser needs no two-token lookahead
+						 * at statement start (bison's lookahead buffer and
+						 * the scanner would otherwise desync, which broke
+						 * every T_WORD-led statement such as SELECT).  Only
+						 * a plain identifier can be a label -- admitting
+						 * unreserved keywords here would make every K_* a
+						 * potential statement opener and create
+						 * shift/reduce ambiguities (e.g. after IF...THEN
+						 * in proc_sect K_ELSIF).  MySQL's grammar says the
+						 * same thing: a label is an identifier.
+						 */
+						plmysql_ns_push($1, PLMYSQL_LABEL_BLOCK);
+						$$ = $1;
+					}
 				;
 
 opt_loop_label	:
@@ -2662,6 +2681,13 @@ opt_loop_label	:
 					{
 						plmysql_ns_push($2, PLMYSQL_LABEL_LOOP);
 						$$ = $2;
+					}
+				| T_WORD_COLON
+					{
+						/* MySQL's native <label>: prefix spelling (see
+						 * opt_block_label for why T_WORD, not any_identifier) */
+						plmysql_ns_push($1, PLMYSQL_LABEL_LOOP);
+						$$ = $1;
 					}
 				;
 

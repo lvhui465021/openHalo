@@ -57,6 +57,98 @@
 #include "nodes/mysql/mys_parsenodes.h"
 #include "rewrite/rewriteHandler.h"
 #include "utils/snapmgr.h"
+#include "adapter/mysql/systemVar.h"
+#include "utils/timestamp.h"
+
+/*
+ * Routine metadata for the plmysql engine, carried in pg_proc.proconfig as
+ * function-local GUC settings (plmysql.definer / sql_mode / created /
+ * last_altered, defined by the plmysql extension).  The grammar records the
+ * DEFINER account; the utility path here adds the CREATE-time session
+ * sql_mode snapshot and the timestamps right before the native DDL path
+ * stores proconfig, so pg_dump/pg_restore carry the values along with
+ * prosrc.  The GUCs are inert strings, so a routine restored from a dump
+ * without them simply falls back to the views' default display.
+ */
+static DefElem *
+mys_plmysql_meta_item(const char *name, const char *value)
+{
+	VariableSetStmt *v = makeNode(VariableSetStmt);
+	A_Const    *c = makeNode(A_Const);
+
+	c->val.type = T_String;
+	c->val.val.str = pstrdup(value);
+	c->location = -1;
+	v->kind = VAR_SET_VALUE;
+	v->name = pstrdup(name);
+	v->args = list_make1(c);
+
+	return makeDefElem("set", (Node *) v, -1);
+}
+
+static bool
+mys_plmysql_lang(List *options)
+{
+	ListCell   *lc;
+
+	foreach(lc, options)
+	{
+		DefElem    *defel = (DefElem *) lfirst(lc);
+
+		if (strcmp(defel->defname, "language") == 0)
+			return strcmp(defGetString(defel), "plmysql") == 0;
+	}
+	return false;
+}
+
+static char *
+mys_plmysql_timestamp_text(void)
+{
+	char	   *ts = DatumGetCString(DirectFunctionCall1(timestamptz_out,
+														 TimestampTzGetDatum(GetCurrentTimestamp())));
+	char	   *pos;
+
+	/*
+	 * mysql.datetime is a naive timestamp; strip the timezone suffix that
+	 * timestamptz_out appends (e.g. "+08" / "-05").  Scan for the first
+	 * sign after the date part, which is the timezone marker.
+	 */
+	pos = strpbrk(ts + 10, "+-");
+	if (pos != NULL)
+	{
+		char	   *ret = palloc(pos - ts + 1);
+
+		memcpy(ret, ts, pos - ts);
+		ret[pos - ts] = '\0';
+		return ret;
+	}
+	return ts;
+}
+
+static void
+mys_plmysql_inject_create_meta(CreateFunctionStmt *stmt)
+{
+	if (!mys_plmysql_lang(stmt->options))
+		return;
+
+	stmt->options = lappend(stmt->options,
+							mys_plmysql_meta_item("plmysql.sql_mode",
+												 mysGetSqlModeText()));
+	stmt->options = lappend(stmt->options,
+							mys_plmysql_meta_item("plmysql.created",
+												 mys_plmysql_timestamp_text()));
+	stmt->options = lappend(stmt->options,
+							mys_plmysql_meta_item("plmysql.last_altered",
+												 mys_plmysql_timestamp_text()));
+}
+
+static void
+mys_plmysql_inject_alter_meta(AlterFunctionStmt *stmt)
+{
+	stmt->actions = lappend(stmt->actions,
+							mys_plmysql_meta_item("plmysql.last_altered",
+												 mys_plmysql_timestamp_text()));
+}
 
 static void mys_ProcessUtilitySlow(ParseState *pstate,
                                    PlannedStmt *pstmt,
@@ -1202,10 +1294,12 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateFunctionStmt:	/* CREATE FUNCTION */
+				mys_plmysql_inject_create_meta((CreateFunctionStmt *) parsetree);
 				address = CreateFunction(pstate, (CreateFunctionStmt *) parsetree);
 				break;
 
 			case T_AlterFunctionStmt:	/* ALTER FUNCTION */
+				mys_plmysql_inject_alter_meta((AlterFunctionStmt *) parsetree);
 				address = AlterFunction(pstate, (AlterFunctionStmt *) parsetree);
 				break;
 

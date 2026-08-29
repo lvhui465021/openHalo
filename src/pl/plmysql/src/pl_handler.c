@@ -80,6 +80,12 @@ char	   *plmysql_extra_errors_string = NULL;
 int			plmysql_extra_warnings;
 int			plmysql_extra_errors;
 
+/* Routine metadata carried in pg_proc.proconfig (see _PG_init). */
+char	   *plmysql_definer_string = NULL;
+char	   *plmysql_sql_mode_string = NULL;
+char	   *plmysql_created_string = NULL;
+char	   *plmysql_last_altered_string = NULL;
+
 /* Hook for plugins */
 PLMySQL_plugin **plmysql_plugin_ptr = NULL;
 
@@ -224,6 +230,43 @@ _PG_init(void)
 							   plmysql_extra_checks_check_hook,
 							   plmysql_extra_errors_assign_hook,
 							   NULL);
+
+	/*
+	 * Routine metadata that pg_proc cannot carry, stored as function-local
+	 * GUC settings (proconfig).  Writing them through proconfig rather than a
+	 * companion catalog keeps them attached to the routine across
+	 * pg_dump/pg_restore and logical replication, and makes them visible to
+	 * the executor as ordinary session GUCs during a call, which is how
+	 * CREATE-time sql_mode semantics will be applied.
+	 */
+	DefineCustomStringVariable("plmysql.definer",
+							   gettext_noop("Definer account recorded at routine creation, as user@host."),
+							   NULL,
+							   &plmysql_definer_string,
+							   "",
+							   PGC_USERSET, 0,
+							   NULL, NULL, NULL);
+	DefineCustomStringVariable("plmysql.sql_mode",
+							   gettext_noop("sql_mode snapshot recorded at routine creation."),
+							   NULL,
+							   &plmysql_sql_mode_string,
+							   "",
+							   PGC_USERSET, 0,
+							   NULL, NULL, NULL);
+	DefineCustomStringVariable("plmysql.created",
+							   gettext_noop("Routine creation time, ISO text."),
+							   NULL,
+							   &plmysql_created_string,
+							   "",
+							   PGC_USERSET, 0,
+							   NULL, NULL, NULL);
+	DefineCustomStringVariable("plmysql.last_altered",
+							   gettext_noop("Routine last-alter time, ISO text."),
+							   NULL,
+							   &plmysql_last_altered_string,
+							   "",
+							   PGC_USERSET, 0,
+							   NULL, NULL, NULL);
 
 	EmitWarningsOnPlaceholders("plmysql");
 
