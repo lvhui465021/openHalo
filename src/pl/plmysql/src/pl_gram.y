@@ -16,6 +16,8 @@
 
 #include "postgres.h"
 
+#include "adapter/mysql/errorConvertor.h"
+
 #include "catalog/namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -106,6 +108,8 @@ static	PLMySQL_expr	*read_sql_stmt(void);
 static	PLMySQL_type	*read_datatype(int tok);
 static	PLMySQL_stmt	*make_execsql_stmt(int firsttoken, int location,
 										   PLword *word);
+static	void			mysql_check_dynamic_sql_context(int firsttoken,
+													  PLword *word, int location);
 static	PLMySQL_stmt_fetch *read_fetch_direction(void);
 static	void			 complete_direction(PLMySQL_stmt_fetch *fetch,
 											bool *check_FROM);
@@ -228,7 +232,7 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %type <list>	condition_value_list
 %type <cond>	decl_condition_def
 %type <ival>	decl_handler_type
-%type <stmt>	handler_action_stmt
+%type <list>	handler_action_stmt
 %type <condition> opt_resignal_cond
 %type <list>	opt_signal_setinfo
 
@@ -1284,7 +1288,6 @@ opt_signal_setinfo :
 stmt_getdiag	: K_GET getdiag_area_opt K_DIAGNOSTICS getdiag_list ';'
 					{
 						PLMySQL_stmt_getdiag	 *new;
-						ListCell		*lc;
 
 						new = palloc0(sizeof(PLMySQL_stmt_getdiag));
 						new->cmd_type = PLMYSQL_STMT_GETDIAG;
@@ -3163,6 +3166,8 @@ make_execsql_stmt(int firsttoken, int location, PLword *word)
 
 	memset(tokens, 0, sizeof(tokens));
 
+	mysql_check_dynamic_sql_context(firsttoken, word, location);
+
 	/* special lookup mode for identifiers within the SQL text */
 	save_IdentifierLookup = plmysql_IdentifierLookup;
 	plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
@@ -3323,6 +3328,36 @@ make_execsql_stmt(int firsttoken, int location, PLword *word)
 	execsql->target	 = target;
 
 	return (PLMySQL_stmt *) execsql;
+}
+
+/*
+ * MySQL's named PREPARE/EXECUTE/DEALLOCATE statements are session-scoped.
+ * They are valid in stored procedures, but MySQL 5.7 rejects them while a
+ * stored function or trigger is being compiled (ER_STMT_NOT_ALLOWED_IN_SF_OR_TRG).
+ * PREPARE and DEALLOCATE arrive here as ordinary words; EXECUTE has its own
+ * grammar token, so recognize both paths before handing the statement to SPI.
+ */
+static void
+mysql_check_dynamic_sql_context(int firsttoken, PLword *word, int location)
+{
+	bool		is_dynamic_sql = firsttoken == K_EXECUTE;
+
+	if (firsttoken == T_WORD && word != NULL && !word->quoted &&
+		word->ident != NULL &&
+		(pg_strcasecmp(word->ident, "prepare") == 0 ||
+		 pg_strcasecmp(word->ident, "deallocate") == 0))
+		is_dynamic_sql = true;
+
+	if (!is_dynamic_sql ||
+		(plmysql_curr_compile->fn_prokind != PROKIND_FUNCTION &&
+		 plmysql_curr_compile->fn_is_trigger == PLMYSQL_NOT_TRIGGER))
+		return;
+
+	mysSetPendingMySQLErrno(1336); /* ER_STMT_NOT_ALLOWED_IN_SF_OR_TRG */
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("Dynamic SQL is not allowed in stored function or trigger"),
+			 parser_errposition(location)));
 }
 
 

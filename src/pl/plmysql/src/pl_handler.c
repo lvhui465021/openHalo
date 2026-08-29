@@ -17,6 +17,8 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "adapter/mysql/errorConvertor.h"
+#include "adapter/mysql/systemVar.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
@@ -34,6 +36,21 @@ static bool plmysql_extra_checks_check_hook(char **newvalue, void **extra, GucSo
 static void plmysql_extra_warnings_assign_hook(const char *newvalue, void *extra);
 static void plmysql_extra_errors_assign_hook(const char *newvalue, void *extra);
 static void plmysql_require_mysql_protocol(void);
+
+/*
+ * This is deliberately a backend-local stack.  A PL handler invocation
+ * cannot cross a backend boundary, and the entries themselves live in their
+ * invoking handler frames, so PG_TRY/PG_FINALLY can reliably unwind it.
+ */
+typedef struct PLMySQL_call_stack_entry
+{
+	Oid			fn_oid;
+	struct PLMySQL_call_stack_entry *prev;
+} PLMySQL_call_stack_entry;
+
+static PLMySQL_call_stack_entry *plmysql_call_stack = NULL;
+
+static void plmysql_check_recursion(PLMySQL_function *func);
 
 PG_MODULE_MAGIC;
 
@@ -266,6 +283,60 @@ plmysql_require_mysql_protocol(void)
 				 errhint("Connect to the MySQL listener port instead of the PostgreSQL port.")));
 }
 
+/*
+ * MySQL permits recursive PROCEDURE calls, controlled per session by
+ * max_sp_recursion_depth (zero disables them), but disallows recursive
+ * FUNCTION calls altogether.  Count only re-entries of this exact routine:
+ * a chain p -> q -> p is recursive for p, while ordinary nested calls are
+ * not subject to the limit.
+ */
+static void
+plmysql_check_recursion(PLMySQL_function *func)
+{
+	PLMySQL_call_stack_entry *entry;
+	char		varname[] = "max_sp_recursion_depth";
+	char	   *value = NULL;
+	int			recursions = 0;
+	int			max_depth;
+
+	for (entry = plmysql_call_stack; entry != NULL; entry = entry->prev)
+	{
+		if (entry->fn_oid == func->fn_oid)
+			recursions++;
+	}
+
+	if (recursions == 0)
+		return;
+
+	if (func->fn_prokind == PROKIND_FUNCTION)
+	{
+		mysSetPendingMySQLErrno(1424); /* ER_SP_NO_RECURSION */
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("recursive stored functions are not allowed")));
+	}
+
+	getSystemVariableValueForSelect(varname, true, &value);
+	max_depth = pg_strtoint32(value);
+
+	/* The existing variable catalog predates this enforcement and permits an
+	 * unconstrained numeric value.  Keep the server-side limit compatible
+	 * with MySQL 5.7 even for clusters upgraded from that catalog. */
+	if (max_depth < 0 || max_depth > 255)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("max_sp_recursion_depth must be between 0 and 255")));
+
+	if (recursions > max_depth)
+	{
+		mysSetPendingMySQLErrno(1456); /* ER_SP_RECURSION_LIMIT */
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("recursive limit %d (as set by the max_sp_recursion_depth variable) was exceeded for routine \"%s\"",
+						max_depth, func->fn_signature)));
+	}
+}
+
 /* ----------
  * plmysql_call_handler
  *
@@ -282,6 +353,7 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 	PLMySQL_function *func;
 	PLMySQL_execstate *save_cur_estate;
 	ResourceOwner procedure_resowner;
+	PLMySQL_call_stack_entry call_stack_entry;
 	volatile Datum retval = (Datum) 0;
 	int			rc;
 
@@ -299,6 +371,10 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 
 	/* Find or compile the function */
 	func = plmysql_compile(fcinfo, false);
+	plmysql_check_recursion(func);
+	call_stack_entry.fn_oid = func->fn_oid;
+	call_stack_entry.prev = plmysql_call_stack;
+	plmysql_call_stack = &call_stack_entry;
 
 	/* Must save and restore prior value of cur_estate */
 	save_cur_estate = func->cur_estate;
@@ -340,6 +416,8 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 	}
 	PG_FINALLY();
 	{
+		plmysql_call_stack = call_stack_entry.prev;
+
 		/* Decrement use-count, restore cur_estate */
 		func->use_count--;
 		func->cur_estate = save_cur_estate;

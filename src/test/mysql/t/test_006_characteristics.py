@@ -134,6 +134,12 @@ def run(cluster):
         "SELECT obj_description(p.oid, 'pg_proc') FROM pg_proc p "
         "WHERE p.proname = 't006_def';")
     assert out.strip() == "demo procedure", "COMMENT lost: %r" % out
+    assert _scalar(cluster,
+                   "SELECT ROUTINE_COMMENT FROM information_schema.ROUTINES "
+                   "WHERE ROUTINE_SCHEMA = 'public' AND ROUTINE_NAME = 't006_def'") == ("demo procedure",)
+    assert _scalar(cluster,
+                   "SELECT comment FROM mysql.proc "
+                   "WHERE db = 'public' AND name = 't006_def'") == ("demo procedure",)
 
     _ddl(cluster,
          "DROP FUNCTION IF EXISTS t006_deffn",

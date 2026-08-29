@@ -5177,7 +5177,7 @@ create view mys_informa_schema.routines as
         '2024-1-1'::mysql.datetime as CREATED,
         '2024-1-1'::mysql.datetime as LAST_ALTERED,
         'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION'::varchar(8192) as SQL_MODE,
-        ''::text as ROUTINE_COMMENT,
+        coalesce(pg_catalog.obj_description(oid, 'pg_proc'), '')::text as ROUTINE_COMMENT,
         pg_catalog.concat(pg_get_userbyid(proowner), '@%')::varchar(93) as DEFINER,
         'utf8mb4'::varchar(32) as CHARACTER_SET_CLIENT,
         'utf8mb4_general_ci'::varchar(32) as COLLATION_CONNECTION,
@@ -5208,7 +5208,7 @@ create view mysql.proc as
         '2024-1-1'::timestamptz as created,
         '2024-1-1'::timestamptz as modified,
         'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION'::varchar(8192) as sql_mode,
-        ''::text as comment,
+        coalesce(pg_catalog.obj_description(oid, 'pg_proc'), '')::text as comment,
         'utf8mb4'::char(32) as character_set_client,
         'utf8mb4_general_ci'::char(32) as collation_connection,
         'utf8_general_ci'::char(32) as db_collation,
@@ -5593,4 +5593,3 @@ GRANT ALL PRIVILEGES ON ALL tables IN SCHEMA mysql TO public;
 GRANT ALL PRIVILEGES ON ALL tables IN SCHEMA mys_informa_schema TO public;
 GRANT ALL PRIVILEGES ON ALL tables IN SCHEMA sys TO public;
 GRANT ALL PRIVILEGES ON ALL tables IN SCHEMA mys_sys TO public;
-

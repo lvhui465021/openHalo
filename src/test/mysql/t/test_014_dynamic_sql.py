@@ -75,4 +75,21 @@ def run(cluster):
             assert cur.fetchone() == (1,), \
                 "PREPARE/EXECUTE/DEALLOCATE PREPARE inside a procedure body failed"
 
+    # MySQL permits named prepared statements in PROCEDUREs only.  Reject the
+    # definition itself in FUNCTION context, before a session-scoped prepared
+    # statement can leak out of the function invocation.
+    with cluster.mysql(dbname="public") as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP FUNCTION IF EXISTS t014_f")
+            try:
+                cur.execute("""CREATE FUNCTION t014_f() RETURNS INT
+                    BEGIN
+                        PREPARE t014_bad FROM 'SELECT 1';
+                        RETURN 1;
+                    END""")
+            except pymysql.MySQLError as exc:
+                assert exc.args[0] == 1336, exc
+            else:
+                raise AssertionError("PREPARE was accepted in a stored function")
+
     CONN.close()

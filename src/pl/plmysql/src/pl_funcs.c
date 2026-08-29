@@ -264,6 +264,8 @@ plmysql_stmt_typename(PLMySQL_stmt *stmt)
 			return "RETURN QUERY";
 		case PLMYSQL_STMT_RAISE:
 			return "RAISE";
+		case PLMYSQL_STMT_SIGNAL:
+			return ((PLMySQL_stmt_signal *) stmt)->is_resignal ? "RESIGNAL" : "SIGNAL";
 		case PLMYSQL_STMT_ASSERT:
 			return "ASSERT";
 		case PLMYSQL_STMT_EXECSQL:
@@ -326,6 +328,8 @@ plmysql_getdiag_kindname(PLMySQL_getdiag_kind kind)
 			return "TABLE_NAME";
 		case PLMYSQL_GETDIAG_SCHEMA_NAME:
 			return "SCHEMA_NAME";
+		case PLMYSQL_GETDIAG_MYSQL_ERRNO:
+			return "MYSQL_ERRNO";
 	}
 
 	return "unknown";

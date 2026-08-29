@@ -2165,7 +2165,6 @@ static int
 exec_stmt_block(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
 {
 	volatile int rc = -1;
-	int			i;
 
 	/*
 	 * Blocks with MySQL condition handlers run through the MySQL execution
@@ -4893,10 +4892,17 @@ exec_stmt_execsql(PLMySQL_execstate *estate,
 			if (stmt->is_select && estate->func->fn_prokind == PROKIND_PROCEDURE)
 				plmysql_push_execsql_resultset(estate, SPI_tuptable, SPI_processed);
 			else
+			{
+				if (estate->func->fn_prokind == PROKIND_FUNCTION)
+					mysSetPendingMySQLErrno(1415); /* ER_SP_NO_RETSET */
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("query has no destination for result data"),
+						(errcode(estate->func->fn_prokind == PROKIND_FUNCTION ?
+								 ERRCODE_FEATURE_NOT_SUPPORTED : ERRCODE_SYNTAX_ERROR),
+						 errmsg(estate->func->fn_prokind == PROKIND_FUNCTION ?
+								"Not allowed to return a result set from a function" :
+								"query has no destination for result data"),
 						 (rc == SPI_OK_SELECT) ? errhint("If you want to discard the results of a SELECT, use PERFORM instead.") : 0));
+			}
 		}
 	}
 

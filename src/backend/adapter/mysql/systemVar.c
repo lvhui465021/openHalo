@@ -1210,6 +1210,20 @@ rectifySystemVarValue(const char *varName, char **varValue,
                 *varValue = pstrdup(buf);
                 return;
             }
+			else if (strcmp(varName, "max_sp_recursion_depth") == 0)
+			{
+				char	   *endptr;
+				long		depth;
+
+				errno = 0;
+				depth = strtol(*varValue, &endptr, 10);
+				if (errno == ERANGE || endptr == *varValue || *endptr != '\0' ||
+					depth < 0 || depth > 255)
+					elog(ERROR,
+						 "Variable 'max_sp_recursion_depth' can't be set to the value of '%s'",
+						 *varValue);
+				return;
+			}
             else 
             {
                 int varValueLen;
@@ -1664,4 +1678,3 @@ getOSTimeZone(void)
 
     return ret;
 }
-
