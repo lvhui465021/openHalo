@@ -815,7 +815,21 @@ sendErrorMessage(ErrorData *edata)
         affectedRows = -1;
         if (!isIgnoreStmt)
         {
-            sendErrPacket(edata->sqlerrcode, edata->message, "HY000");
+            /*
+             * Use the error's real SQLSTATE on the wire instead of a
+             * blanket "HY000": a plmysql "SIGNAL SQLSTATE 'xxxxx'" (or
+             * RESIGNAL) sets this to whatever custom code the routine
+             * chose, and MySQL clients expect that state to round-trip
+             * verbatim.  For errors mapped to a specific MySQL errno via
+             * convertErrorCode()'s table, this is still the PostgreSQL
+             * code, not that errno's own MySQL-canonical SQLSTATE; getting
+             * that requires the errno -> canonical-SQLSTATE side of the
+             * mapping design still calls for (see the MySQL stored
+             * procedure design spec, section 4.8), which is a larger,
+             * separate piece of work than this fix.
+             */
+            sendErrPacket(edata->sqlerrcode, edata->message,
+                         unpack_sql_state(edata->sqlerrcode));
         }
         else 
         {

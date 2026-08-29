@@ -9,11 +9,10 @@ selected to create in"（既有行为，见 test_002 的说明），会在到达
 `CALL p()` + 过程体里一句裸 `SELECT w;` 来读出变量值。那条路在 M1 走不通——
 「过程体里的 SELECT 把结果集回传给客户端」是 MySQL 的多结果集语义，设计文档
 把它排在 **M5**（见 `docs/superpowers/specs/...` 的 M5「CALL OUT 回写 + 多结果
-集」）。继承自 plpgsql 的执行器对没有 INTO 的 SELECT 一律报
-"query has no destination for result data"。所以这里改用两种 M1 已支持的观测
-方式：存储函数用 `RETURN` 回值，存储过程写进表再读回来。下面
-`_known_limitation_bare_select()` 把那条限制本身钉成一条断言，等 M5 把它做出来
-时会「响亮地」提醒把它挪走。
+集」）。继承自 plpgsql 的执行器对没有 INTO 的 SELECT 曾一律报
+"query has no destination for result data"。所以本文件大多数用例改用两种 M1
+已支持的观测方式：存储函数用 `RETURN` 回值，存储过程写进表再读回来。
+`_bare_select_returns_resultset()` 单独验证 M5 补上的裸 SELECT 回传语义本身。
 """
 
 import pymysql
@@ -96,12 +95,12 @@ def _basic_declare_set(cluster):
          """, "SELECT t003_f42()", 42)
 
 
-def _known_limitation_bare_select(cluster):
-    """过程体里的裸 SELECT 目前必须「响亮地」失败，而不是静默丢结果。
+def _bare_select_returns_resultset(cluster):
+    """过程体里的裸 SELECT（无 INTO）把结果集直接回传给客户端（M5 语义）。
 
-    MySQL 的语义是把它当成一个结果集回传给客户端；那属于 M5。这里钉住当前行为，
-    将来谁把它做出来，这条断言会失败并提示把用例挪走——防止它悄悄退化成
-    「SELECT 被执行了但结果被丢掉」。
+    这条用例曾经是「已知限制」：M1 阶段裸 SELECT 必须响亮报错
+    "query has no destination for result data"。M5 补上了多结果集回传后，
+    这里改为断言 CALL 能读到那一行数据。
     """
     _ddl(cluster, "DROP PROCEDURE IF EXISTS t003_baresel")
     _ddl(cluster, """
@@ -111,16 +110,11 @@ def _known_limitation_bare_select(cluster):
              SELECT v;
          END
          """)
-    try:
-        _ddl(cluster, "CALL t003_baresel()")
-    except pymysql.err.MySQLError as e:
-        assert "no destination for result data" in str(e), \
-            "bare SELECT in a routine failed for an unexpected reason: %r" % (e,)
-    else:
-        raise AssertionError(
-            "a bare SELECT inside a routine now returns to the client -- good, "
-            "but that is M5 work: move this case out of the known-limitation "
-            "list and assert the returned rows instead")
+    with cluster.mysql(dbname="public") as conn:
+        with conn.cursor() as cur:
+            cur.execute("CALL t003_baresel()")
+            assert cur.fetchall() == ((42,),), \
+                "expected the bare SELECT's row back from CALL"
 
 
 def _if_elseif_else(cluster):
@@ -395,7 +389,7 @@ def _must_fail_loudly(cluster):
 
 def run(cluster):
     _basic_declare_set(cluster)
-    _known_limitation_bare_select(cluster)
+    _bare_select_returns_resultset(cluster)
     _if_elseif_else(cluster)
     _return_stmt(cluster)
     _multi_variable_declare(cluster)

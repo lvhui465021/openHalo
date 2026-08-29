@@ -785,6 +785,7 @@ do_compile(FunctionCallInfo fcinfo,
 	/*
 	 * Now parse the function's text
 	 */
+	plmysql_decl_reset_for_compile();
 	parse_rc = plmysql_yyparse();
 	if (parse_rc != 0)
 		elog(ERROR, "plmysql parser returned %d", parse_rc);
@@ -941,6 +942,7 @@ plmysql_compile_inline(char *proc_source)
 	/*
 	 * Now parse the function's text
 	 */
+	plmysql_decl_reset_for_compile();
 	parse_rc = plmysql_yyparse();
 	if (parse_rc != 0)
 		elog(ERROR, "plmysql parser returned %d", parse_rc);

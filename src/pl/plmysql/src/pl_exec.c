@@ -4561,6 +4561,8 @@ plmysql_estate_setup(PLMySQL_execstate *estate,
 	estate->err_stmt = NULL;
 	estate->err_text = NULL;
 
+	estate->resultsets_sent = 0;
+
 	estate->plugin_info = NULL;
 
 	/*
@@ -4881,12 +4883,21 @@ exec_stmt_execsql(PLMySQL_execstate *estate,
 	}
 	else
 	{
-		/* If the statement returned a tuple table, complain */
+		/* If the statement returned a tuple table, complain -- unless it's a
+		 * MySQL-style bare SELECT in a PROCEDURE, which streams its result
+		 * set to the client instead (design spec section 4.7).  A FUNCTION
+		 * doing the same is still an error: MySQL 5.7 does not allow a
+		 * function to return a result set (its own error 1415). */
 		if (SPI_tuptable != NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("query has no destination for result data"),
-					 (rc == SPI_OK_SELECT) ? errhint("If you want to discard the results of a SELECT, use PERFORM instead.") : 0));
+		{
+			if (stmt->is_select && estate->func->fn_prokind == PROKIND_PROCEDURE)
+				plmysql_push_execsql_resultset(estate, SPI_tuptable, SPI_processed);
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("query has no destination for result data"),
+						 (rc == SPI_OK_SELECT) ? errhint("If you want to discard the results of a SELECT, use PERFORM instead.") : 0));
+		}
 	}
 
 	return PLMYSQL_RC_OK;

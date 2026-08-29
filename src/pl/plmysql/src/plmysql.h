@@ -1091,8 +1091,10 @@ typedef struct PLMySQL_function
 	unsigned int nstatements;	/* counter for assigning stmtids */
 	bool		requires_procedure_resowner;	/* contains CALL or DO? */
 	bool		has_handlers;	/* body contains a MySQL DECLARE HANDLER? */
-	int			n_resultsets;	/* number of bare SELECTs that stream result
-								 * sets to the client (MySQL semantics) */
+	int			n_resultsets;	/* number of statements that may stream a
+								 * result set to the client (MySQL
+								 * semantics): bare SELECTs, and EXECUTE of a
+								 * prepared statement (which might be one) */
 
 	/* these fields change when the function is used */
 	struct PLMySQL_execstate *cur_estate;
@@ -1174,6 +1176,15 @@ typedef struct PLMySQL_execstate
 	/* status information for error context reporting */
 	PLMySQL_stmt *err_stmt;		/* current stmt */
 	const char *err_text;		/* additional state info */
+
+	/*
+	 * Number of MySQL-style result sets this invocation has already
+	 * streamed to the client (bare SELECTs inside a PROCEDURE body, with no
+	 * INTO clause).  Compared against PLMySQL_function.n_resultsets to
+	 * decide whether more such pushes are still to come; see
+	 * plmysql_push_execsql_resultset() in pl_exec_ext.c.
+	 */
+	int			resultsets_sent;
 
 	void	   *plugin_info;	/* reserved for use by optional plugin */
 } PLMySQL_execstate;
@@ -1300,6 +1311,9 @@ extern int	plmysql_exec_block_mysql(PLMySQL_execstate *estate,
 extern void plmysql_exec_block_initvars(PLMySQL_execstate *estate,
 										PLMySQL_stmt_block *block);
 extern void plmysql_clear_signal_errno(void);
+extern void plmysql_push_execsql_resultset(PLMySQL_execstate *estate,
+										   SPITupleTable *tuptab,
+										   uint64 ntuples);
 
 /*
  * MySQL errno <-> SQLSTATE mapping (pl_exec_ext.c)
@@ -1357,6 +1371,7 @@ extern PLMySQL_condition *plmysql_parse_err_condition(char *condname);
 extern void plmysql_adddatum(PLMySQL_datum *newdatum);
 extern int	plmysql_add_initdatums(int **varnos);
 extern void plmysql_HashTableInit(void);
+extern void plmysql_decl_reset_for_compile(void);
 
 /*
  * Functions in pl_handler.c

@@ -23,8 +23,17 @@
  */
 #include "postgres.h"
 
+#include "adapter/mysql/adapter.h"
+#include "adapter/mysql/common.h"
 #include "adapter/mysql/errorConvertor.h"
+#include "executor/executor.h"
+#include "executor/spi.h"
+#include "libpq/libpq-be.h"
+#include "miscadmin.h"
 #include "plmysql.h"
+#include "postmaster/protocol_interface.h"
+#include "tcop/cmdtag.h"
+#include "tcop/dest.h"
 
 /*
  * Canonical (errno, SQLSTATE) pairs, sorted by errno.  SQLSTATEs follow the
@@ -145,4 +154,61 @@ plmysql_clear_signal_errno(void)
 {
 	plmysql_last_signal_errno = 0;
 	mysSetPendingMySQLErrno(0);
+}
+
+/*
+ * plmysql_push_execsql_resultset
+ *		Stream an already-materialized SPI result set to the MySQL client,
+ *		the way MySQL 5.7 lets a PROCEDURE body return an ad-hoc result set
+ *		via a bare SELECT with no INTO clause (design spec section 4.7).
+ *
+ * The caller (exec_stmt_execsql(), pl_exec.c) has already run the SELECT
+ * through SPI and is holding its result in tuptab; there is no live Portal
+ * for it (SPI never opens one), so this sends the rows directly through a
+ * fresh DestReceiver the way commands/functioncmds.c's ExecuteCallStmt()
+ * sends a CALL's OUT-param row -- CreateDestReceiver(DestRemote) resolves to
+ * the MySQL wire-protocol printTup family whenever the session is on the
+ * MySQL protocol (access/common/printtup.c's printtup_create_DR()), which is
+ * guaranteed here: plmysql routines can only run in such sessions
+ * (pl_handler.c's plmysql_require_mysql_protocol()).
+ *
+ * "More results" bookkeeping is the moreResultsFlag global that the
+ * top-level MySQL multi-statement loop (tcop/postgres.c) also uses, compared
+ * here against PLMySQL_function.n_resultsets -- the number of such
+ * result-set-producing statements the compiler counted in this routine's
+ * body.  This is a static, straight-line count: a bare SELECT that runs
+ * repeatedly inside a loop is only counted once, so a loop emitting more
+ * than one result set can undercount "how many are left" on later
+ * iterations.  That's an accepted limitation (matches the design spec's own
+ * framing of this bookkeeping), not a case in scope today.
+ */
+void
+plmysql_push_execsql_resultset(PLMySQL_execstate *estate,
+							   SPITupleTable *tuptab, uint64 ntuples)
+{
+	DestReceiver *dest;
+	TupOutputState *tstate;
+	QueryCompletion qc;
+	uint64		i;
+
+	estate->resultsets_sent++;
+	moreResultsFlag = (estate->resultsets_sent < estate->func->n_resultsets)
+		? HALO_SVR_MORE_RESULTS_EXISTS : 0;
+
+	dest = CreateDestReceiver(DestRemote);
+	tstate = begin_tup_output_tupdesc(dest, tuptab->tupdesc, &TTSOpsHeapTuple);
+	for (i = 0; i < ntuples; i++)
+	{
+		TupleTableSlot *slot = ExecStoreHeapTuple(tuptab->vals[i],
+												  tstate->slot, false);
+
+		(void) tstate->dest->receiveSlot(slot, tstate->dest, CMDTAG_SELECT);
+	}
+	end_tup_output(tstate);
+
+	SetQueryCompletion(&qc, CMDTAG_SELECT, ntuples);
+	if (MyProcPort)
+		MyProcPort->protocol_handler->end_command(&qc, DestRemote);
+
+	SPI_freetuptable(tuptab);
 }

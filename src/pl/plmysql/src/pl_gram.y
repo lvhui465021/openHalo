@@ -552,6 +552,8 @@ mysql_decl_stmt	: mysql_decl_head decl_varnames decl_datatype decl_defval
 						 */
 						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
 
+						mysql_decl_check_phase(0, @1);
+
 						/* $2 is the decl_varnames list (mysql_decl_head is $1) */
 						foreach(lc, $2)
 						{
@@ -606,6 +608,8 @@ mysql_decl_stmt	: mysql_decl_head decl_varnames decl_datatype decl_defval
 						 * scanned.
 						 */
 						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
+
+						mysql_decl_check_phase(1, @1);
 
 						new = (PLMySQL_var *)
 							plmysql_build_variable($2.name, $2.lineno,
@@ -1085,19 +1089,6 @@ stmt_assign		: T_DATUM
 				;
 
 /*
- * MySQL spells assignment "SET var = expr;".  Everything after the SET is
- * handled exactly as stmt_assign handles a bare "var := expr;": the target
- * datum token is pushed back so that read_sql_construct() captures the whole
- * "var = expr" text and hands it to the core parser in the matching
- * RAW_PARSE_PLPGSQL_ASSIGNn mode.
- *
- * The T_WORD/T_CWORD alternatives exist only to turn "SET notavariable = 1"
- * into a message naming the offending word, instead of a bare syntax error;
- * this mirrors what getdiag_target does.
- *
- * MySQL also allows "SET a = 1, b = 2;"; that is left for M2.
- */
-/*
  * MySQL spells assignment "SET var = expr;" and also allows several targets
  * in one statement: "SET a = 1, b = 2;".  Everything after each target name
  * is handled exactly as stmt_assign handles a bare "var := expr;": the target
@@ -1110,12 +1101,34 @@ stmt_assign		: T_DATUM
  * into a message naming the offending word, instead of a bare syntax error;
  * this mirrors what getdiag_target does.
  *
- * MySQL also allows "SET @uservar = ..." and "SET <system-var> = ..."; those
- * are session-level, not routine-local, and are rejected here for now.
+ * MySQL also allows "SET @uservar = expr;": a session-level user variable,
+ * not a plmysql local datum.  The scanner has no notion of "@identifier" as
+ * one token (core scan.l returns a lone "@" as a generic Op, since it isn't
+ * one of the core scanner's multi-char operators), so "SET @x = 1" reaches
+ * this production as K_SET Op("@") rather than K_SET T_DATUM.  Rather than
+ * teach this grammar what a user variable is, the whole statement is handed
+ * to SPI verbatim, exactly like a generic passthrough SQL statement
+ * (stmt_execsql's make_execsql_stmt): under the MySQL protocol session that
+ * every plmysql routine runs in, SPI parses it with the very same grammar
+ * that already handles a top-level "SET @uservar = expr;", so the existing
+ * user-variable machinery runs it unchanged.
+ *
+ * "SET <system-var> = expr" (no "@") is not covered by this: that spelling
+ * is indistinguishable at this point from "SET <bad-local-var-name> = expr",
+ * which the T_WORD/T_CWORD alternatives below deliberately reject with a
+ * friendlier error instead of guessing. Left for a future pass.
  */
 stmt_set		: K_SET set_assign_list
 					{
 						$$ = $2;
+					}
+				| K_SET Op
+					{
+						/* "SET @uservar = expr;" -- see the comment above */
+						if (strcmp($2, "@") != 0)
+							yyerror("syntax error");
+						plmysql_push_back_token(Op);
+						$$ = list_make1(make_execsql_stmt(K_SET, @1, NULL));
 					}
 				| K_SET T_WORD
 					{
@@ -2249,66 +2262,32 @@ stmt_execsql	: K_IMPORT
 					}
 				;
 
+/*
+ * MySQL's EXECUTE is "EXECUTE stmt_name [USING @var [, @var ...]];" -- a
+ * previously PREPAREd statement run by name.  That has nothing in common
+ * with plpgsql's own dynamic-SQL "EXECUTE expr [INTO ...] [USING ...]"
+ * statement this nonterminal was cloned from (this production used to build
+ * that; see git history), and MySQL SQL/PSM has no equivalent of the
+ * latter.  Rather than teach this grammar MySQL's EXECUTE shape -- which
+ * would just have to turn around and reassemble "EXECUTE name USING ..." as
+ * a string to hand to SPI anyway, since running a prepared statement by name
+ * is not something this grammar can do on its own -- the whole statement is
+ * captured and executed verbatim, exactly like a generic passthrough SQL
+ * statement (stmt_execsql's make_execsql_stmt): under the MySQL protocol
+ * session that every plmysql routine runs in, SPI parses it with the very
+ * same grammar that already runs a top-level "EXECUTE name USING ...;", so
+ * the existing PREPARE/EXECUTE/DEALLOCATE PREPARE machinery (mys_prepare.c)
+ * runs it unchanged, INTO clause and all -- MySQL's EXECUTE has no INTO
+ * clause; a result set it produces is delivered exactly like a bare SELECT
+ * (see make_execsql_stmt's is_select, and pl_exec.c's exec_stmt_execsql()).
+ *
+ * This leaves PLMySQL_stmt_dynexecute and exec_stmt_dynexecute() otherwise
+ * intact but unreachable from this grammar; removing that dead code is a
+ * separate, larger cleanup than this fix.
+ */
 stmt_dynexecute : K_EXECUTE
 					{
-						PLMySQL_stmt_dynexecute *new;
-						PLMySQL_expr *expr;
-						int endtoken;
-
-						expr = read_sql_construct(K_INTO, K_USING, ';',
-												  "INTO or USING or ;",
-												  RAW_PARSE_PLPGSQL_EXPR,
-												  true, true,
-												  NULL, &endtoken);
-
-						new = palloc(sizeof(PLMySQL_stmt_dynexecute));
-						new->cmd_type = PLMYSQL_STMT_DYNEXECUTE;
-						new->lineno = plmysql_location_to_lineno(@1);
-						new->stmtid = ++plmysql_curr_compile->nstatements;
-						new->query = expr;
-						new->into = false;
-						new->strict = false;
-						new->target = NULL;
-						new->params = NIL;
-
-						/*
-						 * We loop to allow the INTO and USING clauses to
-						 * appear in either order, since people easily get
-						 * that wrong.  This coding also prevents "INTO foo"
-						 * from getting absorbed into a USING expression,
-						 * which is *really* confusing.
-						 */
-						for (;;)
-						{
-							if (endtoken == K_INTO)
-							{
-								if (new->into)			/* multiple INTO */
-									yyerror("syntax error");
-								new->into = true;
-								read_into_target(&new->target, &new->strict);
-								endtoken = yylex();
-							}
-							else if (endtoken == K_USING)
-							{
-								if (new->params)		/* multiple USING */
-									yyerror("syntax error");
-								do
-								{
-									expr = read_sql_construct(',', ';', K_INTO,
-															  ", or ; or INTO",
-															  RAW_PARSE_PLPGSQL_EXPR,
-															  true, true,
-															  NULL, &endtoken);
-									new->params = lappend(new->params, expr);
-								} while (endtoken == ',');
-							}
-							else if (endtoken == ';')
-								break;
-							else
-								yyerror("syntax error");
-						}
-
-						$$ = (PLMySQL_stmt *)new;
+						$$ = make_execsql_stmt(K_EXECUTE, @1, NULL);
 					}
 				;
 
@@ -3319,10 +3298,21 @@ make_execsql_stmt(int firsttoken, int location, PLword *word)
 
 	execsql = palloc0(sizeof(PLMySQL_stmt_execsql));
 	execsql->cmd_type = PLMYSQL_STMT_EXECSQL;
-	execsql->is_select = (firsttoken == T_WORD && word != NULL &&
-						  !word->quoted && word->ident != NULL &&
-						  pg_strcasecmp(word->ident, "select") == 0 &&
-						  !have_into);
+	execsql->is_select = (!have_into &&
+						  ((firsttoken == T_WORD && word != NULL &&
+							!word->quoted && word->ident != NULL &&
+							pg_strcasecmp(word->ident, "select") == 0) ||
+						   /*
+							* MySQL's EXECUTE of a previously PREPAREd
+							* statement (captured here too -- see
+							* stmt_dynexecute) can just as well be a SELECT,
+							* only known once SPI actually runs it; count it
+							* as a possible result-set push for the same
+							* reason a literal SELECT is counted, on the same
+							* best-effort, straight-line basis (see the
+							* comment on PLMySQL_execstate.resultsets_sent).
+							*/
+						   firsttoken == K_EXECUTE));
 	if (execsql->is_select)
 		plmysql_curr_compile->n_resultsets++;
 	execsql->lineno  = plmysql_location_to_lineno(location);
@@ -4315,6 +4305,7 @@ static List *mysql_current_handlers = NIL;
 /*
  * (mysql_current_handlers / mysql_decl_phase are declared in the prologue so
  * grammar actions can reach them; the initializers live here.)
+ */
 
 /*
  * DECLARE ordering: MySQL requires variables and conditions to be declared
@@ -4324,9 +4315,38 @@ static List *mysql_current_handlers = NIL;
  */
 static int	mysql_decl_phase = 0;
 
+/*
+ * mysql_current_handlers/mysql_decl_phase are per-block, but a HANDLER's own
+ * action can itself be a "BEGIN ... END" block (e.g. "DECLARE EXIT HANDLER
+ * FOR ... BEGIN ... END;") -- pl_block's opening mid-rule action runs
+ * mysql_decl_begin_block() for that nested block too, before the outer
+ * HANDLER declaration that triggered it has been fully reduced.  Without
+ * saving and restoring the outer block's state around that nested reset,
+ * entering the nested block silently discards any handlers already
+ * collected for the outer block and resets its phase to 0, so a variable
+ * DECLARE the outer block should reject as coming after a HANDLER (which
+ * moved its phase to 2) is instead let through once the nested block exits.
+ * This stack is what makes mysql_decl_begin_block()/_end_block() a true
+ * push/pop pair instead of a bare reset.
+ */
+typedef struct MysqlDeclBlockState
+{
+	int			phase;
+	List	   *handlers;
+} MysqlDeclBlockState;
+
+static List *mysql_decl_block_stack = NIL; /* of MysqlDeclBlockState *,
+											 * innermost block first */
+
 static void
 mysql_decl_begin_block(void)
 {
+	MysqlDeclBlockState *saved = palloc(sizeof(MysqlDeclBlockState));
+
+	saved->phase = mysql_decl_phase;
+	saved->handlers = mysql_current_handlers;
+	mysql_decl_block_stack = lcons(saved, mysql_decl_block_stack);
+
 	mysql_current_handlers = NIL;
 	mysql_decl_phase = 0;
 }
@@ -4335,13 +4355,30 @@ static List *
 mysql_decl_end_block(void)
 {
 	List	   *handlers = mysql_current_handlers;
+	MysqlDeclBlockState *saved = (MysqlDeclBlockState *) linitial(mysql_decl_block_stack);
 
-	mysql_current_handlers = NIL;
-	/* The phase is per-block; the outer block's next declaration restarts
-	 * from its own saved phase -- see pl_block, which snapshots the phase
-	 * across nested blocks. */
+	mysql_decl_block_stack = list_delete_first(mysql_decl_block_stack);
+
+	mysql_current_handlers = saved->handlers;
+	mysql_decl_phase = saved->phase;
+	pfree(saved);
 
 	return handlers;
+}
+
+/*
+ * Reset all DECLARE-ordering/handler-collection state before compiling a
+ * routine from scratch.  Needed because an error raised while compiling one
+ * routine longjmps out of the parser without running mysql_decl_end_block(),
+ * which would otherwise leave a previous compile's nested-block entries on
+ * mysql_decl_block_stack for the next compile's pops to wrongly consume.
+ */
+void
+plmysql_decl_reset_for_compile(void)
+{
+	mysql_current_handlers = NIL;
+	mysql_decl_phase = 0;
+	mysql_decl_block_stack = NIL;
 }
 
 /*
