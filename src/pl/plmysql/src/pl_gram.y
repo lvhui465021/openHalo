@@ -175,6 +175,7 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 
 %type <expr>	expr_until_semi
 %type <expr>	expr_until_then expr_until_loop opt_expr_until_when
+%type <expr>	expr_until_end mysql_while_cond
 %type <expr>	opt_exitcond
 
 %type <var>		cursor_variable
@@ -188,12 +189,20 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %type <list>	proc_sect stmt_elsifs stmt_else
 %type <loop_body>	loop_body
 %type <stmt>	proc_stmt pl_block
-%type <stmt>	stmt_assign stmt_set stmt_if stmt_loop stmt_while stmt_exit
+%type <stmt>	stmt_assign stmt_if stmt_loop stmt_while stmt_exit
 %type <stmt>	stmt_return stmt_execsql
 %type <stmt>	stmt_dynexecute stmt_for stmt_call stmt_getdiag
 %type <stmt>	stmt_open stmt_fetch stmt_move stmt_close stmt_null
 %type <stmt>	stmt_commit stmt_rollback
 %type <stmt>	stmt_case stmt_foreach_a
+%type <stmt>	stmt_repeat stmt_leave stmt_iterate set_item
+
+/*
+ * MySQL spells multi-target assignment "SET a = 1, b = 2;", which lowers to a
+ * list of plain assignment statements, so stmt_set yields a list and is
+ * consumed by proc_sect directly rather than through proc_stmt.
+ */
+%type <list>	stmt_set set_assign_list
 
 %type <list>	proc_exceptions
 %type <exception_block> exception_sect
@@ -673,13 +682,19 @@ proc_sect		:
 						else
 							$$ = lappend($1, $2);
 					}
+				| proc_sect stmt_set
+					{
+						/*
+						 * A MySQL "SET a = expr, b = expr;" statement lowers
+						 * to one assignment per target, all appended here.
+						 */
+						$$ = list_concat($1, $2);
+					}
 				;
 
 proc_stmt		: pl_block ';'
 						{ $$ = $1; }
 				| stmt_assign
-						{ $$ = $1; }
-				| stmt_set
 						{ $$ = $1; }
 				| stmt_if
 						{ $$ = $1; }
@@ -688,6 +703,12 @@ proc_stmt		: pl_block ';'
 				| stmt_loop
 						{ $$ = $1; }
 				| stmt_while
+						{ $$ = $1; }
+				| stmt_repeat
+						{ $$ = $1; }
+				| stmt_leave
+						{ $$ = $1; }
+				| stmt_iterate
 						{ $$ = $1; }
 				| stmt_for
 						{ $$ = $1; }
@@ -812,13 +833,58 @@ stmt_assign		: T_DATUM
  *
  * MySQL also allows "SET a = 1, b = 2;"; that is left for M2.
  */
-stmt_set		: K_SET T_DATUM
+/*
+ * MySQL spells assignment "SET var = expr;" and also allows several targets
+ * in one statement: "SET a = 1, b = 2;".  Everything after each target name
+ * is handled exactly as stmt_assign handles a bare "var := expr;": the target
+ * datum token is pushed back so that read_sql_construct() captures the whole
+ * "var = expr" text and hands it to the core parser in the matching
+ * RAW_PARSE_PLPGSQL_ASSIGNn mode.  Each target lowers to one assignment
+ * statement, executed in source order.
+ *
+ * The T_WORD/T_CWORD alternatives exist only to turn "SET notavariable = 1"
+ * into a message naming the offending word, instead of a bare syntax error;
+ * this mirrors what getdiag_target does.
+ *
+ * MySQL also allows "SET @uservar = ..." and "SET <system-var> = ..."; those
+ * are session-level, not routine-local, and are rejected here for now.
+ */
+stmt_set		: K_SET set_assign_list
+					{
+						$$ = $2;
+					}
+				| K_SET T_WORD
+					{
+						/* just to give a better message than "syntax error" */
+						word_is_not_variable(&($2), @2);
+						$$ = NIL;
+					}
+				| K_SET T_CWORD
+					{
+						/* just to give a better message than "syntax error" */
+						cword_is_not_variable(&($2), @2);
+						$$ = NIL;
+					}
+				;
+
+set_assign_list	: set_item
+					{
+						$$ = list_make1($1);
+					}
+				| set_item ',' set_assign_list
+					{
+						$$ = lcons($1, $3);
+					}
+				;
+
+set_item		: T_DATUM
 					{
 						PLMySQL_stmt_assign *new;
 						RawParseMode pmode;
+						int			endtok;
 
 						/* see how many names identify the datum */
-						switch ($2.ident ? 1 : list_length($2.idents))
+						switch ($1.ident ? 1 : list_length($1.idents))
 						{
 							case 1:
 								pmode = RAW_PARSE_PLPGSQL_ASSIGN1;
@@ -834,30 +900,31 @@ stmt_set		: K_SET T_DATUM
 								pmode = 0; /* keep compiler quiet */
 						}
 
-						check_assignable($2.datum, @2);
+						check_assignable($1.datum, @1);
 						new = palloc0(sizeof(PLMySQL_stmt_assign));
 						new->cmd_type = PLMYSQL_STMT_ASSIGN;
 						new->lineno   = plmysql_location_to_lineno(@1);
 						new->stmtid = ++plmysql_curr_compile->nstatements;
-						new->varno = $2.datum->dno;
+						new->varno = $1.datum->dno;
 						/* Push back the head name to include it in the stmt */
 						plmysql_push_back_token(T_DATUM);
-						new->expr = read_sql_construct(';', 0, 0, ";",
+						new->expr = read_sql_construct(0, ',', ';',
+													   "\",\" or \";\"",
 													   pmode,
 													   false, true,
-													   NULL, NULL);
+													   NULL, &endtok);
+
+						/*
+						 * read_sql_construct() consumed the delimiter that
+						 * ended this item.  A comma has to be handed back so
+						 * the enclosing set_assign_list can shift it and
+						 * parse the next target; a semicolon is this
+						 * statement's own terminator and stays consumed.
+						 */
+						if (endtok == ',')
+							plmysql_push_back_token(',');
 
 						$$ = (PLMySQL_stmt *)new;
-					}
-				| K_SET T_WORD
-					{
-						/* just to give a better message than "syntax error" */
-						word_is_not_variable(&($2), @2);
-					}
-				| K_SET T_CWORD
-					{
-						/* just to give a better message than "syntax error" */
-						cword_is_not_variable(&($2), @2);
 					}
 				;
 
@@ -1171,7 +1238,26 @@ stmt_loop		: opt_loop_label K_LOOP loop_body
 					}
 				;
 
-stmt_while		: opt_loop_label K_WHILE expr_until_loop loop_body
+/*
+ * The condition of a WHILE loop can be terminated either by MySQL's "DO" or
+ * by the inherited plpgsql-style "LOOP".  One empty production reads the
+ * condition up to whichever delimiter appears first and pushes that delimiter
+ * back, so the surrounding stmt_while productions can shift it and use it to
+ * tell the two forms apart without a reduce/reduce conflict.
+ */
+mysql_while_cond :
+					{
+						int			endtok;
+
+						$$ = read_sql_construct(K_LOOP, K_DO, 0,
+												"LOOP or DO",
+												RAW_PARSE_PLPGSQL_EXPR,
+												true, true, NULL, &endtok);
+						plmysql_push_back_token(endtok);
+					}
+				;
+
+stmt_while		: opt_loop_label K_WHILE mysql_while_cond K_LOOP proc_sect K_END K_LOOP opt_label ';'
 					{
 						PLMySQL_stmt_while *new;
 
@@ -1181,10 +1267,135 @@ stmt_while		: opt_loop_label K_WHILE expr_until_loop loop_body
 						new->stmtid	  = ++plmysql_curr_compile->nstatements;
 						new->label	  = $1;
 						new->cond	  = $3;
-						new->body	  = $4.stmts;
+						new->body	  = $5;
 
-						check_labels($1, $4.end_label, $4.end_label_location);
+						check_labels($1, $8, @8);
 						plmysql_ns_pop();
+
+						$$ = (PLMySQL_stmt *)new;
+					}
+				| opt_loop_label K_WHILE mysql_while_cond K_DO proc_sect K_END K_WHILE opt_label ';'
+					{
+						PLMySQL_stmt_while *new;
+
+						/* MySQL form: "WHILE cond DO stmts END WHILE [label]" */
+						new = palloc0(sizeof(PLMySQL_stmt_while));
+						new->cmd_type = PLMYSQL_STMT_WHILE;
+						new->lineno   = plmysql_location_to_lineno(@2);
+						new->stmtid	  = ++plmysql_curr_compile->nstatements;
+						new->label	  = $1;
+						new->cond	  = $3;
+						new->body	  = $5;
+
+						check_labels($1, $8, @8);
+						plmysql_ns_pop();
+
+						$$ = (PLMySQL_stmt *)new;
+					}
+				;
+
+/*
+ * MySQL: "REPEAT stmts UNTIL cond END REPEAT [label];"
+ *
+ * Lowers to a LOOP whose body is the statements followed by a conditional
+ * EXIT: the body runs once, the UNTIL condition is evaluated, and the loop is
+ * left when it is true.  (The UNTIL condition is read as raw text up to the
+ * END keyword, so a condition containing a bare END -- i.e. a CASE expression
+ * -- is not supported; MySQL's own grammar resolves that with its full
+ * expression parser, which we deliberately do not model here.)
+ */
+stmt_repeat		: opt_loop_label K_REPEAT proc_sect K_UNTIL expr_until_end K_REPEAT opt_label ';'
+					{
+						PLMySQL_stmt_loop	*new;
+						PLMySQL_stmt_exit	*xnew;
+
+						xnew = palloc0(sizeof(PLMySQL_stmt_exit));
+						xnew->cmd_type = PLMYSQL_STMT_EXIT;
+						xnew->stmtid   = ++plmysql_curr_compile->nstatements;
+						xnew->lineno   = plmysql_location_to_lineno(@5);
+						xnew->is_exit  = true;
+						xnew->label    = NULL;
+						xnew->cond     = $5;
+
+						new = palloc0(sizeof(PLMySQL_stmt_loop));
+						new->cmd_type = PLMYSQL_STMT_LOOP;
+						new->lineno   = plmysql_location_to_lineno(@2);
+						new->stmtid   = ++plmysql_curr_compile->nstatements;
+						new->label	  = $1;
+						new->body	  = lappend($3, (PLMySQL_stmt *) xnew);
+
+						check_labels($1, $7, @7);
+						plmysql_ns_pop();
+
+						$$ = (PLMySQL_stmt *)new;
+					}
+				;
+
+expr_until_end	:
+					{ $$ = read_sql_expression(K_END, "END"); }
+				;
+
+/*
+ * MySQL: "LEAVE label;" leaves the block or loop carrying that label.
+ */
+stmt_leave		: K_LEAVE any_identifier ';'
+					{
+						PLMySQL_stmt_exit *new;
+						PLMySQL_nsitem    *label;
+
+						label = plmysql_ns_lookup_label(plmysql_ns_top(), $2);
+						if (label == NULL)
+							ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("there is no label \"%s\" "
+											"attached to any block or loop enclosing this statement",
+											$2),
+									 parser_errposition(@2)));
+
+						new = palloc0(sizeof(PLMySQL_stmt_exit));
+						new->cmd_type = PLMYSQL_STMT_EXIT;
+						new->stmtid	  = ++plmysql_curr_compile->nstatements;
+						new->is_exit  = true;
+						new->lineno	  = plmysql_location_to_lineno(@1);
+						new->label	  = $2;
+						new->cond	  = NULL;
+
+						$$ = (PLMySQL_stmt *)new;
+					}
+				;
+
+/*
+ * MySQL: "ITERATE label;" restarts the loop carrying that label.  Blocks are
+ * not restartable, so only loop labels are legal here (same rule as
+ * plpgsql's CONTINUE).
+ */
+stmt_iterate	: K_ITERATE any_identifier ';'
+					{
+						PLMySQL_stmt_exit *new;
+						PLMySQL_nsitem    *label;
+
+						label = plmysql_ns_lookup_label(plmysql_ns_top(), $2);
+						if (label == NULL)
+							ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("there is no label \"%s\" "
+											"attached to any block or loop enclosing this statement",
+											$2),
+									 parser_errposition(@2)));
+						if (label->itemno != PLMYSQL_LABEL_LOOP)
+							ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("block label \"%s\" cannot be used in ITERATE",
+											$2),
+									 parser_errposition(@2)));
+
+						new = palloc0(sizeof(PLMySQL_stmt_exit));
+						new->cmd_type = PLMYSQL_STMT_EXIT;
+						new->stmtid	  = ++plmysql_curr_compile->nstatements;
+						new->is_exit  = false;
+						new->lineno	  = plmysql_location_to_lineno(@1);
+						new->label	  = $2;
+						new->cond	  = NULL;
 
 						$$ = (PLMySQL_stmt *)new;
 					}
@@ -2136,6 +2347,19 @@ opt_block_label	:
 						plmysql_ns_push($2, PLMYSQL_LABEL_BLOCK);
 						$$ = $2;
 					}
+				| T_WORD ':'
+					{
+						/*
+						 * MySQL form: "label: BEGIN ... END label".  Only a
+						 * plain identifier can be a label here; allowing
+						 * unreserved keywords too would collide with the
+						 * keywords that can follow a statement list (ELSIF,
+						 * UNTIL, ...), which bison cannot resolve with one
+						 * token of lookahead.
+						 */
+						plmysql_ns_push($1.ident, PLMYSQL_LABEL_BLOCK);
+						$$ = $1.ident;
+					}
 				;
 
 opt_loop_label	:
@@ -2147,6 +2371,12 @@ opt_loop_label	:
 					{
 						plmysql_ns_push($2, PLMYSQL_LABEL_LOOP);
 						$$ = $2;
+					}
+				| T_WORD ':'
+					{
+						/* MySQL form: "label: LOOP ... END LOOP label" */
+						plmysql_ns_push($1.ident, PLMYSQL_LABEL_LOOP);
+						$$ = $1.ident;
 					}
 				;
 
@@ -3706,12 +3936,17 @@ make_case(int location, PLMySQL_expr *t_expr,
 		ListCell *l;
 
 		/* use a name unlikely to collide with any user names */
-		snprintf(varname, sizeof(varname), "__Case__Variable_%d__",
+		snprintf(varname, sizeof(varname), "__case__variable_%d__",
 				 plmysql_nDatums);
 
 		/*
 		 * We don't yet know the result datatype of t_expr.  Build the
 		 * variable as if it were INT4; we'll fix this at runtime if needed.
+		 *
+		 * The name is all-lowercase on purpose: it is spliced into the WHEN
+		 * expressions as a bare identifier, and both the standard and MySQL
+		 * dialect parsers fold bare identifiers to lowercase, while the
+		 * namespace lookup at plan time is case-sensitive.
 		 */
 		t_var = (PLMySQL_var *)
 			plmysql_build_variable(varname, new->lineno,
@@ -3734,7 +3969,16 @@ make_case(int location, PLMySQL_expr *t_expr,
 			/* Do the string hacking */
 			initStringInfo(&ds);
 
-			appendStringInfo(&ds, "\"%s\" IN (%s)",
+			/*
+			 * The case variable's name is left UNQUOTED on purpose: plpgsql
+			 * spells it as a double-quoted identifier, but the MySQL dialect
+			 * treats double quotes as string literals, which would turn the
+			 * comparison into "string IN (expr)" and fail at run time.  The
+			 * bare name is a plain identifier in both dialects, so the parser
+			 * hook (mys_parse_expr.c honors pre_columnref_hook just like the
+			 * stock analyzer) resolves it to the case variable's parameter.
+			 */
+			appendStringInfo(&ds, "%s IN (%s)",
 							 varname, expr->query);
 
 			pfree(expr->query);
