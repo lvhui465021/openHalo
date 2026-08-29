@@ -11083,55 +11083,55 @@ CreateFunctionStmt:
 			 * delimiters and no LANGUAGE clause.  Capture it verbatim and store
 			 * it as a plmysql function; the plmysql compiler parses it later.
 			 */
-			CREATE opt_or_replace FUNCTION func_name func_args_with_defaults
+			CREATE opt_or_replace opt_definer FUNCTION func_name func_args_with_defaults
 			RETURNS func_return opt_createfunc_opt_list mysql_routine_body
 				{
 					CreateFunctionStmt *n = makeNode(CreateFunctionStmt);
 					n->is_procedure = false;
 					n->replace = $2;
-					n->funcname = $4;
-					n->parameters = $5;
-					n->returnType = $7;
-					n->options = lappend($8,
+					n->funcname = $5;
+					n->parameters = $6;
+					n->returnType = $8;
+					n->options = lappend($9,
 						makeDefElem("language",
 									(Node *) makeString(pstrdup("plmysql")),
-									@9));
+									@10));
 					n->options = lappend(n->options,
 						makeDefElem("as",
-									(Node *) list_make1(makeString($9)),
-									@9));
+									(Node *) list_make1(makeString($10)),
+									@10));
 					n->sql_body = NULL;
 					$$ = (Node *)n;
 				}
-			| CREATE opt_or_replace PROCEDURE func_name func_args_with_defaults
+			| CREATE opt_or_replace opt_definer PROCEDURE func_name func_args_with_defaults
 			  opt_createfunc_opt_list mysql_routine_body
 				{
 					CreateFunctionStmt *n = makeNode(CreateFunctionStmt);
 					n->is_procedure = true;
 					n->replace = $2;
-					n->funcname = $4;
-					n->parameters = $5;
+					n->funcname = $5;
+					n->parameters = $6;
 					n->returnType = NULL;
-					n->options = lappend($6,
+					n->options = lappend($7,
 						makeDefElem("language",
 									(Node *) makeString(pstrdup("plmysql")),
-									@7));
+									@8));
 					n->options = lappend(n->options,
 						makeDefElem("as",
-									(Node *) list_make1(makeString($7)),
-									@7));
+									(Node *) list_make1(makeString($8)),
+									@8));
 					n->sql_body = NULL;
 					$$ = (Node *)n;
 				}
-			| CREATE opt_or_replace FUNCTION func_name func_args_with_defaults
+			| CREATE opt_or_replace opt_definer FUNCTION func_name func_args_with_defaults
 			RETURNS func_return opt_createfunc_opt_list opt_routine_body
 				{
 					CreateFunctionStmt *n = makeNode(CreateFunctionStmt);
 					n->is_procedure = false;
 					n->replace = $2;
-					n->funcname = $4;
-					n->parameters = $5;
-					n->returnType = $7;
+					n->funcname = $5;
+					n->parameters = $6;
+					n->returnType = $8;
 
 					/*
 					 * MySQL's one-statement body "RETURN expr" lowers to the
@@ -11141,68 +11141,68 @@ CreateFunctionStmt:
 					 * LANGUAGE (e.g. plpgsql) is respected instead; LANGUAGE
 					 * SQL is a MySQL no-op and still lowers.
 					 */
-					if (IsA($9, ReturnStmt) && mys_return_body_text != NULL &&
-						!mys_optlist_pins_foreign_language($8))
+					if (IsA($10, ReturnStmt) && mys_return_body_text != NULL &&
+						!mys_optlist_pins_foreign_language($9))
 					{
 						char	   *body;
 
 						body = psprintf("BEGIN %s; END", mys_return_body_text);
-						n->options = lappend($8,
+						n->options = lappend($9,
 							makeDefElem("language",
 										(Node *) makeString(pstrdup("plmysql")),
-										@9));
+										@10));
 						n->options = lappend(n->options,
 							makeDefElem("as",
 										(Node *) list_make1(makeString(body)),
-										@9));
+										@10));
 						n->sql_body = NULL;
 					}
 					else
 					{
-						n->options = $8;
-						n->sql_body = $9;
+						n->options = $9;
+						n->sql_body = $10;
 					}
 					mys_return_body_text = NULL;
 					$$ = (Node *)n;
 				}
-			| CREATE opt_or_replace FUNCTION func_name func_args_with_defaults
+			| CREATE opt_or_replace opt_definer FUNCTION func_name func_args_with_defaults
 			  RETURNS TABLE '(' table_func_column_list ')' opt_createfunc_opt_list opt_routine_body
 				{
 					CreateFunctionStmt *n = makeNode(CreateFunctionStmt);
 					n->is_procedure = false;
 					n->replace = $2;
-					n->funcname = $4;
-					n->parameters = mergeTableFuncParameters($5, $9);
-					n->returnType = TableFuncTypeName($9);
-					n->returnType->location = @7;
-					n->options = $11;
-					n->sql_body = $12;
+					n->funcname = $5;
+					n->parameters = mergeTableFuncParameters($6, $10);
+					n->returnType = TableFuncTypeName($10);
+					n->returnType->location = @8;
+					n->options = $12;
+					n->sql_body = $13;
 					$$ = (Node *)n;
 				}
-			| CREATE opt_or_replace FUNCTION func_name func_args_with_defaults
+			| CREATE opt_or_replace opt_definer FUNCTION func_name func_args_with_defaults
 			  opt_createfunc_opt_list opt_routine_body
 				{
 					CreateFunctionStmt *n = makeNode(CreateFunctionStmt);
 					n->is_procedure = false;
 					n->replace = $2;
-					n->funcname = $4;
-					n->parameters = $5;
+					n->funcname = $5;
+					n->parameters = $6;
 					n->returnType = NULL;
-					n->options = $6;
-					n->sql_body = $7;
+					n->options = $7;
+					n->sql_body = $8;
 					$$ = (Node *)n;
 				}
-			| CREATE opt_or_replace PROCEDURE func_name func_args_with_defaults
+			| CREATE opt_or_replace opt_definer PROCEDURE func_name func_args_with_defaults
 			  opt_createfunc_opt_list opt_routine_body
 				{
 					CreateFunctionStmt *n = makeNode(CreateFunctionStmt);
 					n->is_procedure = true;
 					n->replace = $2;
-					n->funcname = $4;
-					n->parameters = $5;
+					n->funcname = $5;
+					n->parameters = $6;
 					n->returnType = NULL;
-					n->options = $6;
-					n->sql_body = $7;
+					n->options = $7;
+					n->sql_body = $8;
 					$$ = (Node *)n;
 				}
         ;
@@ -11597,6 +11597,11 @@ common_func_opt_item:
             | NOT DETERMINISTIC
                 {
                     $$ = makeDefElem("volatility", (Node *)makeString("volatile"), @1);
+                }
+            | COMMENT Sconst
+                {
+                    /* MySQL routine characteristic; stored as pg_description */
+                    $$ = makeDefElem("comment", (Node *)makeString($2), @1);
                 }
 			| EXTERNAL SECURITY DEFINER
 				{

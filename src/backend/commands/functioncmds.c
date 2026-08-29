@@ -1056,6 +1056,8 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 	Oid			languageOid;
 	Oid			languageValidator;
 	Node	   *transformDefElem = NULL;
+	ListCell   *lc;
+	DefElem    *funcComment;
 	char	   *funcname;
 	Oid			namespaceId;
 	AclResult	aclresult;
@@ -1107,6 +1109,24 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 	prorows = -1;				/* indicates not set */
 	prosupport = InvalidOid;
 	parallel = PROPARALLEL_UNSAFE;
+
+	/*
+	 * MySQL routine characteristic COMMENT 'string' is not a native CREATE
+	 * FUNCTION option; pull it out of the list before option parsing and
+	 * store it as the routine's pg_description after the creation.
+	 */
+	funcComment = NULL;
+	foreach(lc, stmt->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (def && IsA(def, DefElem) && strcmp(def->defname, "comment") == 0)
+		{
+			funcComment = def;
+			stmt->options = list_delete_ptr(stmt->options, def);
+			break;
+		}
+	}
 
 	/* Extract non-default attributes from stmt->options list */
 	compute_function_attributes(pstate,
@@ -1295,6 +1315,46 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 	 * And now that we have all the parameters, and know we're permitted to do
 	 * so, go ahead and create the function.
 	 */
+	if (funcComment != NULL && funcComment->arg != NULL &&
+		IsA(funcComment->arg, String))
+	{
+		/*
+		 * The routine characteristic COMMENT 'string' becomes the routine's
+		 * pg_description; create the routine first, then attach it.
+		 */
+		ObjectAddress addr = ProcedureCreate(funcname,
+							namespaceId,
+							stmt->replace,
+							returnsSet,
+							prorettype,
+							GetUserId(),
+							languageOid,
+							languageValidator,
+							prosrc_str,	/* converted to text later */
+							probin_str,	/* converted to text later */
+							prosqlbody,
+							stmt->is_procedure ? PROKIND_PROCEDURE : (isWindowFunc ? PROKIND_WINDOW : PROKIND_FUNCTION),
+							security,
+							isLeakProof,
+							isStrict,
+							volatility,
+							parallel,
+							NON_PACKAGE_MEMBER,
+							parameterTypes,
+							PointerGetDatum(allParameterTypes),
+							PointerGetDatum(parameterModes),
+							PointerGetDatum(parameterNames),
+							parameterDefaults,
+							PointerGetDatum(trftypes),
+							PointerGetDatum(proconfig),
+							prosupport,
+							procost,
+							prorows);
+
+		CreateComments(addr.objectId, ProcedureRelationId, 0,
+					   strVal(funcComment->arg));
+		return InvalidObjectAddress;
+	}
 	return ProcedureCreate(funcname,
 							namespaceId,
 							stmt->replace,
