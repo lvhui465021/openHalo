@@ -58,6 +58,31 @@ typedef struct
 
 union YYSTYPE;					/* need forward reference for tok_is_keyword */
 
+/*
+ * MySQL DECLARE HANDLER / SIGNAL support (defined in the trailing section)
+ */
+static	void			mysql_decl_begin_block(void);
+static	List		   *mysql_decl_end_block(void);
+static	void			mysql_decl_check_phase(int max_allowed, int location);
+static	void			mysql_check_sqlstate_literal(const char *s, int location);
+static	int				mysql_make_sqlstate(const char *s);
+static	PLMySQL_condition *mysql_resolve_condition_value(const char *name,
+														 int location);
+static	char		   *mysql_signal_condition_sqlstate(const char *name,
+														int location);
+static	List		   *mysql_read_signal_items(void);
+static	PLMySQL_stmt   *mysql_build_signal_node(int location, bool is_resignal,
+												const char *sqlstate, List *items);
+static	void			mysql_check_getdiag_items(PLMySQL_stmt_getdiag *stmt,
+												  int location);
+
+/*
+ * Compile state shared between grammar actions and the helpers: handlers of
+ * the block currently being parsed, and the DECLARE-ordering phase.
+ */
+static	List		   *mysql_current_handlers;
+static	int				mysql_decl_phase;
+
 static	bool			tok_is_keyword(int token, union YYSTYPE *lval,
 									   int kw_token, const char *kw_str);
 static	void			word_is_not_variable(PLword *word, int location);
@@ -145,6 +170,8 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 			int  n_initvars;
 			int  *initvarnos;
 		}						declhdr;
+		PLMySQL_condition		*condition;
+		PLMySQL_cond			*cond;
 		struct
 		{
 			List *stmts;
@@ -157,7 +184,6 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 		PLMySQL_var				*var;
 		PLMySQL_expr			*expr;
 		PLMySQL_stmt			*stmt;
-		PLMySQL_condition		*condition;
 		PLMySQL_exception		*exception;
 		PLMySQL_exception_block	*exception_block;
 		PLMySQL_nsitem			*nsitem;
@@ -176,6 +202,7 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %type <expr>	expr_until_semi
 %type <expr>	expr_until_then expr_until_loop opt_expr_until_when
 %type <expr>	expr_until_end mysql_while_cond
+%type <expr>	decl_cursor_query
 %type <expr>	opt_exitcond
 
 %type <var>		cursor_variable
@@ -196,6 +223,14 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %type <stmt>	stmt_commit stmt_rollback
 %type <stmt>	stmt_case stmt_foreach_a
 %type <stmt>	stmt_repeat stmt_leave stmt_iterate set_item
+%type <stmt>	stmt_signal
+%type <condition> condition_value
+%type <list>	condition_value_list
+%type <cond>	decl_condition_def
+%type <ival>	decl_handler_type
+%type <stmt>	handler_action_stmt
+%type <condition> opt_resignal_cond
+%type <list>	opt_signal_setinfo
 
 /*
  * MySQL spells multi-target assignment "SET a = 1, b = 2;", which lowers to a
@@ -314,6 +349,7 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %token <keyword>	K_LOOP
 %token <keyword>	K_MESSAGE
 %token <keyword>	K_MESSAGE_TEXT
+%token <keyword>	K_MYSQL_ERRNO
 %token <keyword>	K_MOVE
 %token <keyword>	K_NEXT
 %token <keyword>	K_NO
@@ -449,6 +485,7 @@ pl_block		: opt_block_label K_BEGIN
 					{
 						/* Forget any variables created before this block */
 						plmysql_add_initdatums(NULL);
+						mysql_decl_begin_block();
 					}
 				  mysql_decl_sect proc_sect exception_sect K_END opt_label
 					{
@@ -464,6 +501,7 @@ pl_block		: opt_block_label K_BEGIN
 						new->initvarnos = $4.initvarnos;
 						new->body		= $5;
 						new->exceptions	= $6;
+						new->handlers	= mysql_decl_end_block();
 
 						check_labels($1, $8, @8);
 						plmysql_ns_pop();
@@ -497,20 +535,7 @@ mysql_decl_stmts : mysql_decl_stmts mysql_decl_stmt
  * Unlike PL/pgSQL's declaration syntax, one DECLARE can name several
  * variables of the same type.
  */
-mysql_decl_stmt	: K_DECLARE
-					{
-						/*
-						 * Disable scanner lookup of identifiers while the
-						 * names being declared, and the type name, are
-						 * scanned.  Bison performs this mid-rule reduction
-						 * as its default action for the state reached by
-						 * shifting K_DECLARE, without reading a lookahead
-						 * token, so the flag is already set when the first
-						 * declared name is scanned.
-						 */
-						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_DECLARE;
-					}
-				  decl_varnames decl_datatype decl_defval
+mysql_decl_stmt	: mysql_decl_head decl_varnames decl_datatype decl_defval
 					{
 						ListCell   *lc;
 						int			lineno = plmysql_location_to_lineno(@1);
@@ -527,7 +552,8 @@ mysql_decl_stmt	: K_DECLARE
 						 */
 						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
 
-						foreach(lc, $3)
+						/* $2 is the decl_varnames list (mysql_decl_head is $1) */
+						foreach(lc, $2)
 						{
 							char			 *name = strVal(lfirst(lc));
 							PLMySQL_variable *var;
@@ -546,12 +572,248 @@ mysql_decl_stmt	: K_DECLARE
 							 * separately for each variable it initializes.
 							 */
 							typ = palloc(sizeof(PLMySQL_type));
-							memcpy(typ, $4, sizeof(PLMySQL_type));
+							memcpy(typ, $3, sizeof(PLMySQL_type));
 
 							var = plmysql_build_variable(name, lineno,
 														 typ, true);
-							var->default_val = $5;
+							var->default_val = $4;
 						}
+					}
+				|
+				  /*
+				   * MySQL cursor declaration:
+				   * "DECLARE c CURSOR FOR select_statement;"
+				   *
+				   * Ported from plpgsql's cursor declarations minus the
+				   * argument list (MySQL cursors take no arguments) and the
+				   * scroll options (MySQL cursors are never scrollable).  The
+				   * variable is a refcursor whose default value is its own
+				   * name, so OPEN c opens a portal named after the variable
+				   * unless the body assigns it something else.
+				   */
+				  mysql_decl_head decl_varname K_CURSOR K_FOR decl_cursor_query
+					{
+						PLMySQL_var		*new;
+						PLMySQL_expr	*curname_def;
+						char			buf[NAMEDATALEN * 2 + 64];
+						char		   *cp1;
+						char		   *cp2;
+
+						/*
+						 * read_sql_stmt() saved and restored the lookup flag
+						 * around the query text, so it reads DECLARE here;
+						 * resume normal lookup before anything else is
+						 * scanned.
+						 */
+						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
+
+						new = (PLMySQL_var *)
+							plmysql_build_variable($2.name, $2.lineno,
+												   plmysql_build_datatype(REFCURSOROID,
+																		  -1,
+																		  InvalidOid,
+																		  NULL),
+												   true);
+
+						curname_def = palloc0(sizeof(PLMySQL_expr));
+
+						/* Note: refname has been truncated to NAMEDATALEN */
+						cp1 = new->refname;
+						cp2 = buf;
+						/*
+						 * Don't trust standard_conforming_strings here;
+						 * it might change before we use the string.
+						 */
+						if (strchr(cp1, '\\') != NULL)
+							*cp2++ = ESCAPE_STRING_SYNTAX;
+						*cp2++ = '\'';
+						while (*cp1)
+						{
+							if (SQL_STR_DOUBLE(*cp1, true))
+								*cp2++ = *cp1;
+							*cp2++ = *cp1++;
+						}
+						strcpy(cp2, "'::pg_catalog.refcursor");
+						curname_def->query = pstrdup(buf);
+						curname_def->parseMode = RAW_PARSE_PLPGSQL_EXPR;
+						new->default_val = curname_def;
+
+						new->cursor_explicit_expr = $5;
+						new->cursor_explicit_argrow = -1;
+						new->cursor_options = CURSOR_OPT_FAST_PLAN |
+											  CURSOR_OPT_NO_SCROLL;
+					}
+				|
+				  /*
+				   * MySQL named condition:
+				   * "DECLARE cond CONDITION FOR <errno | SQLSTATE 'xxxxx'>;"
+				   *
+				   * Becomes a COND datum registered in the block's namespace
+				   * so HANDLER and SIGNAL statements can refer to it by name.
+				   */
+				  mysql_decl_head decl_varname K_CONDITION K_FOR decl_condition_def
+					{
+						PLMySQL_cond	   *cond = $5;
+
+						mysql_decl_check_phase(0, @3);
+
+						cond->dtype = PLMYSQL_DTYPE_COND;
+						cond->refname = $2.name;
+						cond->lineno = $2.lineno;
+						plmysql_adddatum((PLMySQL_datum *) cond);
+						plmysql_ns_additem(PLMYSQL_NSTYPE_VAR, cond->dno,
+										   cond->refname);
+					}
+				|
+				  /*
+				   * MySQL condition handler:
+				   * "DECLARE {CONTINUE|EXIT} HANDLER FOR <conds> <stmt>;"
+				   *
+				   * The action statement is parsed with normal identifier
+				   * lookup (the mid-rule resumes it), since handler bodies
+				   * reference variables like any other statement.
+				   */
+				  mysql_decl_head decl_handler_type K_HANDLER K_FOR condition_value_list
+					{
+						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
+						mysql_decl_check_phase(2, @2);
+					}
+				  handler_action_stmt
+					{
+						PLMySQL_handler *h = palloc0(sizeof(PLMySQL_handler));
+
+						h->lineno = plmysql_location_to_lineno(@2);
+						h->is_continue = ($2 == K_CONTINUE);
+						h->conditions = $5;
+						h->action = $7;
+						plmysql_curr_compile->has_handlers = true;
+
+						mysql_current_handlers = lappend(mysql_current_handlers, h);
+					}
+				;
+
+/*
+ * Shared head of both DECLARE forms.  An own nonterminal (rather than a
+ * mid-rule action in each alternative) is what keeps the scanner-lookup
+ * switch conflict-free: after K_DECLARE, reducing this empty-headed rule is
+ * the only action, so the flag is set before the first declared name is
+ * scanned -- the same guarantee the variable branch relied on when it was
+ * the only DECLARE form.
+ */
+mysql_decl_head	: K_DECLARE
+					{
+						plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_DECLARE;
+					}
+				;
+
+decl_cursor_query :
+					{ $$ = read_sql_stmt(); }
+				;
+
+decl_condition_def : K_SQLSTATE SCONST ';'
+					{
+						PLMySQL_cond *cond = palloc0(sizeof(PLMySQL_cond));
+
+						mysql_check_sqlstate_literal($2, @2);
+						strcpy(cond->sqlstate, $2);
+						$$ = cond;
+					}
+				| ICONST ';'
+					{
+						/*
+						 * MySQL errno (e.g. 1062 for duplicate key).  The
+						 * SQLSTATE is not fixed here; the matcher matches by
+						 * errno and SIGNAL by name reverse-maps it.
+						 */
+						PLMySQL_cond *cond = palloc0(sizeof(PLMySQL_cond));
+
+						cond->mysql_errno = $1;
+						$$ = cond;
+					}
+				;
+
+decl_handler_type : K_CONTINUE
+					{
+						$$ = K_CONTINUE;
+					}
+				| K_EXIT
+					{
+						$$ = K_EXIT;
+					}
+				;
+
+/*
+ * One value of a HANDLER's condition list.
+ */
+condition_value	: K_SQLSTATE SCONST
+					{
+						PLMySQL_condition *cond = palloc0(sizeof(PLMySQL_condition));
+
+						mysql_check_sqlstate_literal($2, @2);
+						cond->sqlerrstate = mysql_make_sqlstate($2);
+						cond->condname = psprintf("SQLSTATE '%s'", $2);
+						$$ = cond;
+					}
+				| ICONST
+					{
+						PLMySQL_condition *cond = palloc0(sizeof(PLMySQL_condition));
+
+						cond->mysql_errno = $1;
+						cond->condname = psprintf("errno %d", $1);
+						$$ = cond;
+					}
+				| K_NOT T_WORD
+					{
+						/* MySQL's "NOT FOUND" class condition */
+						PLMySQL_condition *cond = palloc0(sizeof(PLMySQL_condition));
+
+						if ($2.quoted || pg_strcasecmp($2.ident, "found") != 0)
+							yyerror("unrecognized condition name");
+						cond->sqlerrstate = ERRCODE_NO_DATA;
+						cond->condname = pstrdup("NOT FOUND");
+						$$ = cond;
+					}
+				| K_SQLEXCEPTION
+					{
+						PLMySQL_condition *cond = palloc0(sizeof(PLMySQL_condition));
+
+						cond->sqlerrstate = PLMYSQL_COND_SQLEXCEPTION;
+						cond->condname = pstrdup("SQLEXCEPTION");
+						$$ = cond;
+					}
+				| K_SQLWARNING
+					{
+						PLMySQL_condition *cond = palloc0(sizeof(PLMySQL_condition));
+
+						cond->sqlerrstate = ERRCODE_WARNING;
+						cond->condname = pstrdup("SQLWARNING");
+						$$ = cond;
+					}
+				| any_identifier
+					{
+						$$ = mysql_resolve_condition_value($1, @1);
+					}
+				;
+
+condition_value_list : condition_value_list ',' condition_value
+					{
+						$$ = lappend($1, $3);
+					}
+				| condition_value
+					{
+						$$ = list_make1($1);
+					}
+				;
+
+handler_action_stmt : proc_stmt
+					{
+						/* don't bother linking null statements into the list */
+						$$ = $1 ? list_make1($1) : NIL;
+					}
+				| stmt_set
+					{
+						/* covers "SET a = expr" and "SET a = expr, b = expr" */
+						$$ = $1;
 					}
 				;
 
@@ -715,6 +977,8 @@ proc_stmt		: pl_block ';'
 				| stmt_foreach_a
 						{ $$ = $1; }
 				| stmt_exit
+						{ $$ = $1; }
+				| stmt_signal
 						{ $$ = $1; }
 				| stmt_return
 						{ $$ = $1; }
@@ -928,6 +1192,82 @@ set_item		: T_DATUM
 					}
 				;
 
+/*
+ * MySQL: "SIGNAL SQLSTATE 'xxxxx' [SET ...];" /
+ *        "SIGNAL condition_name [SET ...];" /
+ *        "RESIGNAL [SQLSTATE 'xxxxx' | condition_name] [SET ...];"
+ *
+ * The SET items (MESSAGE_TEXT, MYSQL_ERRNO) are read by a C helper that
+ * consumes the whole clause and hands the terminating ';' back to the
+ * grammar.
+ */
+stmt_signal		: K_SIGNAL K_SQLSTATE SCONST opt_signal_setinfo ';'
+					{
+						mysql_check_sqlstate_literal($3, @3);
+						$$ = mysql_build_signal_node(@1, false, $3, $4);
+					}
+				| K_SIGNAL any_identifier opt_signal_setinfo ';'
+					{
+						$$ = mysql_build_signal_node(@1, false,
+													 mysql_signal_condition_sqlstate($2, @2),
+													 $3);
+					}
+				| K_RESIGNAL opt_resignal_cond opt_signal_setinfo ';'
+					{
+						/*
+						 * RESIGNAL re-raises the condition that activated the
+						 * handler; a condition value here overrides the
+						 * SQLSTATE (optionally with new SET items).
+						 */
+						$$ = mysql_build_signal_node(@1, true,
+													 ($2 ? $2->condname : NULL),
+													 $3);
+					}
+				;
+
+opt_resignal_cond : K_SQLSTATE SCONST
+					{
+						/*
+						 * The condition struct's condname field carries the
+						 * SQLSTATE text here, as the override value.
+						 */
+						PLMySQL_condition *cond = palloc0(sizeof(PLMySQL_condition));
+
+						mysql_check_sqlstate_literal($2, @2);
+						cond->sqlerrstate = mysql_make_sqlstate($2);
+						cond->condname = pstrdup($2);
+						$$ = cond;
+					}
+				| any_identifier
+					{
+						PLMySQL_condition *cond;
+
+						cond = mysql_resolve_condition_value($1, @1);
+						if (cond->sqlerrstate == PLMYSQL_COND_SQLEXCEPTION ||
+							ERRCODE_IS_CATEGORY(cond->sqlerrstate))
+							ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("RESIGNAL cannot use a condition class"),
+									 parser_errposition(@1)));
+						$$ = cond;
+					}
+				| /*EMPTY*/
+					{
+						$$ = NULL;
+					}
+				;
+
+/*
+ * "SET MESSAGE_TEXT = ..., MYSQL_ERRNO = ..." of a SIGNAL statement.  Empty
+ * unless the K_SET keyword is actually present.  The helper leaves the
+ * terminating ';' for the grammar to shift.
+ */
+opt_signal_setinfo :
+					{
+						$$ = mysql_read_signal_items();
+					}
+				;
+
 stmt_getdiag	: K_GET getdiag_area_opt K_DIAGNOSTICS getdiag_list ';'
 					{
 						PLMySQL_stmt_getdiag	 *new;
@@ -939,53 +1279,32 @@ stmt_getdiag	: K_GET getdiag_area_opt K_DIAGNOSTICS getdiag_list ';'
 						new->stmtid	  = ++plmysql_curr_compile->nstatements;
 						new->is_stacked = $2;
 						new->diag_items = $4;
+						mysql_check_getdiag_items(new, @1);
 
+						$$ = (PLMySQL_stmt *)new;
+					}
+				;
+
+stmt_getdiag	: K_GET getdiag_area_opt K_DIAGNOSTICS K_CONDITION ICONST getdiag_list ';'
+					{
 						/*
-						 * Check information items are valid for area option.
+						 * MySQL's "GET [CURRENT|STACKED] DIAGNOSTICS
+						 * CONDITION <n> <items>".  PostgreSQL's diagnostics
+						 * area holds a single condition, so only CONDITION 1
+						 * is accepted at run time; the items are read from
+						 * the handler's error the same way STACKED does.
 						 */
-						foreach(lc, new->diag_items)
-						{
-							PLMySQL_diag_item *ditem = (PLMySQL_diag_item *) lfirst(lc);
+						PLMySQL_stmt_getdiag	 *new;
 
-							switch (ditem->kind)
-							{
-								/* these fields are disallowed in stacked case */
-								case PLMYSQL_GETDIAG_ROW_COUNT:
-									if (new->is_stacked)
-										ereport(ERROR,
-												(errcode(ERRCODE_SYNTAX_ERROR),
-												 errmsg("diagnostics item %s is not allowed in GET STACKED DIAGNOSTICS",
-														plmysql_getdiag_kindname(ditem->kind)),
-												 parser_errposition(@1)));
-									break;
-								/* these fields are disallowed in current case */
-								case PLMYSQL_GETDIAG_ERROR_CONTEXT:
-								case PLMYSQL_GETDIAG_ERROR_DETAIL:
-								case PLMYSQL_GETDIAG_ERROR_HINT:
-								case PLMYSQL_GETDIAG_RETURNED_SQLSTATE:
-								case PLMYSQL_GETDIAG_COLUMN_NAME:
-								case PLMYSQL_GETDIAG_CONSTRAINT_NAME:
-								case PLMYSQL_GETDIAG_DATATYPE_NAME:
-								case PLMYSQL_GETDIAG_MESSAGE_TEXT:
-								case PLMYSQL_GETDIAG_TABLE_NAME:
-								case PLMYSQL_GETDIAG_SCHEMA_NAME:
-									if (!new->is_stacked)
-										ereport(ERROR,
-												(errcode(ERRCODE_SYNTAX_ERROR),
-												 errmsg("diagnostics item %s is not allowed in GET CURRENT DIAGNOSTICS",
-														plmysql_getdiag_kindname(ditem->kind)),
-												 parser_errposition(@1)));
-									break;
-								/* these fields are allowed in either case */
-								case PLMYSQL_GETDIAG_CONTEXT:
-									break;
-								default:
-									elog(ERROR, "unrecognized diagnostic item kind: %d",
-										 ditem->kind);
-									break;
-							}
-						}
-
+						new = palloc0(sizeof(PLMySQL_stmt_getdiag));
+						new->cmd_type = PLMYSQL_STMT_GETDIAG;
+						new->lineno   = plmysql_location_to_lineno(@1);
+						new->stmtid	  = ++plmysql_curr_compile->nstatements;
+						new->is_stacked = $2;
+						new->is_condition = true;
+						new->condition_no = $5;
+						new->diag_items = $6;
+						mysql_check_getdiag_items(new, @1);
 						$$ = (PLMySQL_stmt *)new;
 					}
 				;
@@ -1066,6 +1385,9 @@ getdiag_item :
 						else if (tok_is_keyword(tok, &yylval,
 												K_RETURNED_SQLSTATE, "returned_sqlstate"))
 							$$ = PLMYSQL_GETDIAG_RETURNED_SQLSTATE;
+						else if (tok_is_keyword(tok, &yylval,
+												K_MYSQL_ERRNO, "mysql_errno"))
+							$$ = PLMYSQL_GETDIAG_MYSQL_ERRNO;
 						else
 							yyerror("unrecognized GET DIAGNOSTICS item");
 					}
@@ -2347,19 +2669,6 @@ opt_block_label	:
 						plmysql_ns_push($2, PLMYSQL_LABEL_BLOCK);
 						$$ = $2;
 					}
-				| T_WORD ':'
-					{
-						/*
-						 * MySQL form: "label: BEGIN ... END label".  Only a
-						 * plain identifier can be a label here; allowing
-						 * unreserved keywords too would collide with the
-						 * keywords that can follow a statement list (ELSIF,
-						 * UNTIL, ...), which bison cannot resolve with one
-						 * token of lookahead.
-						 */
-						plmysql_ns_push($1.ident, PLMYSQL_LABEL_BLOCK);
-						$$ = $1.ident;
-					}
 				;
 
 opt_loop_label	:
@@ -2371,12 +2680,6 @@ opt_loop_label	:
 					{
 						plmysql_ns_push($2, PLMYSQL_LABEL_LOOP);
 						$$ = $2;
-					}
-				| T_WORD ':'
-					{
-						/* MySQL form: "label: LOOP ... END LOOP label" */
-						plmysql_ns_push($1.ident, PLMYSQL_LABEL_LOOP);
-						$$ = $1.ident;
 					}
 				;
 
@@ -2431,7 +2734,6 @@ unreserved_keyword	:
 				| K_CONSTANT
 				| K_CONSTRAINT
 				| K_CONSTRAINT_NAME
-				| K_CONTINUE
 				| K_CURRENT
 				| K_CURSOR
 				| K_DATATYPE
@@ -2445,7 +2747,6 @@ unreserved_keyword	:
 				| K_ERRCODE
 				| K_ERROR
 				| K_EXCEPTION
-				| K_EXIT
 				| K_FETCH
 				| K_FIRST
 				| K_FORWARD
@@ -2484,9 +2785,6 @@ unreserved_keyword	:
 				| K_SCHEMA_NAME
 				| K_SCROLL
 				| K_SLICE
-				| K_SQLEXCEPTION
-				| K_SQLSTATE
-				| K_SQLWARNING
 				| K_STACKED
 				| K_TABLE
 				| K_TABLE_NAME
@@ -3991,4 +4289,302 @@ make_case(int location, PLMySQL_expr *t_expr,
 	}
 
 	return (PLMySQL_stmt *) new;
+}
+
+/*
+ * ---------------------------------------------------------------------
+ * MySQL DECLARE HANDLER / SIGNAL compile-time support
+ * ---------------------------------------------------------------------
+ *
+ * MySQL declares condition handlers inside the DECLARE section of a block;
+ * the handlers attach to that block and (with lower precedence) to enclosing
+ * blocks.  The grammar builds the block node only after the whole declare
+ * section and body have been parsed, so handlers are collected in
+ * mysql_current_handlers while a block is being parsed; pl_block's opening
+ * mid-rule saves and clears the list, and the block's closing action picks
+ * it up.
+ */
+
+static List *mysql_current_handlers = NIL;
+/*
+ * (mysql_current_handlers / mysql_decl_phase are declared in the prologue so
+ * grammar actions can reach them; the initializers live here.)
+
+/*
+ * DECLARE ordering: MySQL requires variables and conditions to be declared
+ * first, then cursors, then handlers.  Phases: 0 = variables/conditions,
+ * 1 = cursors, 2 = handlers.  A declaration of kind k is only legal while
+ * the phase is <= k; declaring it moves the phase to k.
+ */
+static int	mysql_decl_phase = 0;
+
+static void
+mysql_decl_begin_block(void)
+{
+	mysql_current_handlers = NIL;
+	mysql_decl_phase = 0;
+}
+
+static List *
+mysql_decl_end_block(void)
+{
+	List	   *handlers = mysql_current_handlers;
+
+	mysql_current_handlers = NIL;
+	/* The phase is per-block; the outer block's next declaration restarts
+	 * from its own saved phase -- see pl_block, which snapshots the phase
+	 * across nested blocks. */
+
+	return handlers;
+}
+
+/*
+ * max_allowed: the latest phase in which this declaration kind is legal.
+ * (0 = variables/conditions, 1 = cursors, 2 = handlers.)
+ */
+static void
+mysql_decl_check_phase(int max_allowed, int location)
+{
+	static const char *const kinds[3] = {
+		"variables and conditions",
+		"cursors",
+		"handlers"
+	};
+
+	if (mysql_decl_phase > max_allowed)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("%s must be declared before %s",
+						kinds[max_allowed], kinds[mysql_decl_phase]),
+				 parser_errposition(location)));
+
+	mysql_decl_phase = max_allowed;
+}
+
+static int
+mysql_make_sqlstate(const char *s)
+{
+	return MAKE_SQLSTATE(s[0], s[1], s[2], s[3], s[4]);
+}
+
+static void
+mysql_check_sqlstate_literal(const char *s, int location)
+{
+	if (strlen(s) != 5 ||
+		strspn(s, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") != 5)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("invalid SQLSTATE code \"%s\"", s),
+				 parser_errposition(location)));
+}
+
+/*
+ * Resolve a HANDLER/SIGNAL condition that is spelled as an identifier: a
+ * declared CONDITION datum (from DECLARE cond CONDITION FOR ...), the
+ * SQLEXCEPTION / SQLWARNING classes, or one of the standard condition names
+ * recognized by plmysql_recognize_err_condition().
+ */
+static PLMySQL_condition *
+mysql_resolve_condition_value(const char *name, int location)
+{
+	PLMySQL_condition *cond = palloc0(sizeof(PLMySQL_condition));
+	PLMySQL_nsitem *ns;
+
+	if (pg_strcasecmp(name, "sqlexception") == 0)
+	{
+		cond->sqlerrstate = PLMYSQL_COND_SQLEXCEPTION;
+		cond->condname = pstrdup("SQLEXCEPTION");
+		return cond;
+	}
+
+	/*
+	 * A named condition declared in this or an enclosing block.  The scanner
+	 * is in DECLARE lookup mode while parsing the declare section, so the
+	 * name arrives as a plain word; look it up manually.
+	 */
+	ns = plmysql_ns_lookup(plmysql_ns_top(), false, name, NULL, NULL, NULL);
+	if (ns != NULL && ns->itemtype == PLMYSQL_NSTYPE_VAR &&
+		plmysql_Datums[ns->itemno]->dtype == PLMYSQL_DTYPE_COND)
+	{
+		PLMySQL_cond *c = (PLMySQL_cond *) plmysql_Datums[ns->itemno];
+
+		cond->sqlerrstate = c->sqlstate[0]
+			? mysql_make_sqlstate(c->sqlstate)
+			: 0;
+		cond->mysql_errno = c->mysql_errno;
+		cond->condname = pstrdup(name);
+		return cond;
+	}
+
+	/*
+	 * SQLWARNING is MySQL's warning class (SQLSTATE class '01'); everything
+	 * else goes through the standard condition-name table (which also
+	 * accepts 5-character SQLSTATE codes and names like NO_DATA_FOUND).
+	 */
+	if (pg_strcasecmp(name, "sqlwarning") == 0)
+		cond->sqlerrstate = ERRCODE_WARNING;
+	else
+		cond->sqlerrstate = plmysql_recognize_err_condition(name, true);
+	cond->condname = pstrdup(name);
+
+	return cond;
+}
+
+/*
+ * SIGNAL's condition must resolve to a concrete SQLSTATE (classes and raw
+ * errnos are not signalable).  Named conditions declared by errno get their
+ * SQLSTATE from the reverse error-code map, defaulting to 45000
+ * (unhandled user-defined exception), which is what MySQL effectively
+ * reports for user-signalled errors without a specific code.
+ */
+static char *
+mysql_signal_condition_sqlstate(const char *name, int location)
+{
+	PLMySQL_condition *cond;
+	static char sqlstate[6];
+
+	cond = mysql_resolve_condition_value(name, location);
+
+	if (cond->sqlerrstate == PLMYSQL_COND_SQLEXCEPTION ||
+		ERRCODE_IS_CATEGORY(cond->sqlerrstate))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("SIGNAL cannot use a condition class"),
+				 parser_errposition(location)));
+
+	if (cond->sqlerrstate != 0)
+		return pstrdup(unpack_sql_state(cond->sqlerrstate));
+
+	if (cond->mysql_errno > 0)
+	{
+		plmysql_errno_to_sqlstate(cond->mysql_errno, sqlstate);
+		return pstrdup(sqlstate);
+	}
+
+	return pstrdup("45000");
+}
+
+/*
+ * Read the "SET MESSAGE_TEXT = ..., MYSQL_ERRNO = ..." clause of a SIGNAL
+ * statement.  Returns NIL when the clause is absent.  The terminating ';'
+ * is left for the grammar (pushed back) when the clause is present.
+ */
+static List *
+mysql_read_signal_items(void)
+{
+	List	   *items = NIL;
+	int			tok;
+
+	tok = yylex();
+	if (tok != K_SET)
+	{
+		plmysql_push_back_token(tok);
+		return NIL;
+	}
+
+	for (;;)
+	{
+		PLMySQL_signal_item_type kind;
+		PLMySQL_signal_item *item;
+		PLMySQL_expr *expr;
+		int			endtok;
+
+		tok = yylex();
+		if (tok_is_keyword(tok, &yylval, K_MESSAGE_TEXT, "message_text"))
+			kind = PLMYSQL_SIGNAL_MESSAGE_TEXT;
+		else if (tok_is_keyword(tok, &yylval, K_MYSQL_ERRNO, "mysql_errno"))
+			kind = PLMYSQL_SIGNAL_MYSQL_ERRNO;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("unsupported SIGNAL information item"),
+					 parser_errposition(plmysql_yylloc)));
+
+		tok = yylex();
+		if (tok != '=' && tok != COLON_EQUALS)
+			yyerror("syntax error");
+
+		expr = read_sql_construct(0, ',', ';', "\",\" or \";\"",
+								  RAW_PARSE_PLPGSQL_EXPR,
+								  true, true, NULL, &endtok);
+
+		item = palloc0(sizeof(PLMySQL_signal_item));
+		item->opt_type = kind;
+		item->expr = expr;
+		items = lappend(items, item);
+
+		if (endtok == ';')
+		{
+			plmysql_push_back_token(';');
+			break;
+		}
+	}
+
+	return items;
+}
+
+static PLMySQL_stmt *
+mysql_build_signal_node(int location, bool is_resignal,
+						const char *sqlstate, List *items)
+{
+	PLMySQL_stmt_signal *new = palloc0(sizeof(PLMySQL_stmt_signal));
+
+	new->cmd_type = PLMYSQL_STMT_SIGNAL;
+	new->lineno = plmysql_location_to_lineno(location);
+	new->stmtid = ++plmysql_curr_compile->nstatements;
+	new->is_resignal = is_resignal;
+	new->sqlstate = sqlstate ? pstrdup(sqlstate) : NULL;
+	new->cond_datano = -1;
+	new->items = items;
+
+	return (PLMySQL_stmt *) new;
+}
+
+/*
+ * Shared validity checks for GET DIAGNOSTICS items.
+ */
+static void
+mysql_check_getdiag_items(PLMySQL_stmt_getdiag *stmt, int location)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmt->diag_items)
+	{
+		PLMySQL_diag_item *ditem = (PLMySQL_diag_item *) lfirst(lc);
+
+		switch (ditem->kind)
+		{
+			/* these fields are disallowed in stacked case */
+			case PLMYSQL_GETDIAG_ROW_COUNT:
+				if (stmt->is_stacked && !stmt->is_condition)
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("diagnostics item %s is not allowed in GET STACKED DIAGNOSTICS",
+									plmysql_getdiag_kindname(ditem->kind)),
+							 parser_errposition(location)));
+				break;
+			/* these fields are disallowed in current case */
+			case PLMYSQL_GETDIAG_ERROR_CONTEXT:
+			case PLMYSQL_GETDIAG_ERROR_DETAIL:
+			case PLMYSQL_GETDIAG_ERROR_HINT:
+			case PLMYSQL_GETDIAG_RETURNED_SQLSTATE:
+			case PLMYSQL_GETDIAG_COLUMN_NAME:
+			case PLMYSQL_GETDIAG_CONSTRAINT_NAME:
+			case PLMYSQL_GETDIAG_DATATYPE_NAME:
+			case PLMYSQL_GETDIAG_MESSAGE_TEXT:
+			case PLMYSQL_GETDIAG_TABLE_NAME:
+			case PLMYSQL_GETDIAG_SCHEMA_NAME:
+			case PLMYSQL_GETDIAG_MYSQL_ERRNO:
+				if (!stmt->is_stacked && !stmt->is_condition)
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("diagnostics item %s is not allowed in GET CURRENT DIAGNOSTICS",
+									plmysql_getdiag_kindname(ditem->kind)),
+							 parser_errposition(location)));
+				break;
+			/* these fields are allowed in either case */
+			case PLMYSQL_GETDIAG_CONTEXT:
+				break;
+		}
+	}
 }

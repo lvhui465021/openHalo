@@ -273,6 +273,7 @@ static void pop_stmt_mcontext(PLMySQL_execstate *estate);
 
 static int	exec_toplevel_block(PLMySQL_execstate *estate,
 								PLMySQL_stmt_block *block);
+static int	exec_stmt(PLMySQL_execstate *estate, PLMySQL_stmt *stmt);
 static int	exec_stmt_block(PLMySQL_execstate *estate,
 							PLMySQL_stmt_block *block);
 static int	exec_stmts(PLMySQL_execstate *estate,
@@ -305,6 +306,15 @@ static int	exec_stmt_open(PLMySQL_execstate *estate,
 						   PLMySQL_stmt_open *stmt);
 static int	exec_stmt_fetch(PLMySQL_execstate *estate,
 							PLMySQL_stmt_fetch *stmt);
+/*
+ * MySQL errno of the error currently being raised toward the client (set by
+ * SIGNAL ... SET MYSQL_ERRNO, consumed by the protocol adapter's error
+ * converter), and the errno of the error being handled by a MySQL handler
+ * (read by GET DIAGNOSTICS ... MYSQL_ERRNO).  0 = none.
+ */
+int			plmysql_last_signal_errno = 0;
+int			plmysql_caught_mysql_errno = 0;
+
 static int	exec_stmt_close(PLMySQL_execstate *estate,
 							PLMySQL_stmt_close *stmt);
 static int	exec_stmt_exit(PLMySQL_execstate *estate,
@@ -1328,6 +1338,7 @@ copy_plmysql_datums(PLMySQL_execstate *estate,
 
 			case PLMYSQL_DTYPE_ROW:
 			case PLMYSQL_DTYPE_RECFIELD:
+			case PLMYSQL_DTYPE_COND:
 
 				/*
 				 * These datum records are read-only at runtime, so no need to
@@ -1595,53 +1606,16 @@ exception_matches_conditions(ErrorData *edata, PLMySQL_condition *cond)
 }
 
 
-/* ----------
- * exec_toplevel_block			Execute the toplevel block
+/*
+ * plmysql_exec_block_initvars		Initialize a block's declared variables.
  *
- * This is intentionally equivalent to executing exec_stmts() with a
- * list consisting of the one statement.  One tiny difference is that
- * we do not bother to save the entry value of estate->err_stmt;
- * that's assumed to be NULL.
- * ----------
+ * Shared by the plain and the MySQL-handler block execution paths.
  */
-static int
-exec_toplevel_block(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
+void
+plmysql_exec_block_initvars(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
 {
-	int			rc;
-
-	estate->err_stmt = (PLMySQL_stmt *) block;
-
-	/* Let the plugin know that we are about to execute this statement */
-	if (*plmysql_plugin_ptr && (*plmysql_plugin_ptr)->stmt_beg)
-		((*plmysql_plugin_ptr)->stmt_beg) (estate, (PLMySQL_stmt *) block);
-
-	CHECK_FOR_INTERRUPTS();
-
-	rc = exec_stmt_block(estate, block);
-
-	/* Let the plugin know that we have finished executing this statement */
-	if (*plmysql_plugin_ptr && (*plmysql_plugin_ptr)->stmt_end)
-		((*plmysql_plugin_ptr)->stmt_end) (estate, (PLMySQL_stmt *) block);
-
-	estate->err_stmt = NULL;
-
-	return rc;
-}
-
-
-/* ----------
- * exec_stmt_block			Execute a block of statements
- * ----------
- */
-static int
-exec_stmt_block(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
-{
-	volatile int rc = -1;
 	int			i;
 
-	/*
-	 * First initialize all variables declared in this block
-	 */
 	estate->err_text = gettext_noop("during statement block local variable initialization");
 
 	for (i = 0; i < block->n_initvars; i++)
@@ -1724,10 +1698,486 @@ exec_stmt_block(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
 				}
 				break;
 
+			case PLMYSQL_DTYPE_COND:
+				/* named conditions carry no runtime value */
+				break;
+
 			default:
 				elog(ERROR, "unrecognized dtype: %d", datum->dtype);
 		}
 	}
+
+	estate->err_text = NULL;
+}
+
+/*
+ * mysql_condition_matches		Does one handler condition match the error?
+ *
+ * Matching rules (MySQL 5.7):
+ *  - a condition declared by errno matches when the caught error carries
+ *    that MySQL errno;
+ *  - an SQLSTATE condition matches exactly;
+ *  - the class conditions SQLWARNING ('01') and NOT FOUND ('02') match by
+ *    SQLSTATE class;
+ *  - SQLEXCEPTION matches any condition whose class is neither '01' nor '02'.
+ */
+static bool
+mysql_condition_matches(List *conditions, ErrorData *edata,
+						int caught_errno)
+{
+	ListCell   *lc;
+
+	foreach(lc, conditions)
+	{
+		PLMySQL_condition *cond = (PLMySQL_condition *) lfirst(lc);
+
+		if (cond->mysql_errno > 0)
+		{
+			if (caught_errno == cond->mysql_errno)
+				return true;
+			/*
+			 * A server-raised error has no MySQL errno attached; match by
+			 * comparing the condition's errno with the error's SQLSTATE
+			 * through the errno<->SQLSTATE map.
+			 */
+			if (caught_errno == 0)
+			{
+				char		mapped[6];
+
+				if (plmysql_errno_to_pgsqlstate(cond->mysql_errno, mapped) &&
+					strcmp(mapped, unpack_sql_state(edata->sqlerrcode)) == 0)
+					return true;
+			}
+			continue;
+		}
+
+		switch (cond->sqlerrstate)
+		{
+			case PLMYSQL_COND_SQLEXCEPTION:
+				{
+					const char *state = unpack_sql_state(edata->sqlerrcode);
+
+					if (strncmp(state, "01", 2) != 0 &&
+						strncmp(state, "02", 2) != 0)
+						return true;
+				}
+				break;
+
+			default:
+				/* Exact match? */
+				if (edata->sqlerrcode == cond->sqlerrstate)
+					return true;
+				/* Class match? */
+				if (ERRCODE_IS_CATEGORY(cond->sqlerrstate) &&
+					ERRCODE_TO_CATEGORY(edata->sqlerrcode) == cond->sqlerrstate)
+					return true;
+				break;
+		}
+	}
+	return false;
+}
+
+/*
+ * Find the handler for the error among the block's handlers, in MySQL's
+ * precedence order: the handler declared LAST wins.
+ */
+static PLMySQL_handler *
+mysql_find_handler(List *handlers, ErrorData *edata, int caught_errno)
+{
+	int			i;
+
+	/* the handler declared last takes precedence */
+	for (i = list_length(handlers) - 1; i >= 0; i--)
+	{
+		PLMySQL_handler *h = (PLMySQL_handler *) list_nth(handlers, i);
+
+		if (mysql_condition_matches(h->conditions, edata, caught_errno))
+			return h;
+	}
+	return NULL;
+}
+
+/*
+ * exec_stmt_block_mysql	Execute a block with MySQL condition handlers.
+ *
+ * Each top-level statement runs inside its own subtransaction.  On error:
+ * roll the statement back, find the matching handler (this block's handlers
+ * in reverse declaration order), and either run the handler and resume with
+ * the next statement (CONTINUE), or run it and leave this block (EXIT).
+ * Errors no handler claims for class SQLEXCEPTION propagate; unhandled
+ * SQLWARNING and NOT FOUND conditions are swallowed, per MySQL's default
+ * handler semantics.
+ *
+ * Note on handlers declared in enclosing blocks: an error this block cannot
+ * handle is re-thrown and caught at the enclosing block's statement level,
+ * so the enclosing handler runs with the rest of this block skipped.  MySQL
+ * would resume inside this block; supporting that fully needs an iterative
+ * executor, which is deliberately deferred (see the design spec, section
+ * 4.5).
+ */
+static int
+exec_stmt_block_mysql(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
+{
+	volatile int rc = -1;
+	ListCell   *l;
+	ErrorData  *save_cur_error = estate->cur_error;
+	MemoryContext oldcontext = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+	ExprContext *old_eval_econtext = estate->eval_econtext;
+	MemoryContext stmt_mcontext;
+
+	plmysql_exec_block_initvars(estate, block);
+
+	estate->err_text = NULL;
+
+	/*
+	 * One eval_econtext for the whole block, created OUTSIDE any of the
+	 * per-statement subtransactions below and freed at block exit.  (The
+	 * shared simple-expression EState outlives subtransaction aborts, so
+	 * recreating the econtext per statement is unnecessary churn.)
+	 */
+	plmysql_create_econtext(estate);
+
+	stmt_mcontext = get_stmt_mcontext(estate);
+
+	foreach(l, block->body)
+	{
+		PLMySQL_stmt *stmt = (PLMySQL_stmt *) lfirst(l);
+		PLMySQL_handler *handler;
+
+		estate->err_stmt = stmt;
+
+		if (*plmysql_plugin_ptr && (*plmysql_plugin_ptr)->stmt_beg)
+			((*plmysql_plugin_ptr)->stmt_beg) (estate, stmt);
+
+		CHECK_FOR_INTERRUPTS();
+
+		BeginInternalSubTransaction(NULL);
+		/* Want to run statements inside function's memory context */
+		MemoryContextSwitchTo(oldcontext);
+
+		PG_TRY();
+		{
+			rc = exec_stmt(estate, stmt);
+
+			/* Commit the inner transaction, return to outer xact context */
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcontext);
+			CurrentResourceOwner = oldowner;
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			estate->err_text = gettext_noop("during handler error recovery");
+
+			/* Save error info in our stmt_mcontext */
+			MemoryContextSwitchTo(stmt_mcontext);
+			edata = CopyErrorData();
+			FlushErrorState();
+
+			/*
+			 * The error stopped propagating here; a SIGNAL errno it carried
+			 * must not leak to a later, unrelated client error.
+			 */
+			plmysql_caught_mysql_errno = plmysql_last_signal_errno;
+			plmysql_last_signal_errno = 0;
+			mysSetPendingMySQLErrno(0);
+
+			/* Abort the statement's subtransaction */
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcontext);
+			CurrentResourceOwner = oldowner;
+
+			estate->stmt_mcontext_parent = stmt_mcontext;
+			estate->stmt_mcontext = NULL;
+			MemoryContextDeleteChildren(stmt_mcontext);
+
+			estate->eval_tuptable = NULL;
+			exec_eval_cleanup(estate);
+
+			handler = mysql_find_handler(block->handlers, edata,
+										 plmysql_caught_mysql_errno);
+			if (handler == NULL)
+			{
+				const char *state = unpack_sql_state(edata->sqlerrcode);
+
+				/*
+				 * MySQL's default handler semantics: an unhandled condition
+				 * of class SQLWARNING or NOT FOUND continues execution as if
+				 * a CONTINUE handler had run; anything else propagates.
+				 */
+				if (strncmp(state, "01", 2) != 0 && strncmp(state, "02", 2) != 0)
+					ReThrowError(edata);	/* does not return */
+
+				plmysql_caught_mysql_errno = 0;
+				rc = PLMYSQL_RC_OK;		/* swallowed: resume next statement */
+			}
+			else
+			{
+				/*
+				 * Make the error available to GET DIAGNOSTICS / RESIGNAL
+				 * inside the handler, then run the handler body.
+				 */
+				estate->cur_error = edata;
+
+				estate->err_text = NULL;
+
+				rc = exec_stmts(estate, handler->action);
+
+				estate->cur_error = save_cur_error;
+				plmysql_caught_mysql_errno = 0;
+
+				if (!handler->is_continue)
+				{
+					/* EXIT handler: skip the rest of this block */
+					pop_stmt_mcontext(estate);
+					MemoryContextReset(stmt_mcontext);
+					goto block_exit;
+				}
+			}
+
+			/* Restore stmt_mcontext stack and release the error data */
+			pop_stmt_mcontext(estate);
+			MemoryContextReset(stmt_mcontext);
+		}
+		PG_END_TRY();
+
+		if (*plmysql_plugin_ptr && (*plmysql_plugin_ptr)->stmt_end)
+			((*plmysql_plugin_ptr)->stmt_end) (estate, stmt);
+
+		/* A label-less or block-targeted EXIT stops this block's body */
+		if (rc == PLMYSQL_RC_EXIT)
+			break;
+
+		if (rc != PLMYSQL_RC_OK)
+			break;
+	}
+
+block_exit:
+	estate->err_text = NULL;
+
+	/*
+	 * Discard the block's econtext (its stack entry was pushed with the
+	 * block's outer subtransaction id, which is current again) and revert
+	 * to the caller's.
+	 */
+	estate->eval_econtext = old_eval_econtext;
+
+	/*
+	 * Same return-code handling as exec_stmt_block: EXIT matches this block
+	 * only when its label names this block (or no label at all -- which for
+	 * blocks, as in plpgsql, only happens for EXIT inside a loop that has
+	 * already been consumed).
+	 */
+	switch (rc)
+	{
+		case PLMYSQL_RC_OK:
+		case PLMYSQL_RC_RETURN:
+		case PLMYSQL_RC_CONTINUE:
+			return rc;
+
+		case PLMYSQL_RC_EXIT:
+			if (estate->exitlabel == NULL)
+				return PLMYSQL_RC_EXIT;
+			if (block->label == NULL)
+				return PLMYSQL_RC_EXIT;
+			if (strcmp(block->label, estate->exitlabel) != 0)
+				return PLMYSQL_RC_EXIT;
+			estate->exitlabel = NULL;
+			return PLMYSQL_RC_OK;
+
+		default:
+			elog(ERROR, "unrecognized rc: %d", rc);
+	}
+
+	return PLMYSQL_RC_OK;
+}
+
+static inline int
+mysql_make_sqlstate_code(const char *s)
+{
+	return MAKE_SQLSTATE(s[0], s[1], s[2], s[3], s[4]);
+}
+
+/*
+ * exec_stmt_signal			Execute a MySQL SIGNAL or RESIGNAL statement.
+ *
+ * The condition is raised as a PostgreSQL error carrying the SQLSTATE; a
+ * MYSQL_ERRNO set on the statement (or the 1644 default for the 45000 class)
+ * is stashed in plmysql_signal_mysql_errno so that the MySQL protocol
+ * adapter reports it verbatim instead of mapping by SQLSTATE.  If a handler
+ * catches the error, the catch path consumes the stash.
+ */
+static int
+exec_stmt_signal(PLMySQL_execstate *estate, PLMySQL_stmt_signal *stmt)
+{
+	char		sqlstate[6];
+	const char *message = NULL;
+	bool		message_from_error = false;
+	int			errno_val = 0;
+	bool		have_errno = false;
+	ListCell   *lc;
+
+	/*
+	 * Determine the SQLSTATE to signal.
+	 */
+	if (stmt->is_resignal)
+	{
+		if (estate->cur_error == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_NO_ACTIVE_SQL_TRANSACTION),
+					 errmsg("RESIGNAL can only be used inside a condition handler")));
+
+		/* re-signal the handler's condition, optionally overridden */
+		strcpy(sqlstate, unpack_sql_state(estate->cur_error->sqlerrcode));
+		message = estate->cur_error->message;
+		message_from_error = true;
+		errno_val = plmysql_caught_mysql_errno;
+		have_errno = (errno_val > 0);
+
+		if (stmt->sqlstate != NULL)
+			strcpy(sqlstate, stmt->sqlstate);
+	}
+	else if (stmt->sqlstate != NULL)
+	{
+		strcpy(sqlstate, stmt->sqlstate);
+	}
+	else
+		elog(ERROR, "SIGNAL without a condition");
+
+	/*
+	 * Evaluate the SET items.
+	 */
+	foreach(lc, stmt->items)
+	{
+		PLMySQL_signal_item *item = (PLMySQL_signal_item *) lfirst(lc);
+		bool		isnull;
+
+		switch (item->opt_type)
+		{
+			case PLMYSQL_SIGNAL_MESSAGE_TEXT:
+				{
+					Datum		val;
+					Oid			valtype;
+					int32		valtypmod;
+
+					val = exec_eval_expr(estate, item->expr, &isnull,
+										 &valtype, &valtypmod);
+					if (!isnull)
+					{
+						/* result lives in the eval mcontext, used right away */
+						message = convert_value_to_string(estate, val, valtype);
+						message_from_error = false;
+					}
+				}
+				break;
+
+			case PLMYSQL_SIGNAL_MYSQL_ERRNO:
+				{
+					int32		v = exec_eval_integer(estate, item->expr, &isnull);
+
+					if (!isnull)
+					{
+						errno_val = v;
+						have_errno = true;
+					}
+				}
+				break;
+		}
+	}
+
+	if (!message)
+	{
+		/* MySQL's default texts for SIGNAL without MESSAGE_TEXT */
+		if (strncmp(sqlstate, "01", 2) == 0)
+			message = gettext_noop("Unhandled user-defined warning condition");
+		else if (strncmp(sqlstate, "02", 2) == 0)
+			message = gettext_noop("Unhandled user-defined not-found condition");
+		else
+			message = gettext_noop("Unhandled user-defined exception condition");
+		message_from_error = false;
+	}
+
+	/*
+	 * Stash the MySQL errno for the protocol adapter.  MySQL reports 1644
+	 * (ER_SIGNAL_EXCEPTION) for user signals in the 45000 class that don't
+	 * set MYSQL_ERRNO explicitly.
+	 */
+	if (have_errno)
+		plmysql_last_signal_errno = errno_val;
+	else if (strcmp(sqlstate, "45000") == 0 && !message_from_error)
+		plmysql_last_signal_errno = 1644;
+	else
+		plmysql_last_signal_errno = 0;
+	mysSetPendingMySQLErrno(plmysql_last_signal_errno);
+
+	ereport(ERROR,
+			(errcode(mysql_make_sqlstate_code(sqlstate)),
+			 errmsg_internal("%s", message)));
+
+	return PLMYSQL_RC_OK;		/* not reached */
+}
+
+/* ----------
+ * exec_toplevel_block			Execute the toplevel block
+ *
+ * This is intentionally equivalent to executing exec_stmts() with a
+ * list consisting of the one statement.  One tiny difference is that
+ * we do not bother to save the entry value of estate->err_stmt;
+ * that's assumed to be NULL.
+ * ----------
+ */
+static int
+exec_toplevel_block(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
+{
+	int			rc;
+
+	estate->err_stmt = (PLMySQL_stmt *) block;
+
+	/* Let the plugin know that we are about to execute this statement */
+	if (*plmysql_plugin_ptr && (*plmysql_plugin_ptr)->stmt_beg)
+		((*plmysql_plugin_ptr)->stmt_beg) (estate, (PLMySQL_stmt *) block);
+
+	CHECK_FOR_INTERRUPTS();
+
+	rc = exec_stmt_block(estate, block);
+
+	/* Let the plugin know that we have finished executing this statement */
+	if (*plmysql_plugin_ptr && (*plmysql_plugin_ptr)->stmt_end)
+		((*plmysql_plugin_ptr)->stmt_end) (estate, (PLMySQL_stmt *) block);
+
+	estate->err_stmt = NULL;
+
+	return rc;
+}
+
+
+/* ----------
+ * exec_stmt_block			Execute a block of statements
+ * ----------
+ */
+static int
+exec_stmt_block(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
+{
+	volatile int rc = -1;
+	int			i;
+
+	/*
+	 * Blocks with MySQL condition handlers run through the MySQL execution
+	 * model: each top-level statement is wrapped in its own subtransaction so
+	 * that a handler can resume with the statement after the one that failed
+	 * (CONTINUE), and the failing statement alone is rolled back rather than
+	 * the whole block (what an EXIT handler effectively does, matching
+	 * MySQL's statement-level atomicity).
+	 */
+	if (block->handlers != NIL)
+		return exec_stmt_block_mysql(estate, block);
+
+	/*
+	 * First initialize all variables declared in this block
+	 */
+	plmysql_exec_block_initvars(estate, block);
 
 	if (block->exceptions)
 	{
@@ -1811,6 +2261,13 @@ exec_stmt_block(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
 			ListCell   *e;
 
 			estate->err_text = gettext_noop("during exception cleanup");
+
+			/*
+			 * The error stopped propagating here, so any SIGNAL errno it
+			 * carried must not leak to a later, unrelated client error.
+			 */
+			plmysql_last_signal_errno = 0;
+			mysSetPendingMySQLErrno(0);
 
 			/* Save error info in our stmt_mcontext */
 			MemoryContextSwitchTo(stmt_mcontext);
@@ -1989,8 +2446,34 @@ exec_stmts(PLMySQL_execstate *estate, List *stmts)
 
 		CHECK_FOR_INTERRUPTS();
 
-		switch (stmt->cmd_type)
+		rc = exec_stmt(estate, stmt);
+
+		/* Let the plugin know that we have finished executing this statement */
+		if (*plmysql_plugin_ptr && (*plmysql_plugin_ptr)->stmt_end)
+			((*plmysql_plugin_ptr)->stmt_end) (estate, stmt);
+
+		if (rc != PLMYSQL_RC_OK)
 		{
+			estate->err_stmt = save_estmt;
+			return rc;
+		}
+	}							/* end of loop over statements */
+
+	estate->err_stmt = save_estmt;
+	return PLMYSQL_RC_OK;
+}
+
+/* ----------
+ * exec_stmt			Dispatch one statement by its cmd_type
+ * ----------
+ */
+static int
+exec_stmt(PLMySQL_execstate *estate, PLMySQL_stmt *stmt)
+{
+	int			rc;
+
+	switch (stmt->cmd_type)
+	{
 			case PLMYSQL_STMT_BLOCK:
 				rc = exec_stmt_block(estate, (PLMySQL_stmt_block *) stmt);
 				break;
@@ -2063,6 +2546,10 @@ exec_stmts(PLMySQL_execstate *estate, List *stmts)
 				rc = exec_stmt_raise(estate, (PLMySQL_stmt_raise *) stmt);
 				break;
 
+			case PLMYSQL_STMT_SIGNAL:
+				rc = exec_stmt_signal(estate, (PLMySQL_stmt_signal *) stmt);
+				break;
+
 			case PLMYSQL_STMT_ASSERT:
 				rc = exec_stmt_assert(estate, (PLMySQL_stmt_assert *) stmt);
 				break;
@@ -2100,25 +2587,10 @@ exec_stmts(PLMySQL_execstate *estate, List *stmts)
 				break;
 
 			default:
-				/* point err_stmt to parent, since this one seems corrupt */
-				estate->err_stmt = save_estmt;
 				elog(ERROR, "unrecognized cmd_type: %d", stmt->cmd_type);
-				rc = -1;		/* keep compiler quiet */
-		}
+				rc = -1;		/* keep compiler quiet */	}
 
-		/* Let the plugin know that we have finished executing this statement */
-		if (*plmysql_plugin_ptr && (*plmysql_plugin_ptr)->stmt_end)
-			((*plmysql_plugin_ptr)->stmt_end) (estate, stmt);
-
-		if (rc != PLMYSQL_RC_OK)
-		{
-			estate->err_stmt = save_estmt;
-			return rc;
-		}
-	}							/* end of loop over statements */
-
-	estate->err_stmt = save_estmt;
-	return PLMYSQL_RC_OK;
+	return rc;
 }
 
 
@@ -2380,7 +2852,18 @@ exec_stmt_getdiag(PLMySQL_execstate *estate, PLMySQL_stmt_getdiag *stmt)
 	 * Note: we trust the grammar to have disallowed the relevant item kinds
 	 * if not is_stacked, otherwise we'd dump core below.
 	 */
-	if (stmt->is_stacked && estate->cur_error == NULL)
+	/*
+	 * GET STACKED DIAGNOSTICS is only valid inside an exception handler.
+	 * MySQL's "GET ... DIAGNOSTICS CONDITION <n>" reads the condition that
+	 * activated the handler the same way; PostgreSQL's diagnostics area
+	 * holds a single condition, so only CONDITION 1 is accepted.
+	 */
+	if (stmt->is_condition && stmt->condition_no != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("CONDITION number %d is not available: only one condition exists",
+						stmt->condition_no)));
+	if ((stmt->is_stacked || stmt->is_condition) && estate->cur_error == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER),
 				 errmsg("GET STACKED DIAGNOSTICS cannot be used outside an exception handler")));
@@ -2446,6 +2929,33 @@ exec_stmt_getdiag(PLMySQL_execstate *estate, PLMySQL_stmt_getdiag *stmt)
 			case PLMYSQL_GETDIAG_SCHEMA_NAME:
 				exec_assign_c_string(estate, var,
 									 estate->cur_error->schema_name);
+				break;
+
+			case PLMYSQL_GETDIAG_MYSQL_ERRNO:
+				{
+					/*
+					 * The MySQL errno of the handled condition: either what
+					 * the raiser attached (SIGNAL ... SET MYSQL_ERRNO) or
+					 * the reverse map of the condition's SQLSTATE.
+					 */
+					int			errno_val;
+
+					errno_val = plmysql_caught_mysql_errno;
+					if (errno_val <= 0 && estate->cur_error != NULL)
+						errno_val = plmysql_sqlstate_to_errno(
+							unpack_sql_state(estate->cur_error->sqlerrcode));
+
+					if (errno_val <= 0)
+						exec_assign_value(estate, var, (Datum) 0, true,
+										  INT4OID, -1);
+					else
+					{
+						char		buf[16];
+
+						snprintf(buf, sizeof(buf), "%d", errno_val);
+						exec_assign_c_string(estate, var, buf);
+					}
+				}
 				break;
 
 			case PLMYSQL_GETDIAG_CONTEXT:
@@ -4838,6 +5348,20 @@ exec_stmt_fetch(PLMySQL_execstate *estate, PLMySQL_stmt_fetch *stmt)
 	/* Set the ROW_COUNT and the global FOUND variable appropriately. */
 	estate->eval_processed = n;
 	exec_set_found(estate, n != 0);
+
+	/*
+	 * MySQL semantics: a FETCH past the end of the result set raises a NOT
+	 * FOUND condition (SQLSTATE 02000), which is how the classic
+	 * "DECLARE CONTINUE HANDLER FOR NOT FOUND" cursor loop terminates.  The
+	 * condition is only raised when the routine actually declares handlers,
+	 * so plain plpgsql-style loops keep the quiet FOUND=false behavior.  In
+	 * a handler-equipped block the per-statement machinery either matches a
+	 * handler or swallows the unhandled class-02 condition, as MySQL does.
+	 */
+	if (n == 0 && !stmt->is_move && estate->func->has_handlers)
+		ereport(ERROR,
+				(errcode(ERRCODE_NO_DATA),
+				 errmsg("cursor fetch past end of result set")));
 
 	return PLMYSQL_RC_OK;
 }

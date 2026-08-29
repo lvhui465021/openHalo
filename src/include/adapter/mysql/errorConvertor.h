@@ -79,6 +79,12 @@
 void initErrorCodeHashTable(void);
 int convertErrorCode(int haloErrorCode);
 
+/*
+ * MySQL errno explicitly attached to the error currently being sent to the
+ * client (set by the plmysql extension for SIGNAL ... SET MYSQL_ERRNO).
+ */
+extern void mysSetPendingMySQLErrno(int errorCode);
+extern int	mysTakePendingMySQLErrno(void);
 
 #endif                          /* ERRORCONVERTOR_H */
 

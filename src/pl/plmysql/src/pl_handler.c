@@ -45,7 +45,14 @@ static const struct config_enum_entry variable_conflict_options[] = {
 	{NULL, 0, false}
 };
 
-int			plmysql_variable_conflict = PLMYSQL_RESOLVE_ERROR;
+/*
+ * MySQL resolves an unqualified name in an embedded SQL statement as a table
+ * column first, and only falls back to a routine-local variable or parameter
+ * when no such column exists.  That is exactly the use_column behavior, so
+ * unlike plpgsql (whose default raises an ambiguity error) the plmysql
+ * default follows MySQL.
+ */
+int			plmysql_variable_conflict = PLMYSQL_RESOLVE_COLUMN;
 
 bool		plmysql_print_strict_params = false;
 
@@ -160,7 +167,7 @@ _PG_init(void)
 							 gettext_noop("Sets handling of conflicts between PL/MySQL variable names and table column names."),
 							 NULL,
 							 &plmysql_variable_conflict,
-							 PLMYSQL_RESOLVE_ERROR,
+							 PLMYSQL_RESOLVE_COLUMN,
 							 variable_conflict_options,
 							 PGC_SUSET, 0,
 							 NULL, NULL, NULL);

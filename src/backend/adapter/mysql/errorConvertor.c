@@ -48,7 +48,33 @@
 
 #include "postgres.h"
 #include "utils/hsearch.h"
+#include "utils/errcodes.h"
 #include "adapter/mysql/errorConvertor.h"
+
+/*
+ * MySQL errno explicitly attached to the error currently on its way to the
+ * client (SIGNAL ... SET MYSQL_ERRNO).  The backend never calls into the
+ * plmysql extension, so plmysql hands the value over through
+ * mysSetPendingMySQLErrno() before raising the error; sendErrPacket() takes
+ * and clears it when the error packet goes out.  A catch path in plmysql
+ * clears it when the error is handled instead.
+ */
+static int mysPendingMySQLErrno = 0;
+
+void
+mysSetPendingMySQLErrno(int errorCode)
+{
+	mysPendingMySQLErrno = errorCode;
+}
+
+int
+mysTakePendingMySQLErrno(void)
+{
+	int			e = mysPendingMySQLErrno;
+
+	mysPendingMySQLErrno = 0;
+	return e;
+}
 
 
 typedef struct 
@@ -93,24 +119,55 @@ initErrorCodeHashTable(void)
                                       &hashctl, 
                                       HASH_ELEM | HASH_BLOBS);
 
-    /* 有个比较麻烦的问题，halo的错误码和mysql的错误码不是一一对应的 */
-    initErrorCode(1064, 1265);
-    initErrorCode(1292, 1366);
-    initErrorCode(1364, 1048);
-    initErrorCode(1411, 1049);
-    initErrorCode(2600, 1292);
-    initErrorCode(16777248, 1264);
-    initErrorCode(16777346, 1406);
-    initErrorCode(16801924, 1478);
-    initErrorCode(16908420, 1146);
-    initErrorCode(33575106, 1048);
-    initErrorCode(33685634, 1064);
-    initErrorCode(50331778, 1264);
-    initErrorCode(50352322, 1452);
-    initErrorCode(50360452, 1054);
-    initErrorCode(67391682, 1264);
-    initErrorCode(83906754, 1062);
-    initErrorCode(117571716, 1050);
+    /*
+     * 有个比较麻烦的问题，halo的错误码和mysql的错误码不是一一对应的。
+     *
+     * Keys are PostgreSQL SQLSTATEs (as produced by MAKE_SQLSTATE); the two
+     * "42W01"/"42W07"/"22W02"/"W0001" states are openHalo's own.  The
+     * original list contained five dead entries whose keys were MySQL
+     * errnos (1064/1292/1364/1411/2600) and could never match a PG
+     * SQLSTATE, plus two wrong mappings: 42601 (syntax error) was reported
+     * as 1478 instead of 1064, and the invalid-text-representation state
+     * was reported as 1064 instead of 1366.  The 23514 (check_violation)
+     * entry was dropped: MySQL 5.7 has no CHECK constraints, so it can only
+     * ever fall through to the generic mapping below.
+     */
+    initErrorCode(16801924, 1064);      /* 42601 syntax error -> ER_PARSE_ERROR */
+    initErrorCode(16908420, 1146);      /* 42W01 (openHalo undefined table) */
+    initErrorCode(33575106, 1048);      /* 23502 not-null -> ER_BAD_NULL_ERROR */
+    initErrorCode(33685634, 1366);      /* 22W02 (openHalo invalid text repr) */
+    initErrorCode(50331778, 1264);      /* 22003 out of range -> ER_WARN_DATA_OUT_OF_RANGE */
+    initErrorCode(50352322, 1452);      /* 23503 FK violation -> ER_NO_REFERENCED_ROW_2 */
+    initErrorCode(50360452, 1054);      /* 42703 undefined column -> ER_BAD_FIELD_ERROR */
+    initErrorCode(83906754, 1062);      /* 23505 unique -> ER_DUP_ENTRY */
+    initErrorCode(117571716, 1050);     /* 42W07 (openHalo duplicate table) */
+    initErrorCode(16777248, 1264);      /* W0001 (openHalo warning) */
+    initErrorCode(16777346, 1406);      /* 22001 string right truncation -> ER_DATA_TOO_LONG */
+
+    /*
+     * Common conditions raised by stored routines, keyed by the standard
+     * ERRCODE_* names so the mapping stays readable.
+     */
+    initErrorCode(ERRCODE_UNIQUE_VIOLATION, 1062);
+    initErrorCode(ERRCODE_NOT_NULL_VIOLATION, 1048);
+    initErrorCode(ERRCODE_FOREIGN_KEY_VIOLATION, 1452);
+    initErrorCode(ERRCODE_UNDEFINED_TABLE, 1146);
+    initErrorCode(ERRCODE_UNDEFINED_COLUMN, 1054);
+    initErrorCode(ERRCODE_SYNTAX_ERROR, 1064);
+    initErrorCode(ERRCODE_DUPLICATE_TABLE, 1050);
+    initErrorCode(ERRCODE_UNDEFINED_FUNCTION, 1305);
+    initErrorCode(ERRCODE_INVALID_TEXT_REPRESENTATION, 1366);
+    initErrorCode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION, 1406);
+    initErrorCode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE, 1264);
+    initErrorCode(ERRCODE_DIVISION_BY_ZERO, 1365);
+    initErrorCode(ERRCODE_DATETIME_FIELD_OVERFLOW, 1292);
+    initErrorCode(ERRCODE_INVALID_DATETIME_FORMAT, 1292);
+    initErrorCode(ERRCODE_AMBIGUOUS_COLUMN, 1052);
+    initErrorCode(ERRCODE_NAME_TOO_LONG, 1059);
+    initErrorCode(ERRCODE_NO_DATA, 1329);
+    initErrorCode(ERRCODE_T_R_DEADLOCK_DETECTED, 1213);
+    initErrorCode(ERRCODE_LOCK_NOT_AVAILABLE, 1205);
+    initErrorCode(ERRCODE_QUERY_CANCELED, 1317);
     //initErrorCode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION, 
     //              HALO_ERR_DATA_TOO_LONG);
     //initErrorCode(ERRCODE_INVALID_TEXT_REPRESENTATION, 
@@ -148,6 +205,15 @@ convertErrorCode(int haloErrorCode)
 {
     HaloMySQLErrorCode *ret = NULL;
     bool found = false;
+    int  pending;
+
+    /*
+     * SIGNAL ... SET MYSQL_ERRNO bypasses the table entirely: the user
+     * picked the exact MySQL error number to report.
+     */
+    pending = mysTakePendingMySQLErrno();
+    if (pending > 0)
+        return pending;
 
     if (haloMysqlErrorCodes != NULL)
     {
@@ -159,14 +225,13 @@ convertErrorCode(int haloErrorCode)
         {
             return ret->mySQLErrorCode;
         }
-        else
-        {
-            return haloErrorCode;
-        }
     }
-    else
-    {
-        return haloErrorCode;
-    }
+
+    /*
+     * Unmapped errors used to fall through as the raw PG code, which shows
+     * up on MySQL clients as an illegal errno in the millions.  Report the
+     * generic ER_UNKNOWN_ERROR instead.
+     */
+    return 1105;
 }
 

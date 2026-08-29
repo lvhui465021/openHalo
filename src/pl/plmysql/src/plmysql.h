@@ -65,7 +65,8 @@ typedef enum PLMySQL_datum_type
 	PLMYSQL_DTYPE_ROW,
 	PLMYSQL_DTYPE_REC,
 	PLMYSQL_DTYPE_RECFIELD,
-	PLMYSQL_DTYPE_PROMISE
+	PLMYSQL_DTYPE_PROMISE,
+	PLMYSQL_DTYPE_COND			/* MySQL named condition (DECLARE cond CONDITION FOR ...) */
 } PLMySQL_datum_type;
 
 /*
@@ -117,6 +118,7 @@ typedef enum PLMySQL_stmt_type
 	PLMYSQL_STMT_RETURN_NEXT,
 	PLMYSQL_STMT_RETURN_QUERY,
 	PLMYSQL_STMT_RAISE,
+	PLMYSQL_STMT_SIGNAL,
 	PLMYSQL_STMT_ASSERT,
 	PLMYSQL_STMT_EXECSQL,
 	PLMYSQL_STMT_DYNEXECUTE,
@@ -158,8 +160,18 @@ typedef enum PLMySQL_getdiag_kind
 	PLMYSQL_GETDIAG_DATATYPE_NAME,
 	PLMYSQL_GETDIAG_MESSAGE_TEXT,
 	PLMYSQL_GETDIAG_TABLE_NAME,
-	PLMYSQL_GETDIAG_SCHEMA_NAME
+	PLMYSQL_GETDIAG_SCHEMA_NAME,
+	PLMYSQL_GETDIAG_MYSQL_ERRNO
 } PLMySQL_getdiag_kind;
+
+/*
+ * Which diagnostic item a SIGNAL statement sets
+ */
+typedef enum PLMySQL_signal_item_type
+{
+	PLMYSQL_SIGNAL_MESSAGE_TEXT,
+	PLMYSQL_SIGNAL_MYSQL_ERRNO
+} PLMySQL_signal_item_type;
 
 /*
  * RAISE statement options
@@ -468,10 +480,16 @@ typedef struct PLMySQL_stmt
  */
 typedef struct PLMySQL_condition
 {
-	int			sqlerrstate;	/* SQLSTATE code */
+	int			sqlerrstate;	/* SQLSTATE code; PLMYSQL_COND_SQLEXCEPTION is
+								 * the MySQL SQLEXCEPTION class sentinel */
+	int			mysql_errno;	/* MySQL error number, or 0 if this is a pure
+								 * SQLSTATE / class condition */
 	char	   *condname;		/* condition name (for debugging) */
 	struct PLMySQL_condition *next;
 } PLMySQL_condition;
+
+/* sentinel sqlerrstate value meaning "any SQLEXCEPTION-class condition" */
+#define PLMYSQL_COND_SQLEXCEPTION	(-1)
 
 /*
  * EXCEPTION block
@@ -494,6 +512,34 @@ typedef struct PLMySQL_exception
 } PLMySQL_exception;
 
 /*
+ * A named condition datum: "DECLARE cond CONDITION FOR <errno | SQLSTATE>".
+ * MySQL allows subsequent HANDLER and SIGNAL statements to refer to the
+ * condition by name.
+ */
+typedef struct PLMySQL_cond
+{
+	int			dtype;			/* PLMYSQL_DTYPE_COND */
+	int			dno;
+	char	   *refname;
+	int			lineno;
+	char		sqlstate[6];	/* SQLSTATE string, e.g. "23000" */
+	int			mysql_errno;	/* MySQL error number, or 0 if unknown */
+} PLMySQL_cond;
+
+/*
+ * One MySQL "DECLARE {CONTINUE|EXIT} HANDLER FOR <conditions> <stmt>".
+ * The action is a single statement (which may be a BEGIN...END block).
+ */
+typedef struct PLMySQL_handler
+{
+	int			lineno;
+	bool		is_continue;	/* CONTINUE vs EXIT handler */
+	List	   *conditions;		/* List of PLMySQL_condition */
+	List	   *action;			/* handler body statements (List of
+								 * PLMySQL_stmt) */
+} PLMySQL_handler;
+
+/*
  * Block of statements
  */
 typedef struct PLMySQL_stmt_block
@@ -506,6 +552,8 @@ typedef struct PLMySQL_stmt_block
 	int			n_initvars;		/* Length of initvarnos[] */
 	int		   *initvarnos;		/* dnos of variables declared in this block */
 	PLMySQL_exception_block *exceptions;
+	List	   *handlers;		/* MySQL DECLARE HANDLERs (List of
+								 * PLMySQL_handler), or NIL */
 } PLMySQL_stmt_block;
 
 /*
@@ -584,6 +632,8 @@ typedef struct PLMySQL_stmt_getdiag
 	int			lineno;
 	unsigned int stmtid;
 	bool		is_stacked;		/* STACKED or CURRENT diagnostics area? */
+	bool		is_condition;	/* CONDITION <n> form? */
+	int			condition_no;	/* condition number, when is_condition */
 	List	   *diag_items;		/* List of PLMySQL_diag_item */
 } PLMySQL_stmt_getdiag;
 
@@ -874,6 +924,35 @@ typedef struct PLMySQL_raise_option
 } PLMySQL_raise_option;
 
 /*
+ * MySQL SIGNAL or RESIGNAL statement.
+ *
+ * sqlstate/cond_datano: which condition to signal.  For SIGNAL, exactly one
+ * of sqlstate (from "SIGNAL SQLSTATE 'xxxxx'") or cond_datano (a named
+ * condition datum) is set.  For RESIGNAL both may be NULL/-1 (re-signal the
+ * condition that activated the handler), or sqlstate may override it.
+ */
+typedef struct PLMySQL_stmt_signal
+{
+	PLMySQL_stmt_type cmd_type;
+	int			lineno;
+	unsigned int stmtid;
+	bool		is_resignal;	/* RESIGNAL vs SIGNAL */
+	char	   *sqlstate;		/* literal SQLSTATE, or NULL */
+	int			cond_datano;	/* named condition datum, or -1 */
+	List	   *items;			/* List of PLMySQL_signal_item, or NIL */
+} PLMySQL_stmt_signal;
+
+/*
+ * One SET item of a SIGNAL statement (MESSAGE_TEXT = ..., MYSQL_ERRNO = ...)
+ */
+typedef struct PLMySQL_signal_item
+{
+	int			lineno;
+	PLMySQL_signal_item_type opt_type;
+	PLMySQL_expr *expr;
+} PLMySQL_signal_item;
+
+/*
  * ASSERT statement
  */
 typedef struct PLMySQL_stmt_assert
@@ -1009,6 +1088,7 @@ typedef struct PLMySQL_function
 	/* data derived while parsing body */
 	unsigned int nstatements;	/* counter for assigning stmtids */
 	bool		requires_procedure_resowner;	/* contains CALL or DO? */
+	bool		has_handlers;	/* body contains a MySQL DECLARE HANDLER? */
 
 	/* these fields change when the function is used */
 	struct PLMySQL_execstate *cur_estate;
@@ -1195,6 +1275,34 @@ extern bool plmysql_check_syntax;
 extern bool plmysql_DumpExecTree;
 
 extern PLMySQL_stmt_block *plmysql_parse_result;
+
+/*
+ * MySQL errno carried by the error currently being raised (SIGNAL ... SET
+ * MYSQL_ERRNO), for the MySQL protocol adapter to put on the wire, and the
+ * errno of the error a MySQL handler is currently handling (for GET
+ * DIAGNOSTICS / RESIGNAL).  0 means "none".
+ */
+extern int	plmysql_last_signal_errno;
+extern int	plmysql_caught_mysql_errno;
+
+/* backend-side stash for the adapter's error packet builder (adapter/mysql) */
+extern void mysSetPendingMySQLErrno(int errorCode);
+
+/*
+ * MySQL handler execution support (pl_exec_ext.c)
+ */
+extern int	plmysql_exec_block_mysql(PLMySQL_execstate *estate,
+									 PLMySQL_stmt_block *block);
+extern void plmysql_exec_block_initvars(PLMySQL_execstate *estate,
+										PLMySQL_stmt_block *block);
+extern void plmysql_clear_signal_errno(void);
+
+/*
+ * MySQL errno <-> SQLSTATE mapping (pl_exec_ext.c)
+ */
+extern bool plmysql_errno_to_pgsqlstate(int err, char sqlstate[6]);
+extern bool plmysql_errno_to_sqlstate(int err, char sqlstate[6]);
+extern int	plmysql_sqlstate_to_errno(const char *sqlstate);
 
 extern int	plmysql_nDatums;
 extern PLMySQL_datum **plmysql_Datums;

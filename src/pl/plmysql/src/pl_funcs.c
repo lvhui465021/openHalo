@@ -422,6 +422,9 @@ free_stmt(PLMySQL_stmt *stmt)
 		case PLMYSQL_STMT_RAISE:
 			free_raise((PLMySQL_stmt_raise *) stmt);
 			break;
+		case PLMYSQL_STMT_SIGNAL:
+			/* nothing extra to free: sqlstate is shared, items are exprs */
+			break;
 		case PLMYSQL_STMT_ASSERT:
 			free_assert((PLMySQL_stmt_assert *) stmt);
 			break;
@@ -801,6 +804,7 @@ static void dump_return(PLMySQL_stmt_return *stmt);
 static void dump_return_next(PLMySQL_stmt_return_next *stmt);
 static void dump_return_query(PLMySQL_stmt_return_query *stmt);
 static void dump_raise(PLMySQL_stmt_raise *stmt);
+static void dump_signal(PLMySQL_stmt_signal *stmt);
 static void dump_assert(PLMySQL_stmt_assert *stmt);
 static void dump_execsql(PLMySQL_stmt_execsql *stmt);
 static void dump_dynexecute(PLMySQL_stmt_dynexecute *stmt);
@@ -876,6 +880,9 @@ dump_stmt(PLMySQL_stmt *stmt)
 			break;
 		case PLMYSQL_STMT_RAISE:
 			dump_raise((PLMySQL_stmt_raise *) stmt);
+			break;
+		case PLMYSQL_STMT_SIGNAL:
+			dump_signal((PLMySQL_stmt_signal *) stmt);
 			break;
 		case PLMYSQL_STMT_ASSERT:
 			dump_assert((PLMySQL_stmt_assert *) stmt);
@@ -1462,6 +1469,15 @@ dump_raise(PLMySQL_stmt_raise *stmt)
 	}
 	dump_indent -= 2;
 }
+
+static void
+dump_signal(PLMySQL_stmt_signal *stmt)
+{
+	dump_ind();
+	printf("%s: sqlstate=%s\n", stmt->is_resignal ? "RESIGNAL" : "SIGNAL",
+		   stmt->sqlstate ? stmt->sqlstate : "(none)");
+}
+
 
 static void
 dump_assert(PLMySQL_stmt_assert *stmt)

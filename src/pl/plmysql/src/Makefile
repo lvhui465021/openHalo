@@ -23,6 +23,7 @@ OBJS = \
 	$(WIN32RES) \
 	pl_comp.o \
 	pl_exec.o \
+	pl_exec_ext.o \
 	pl_funcs.o \
 	pl_gram.o \
 	pl_handler.o \
