@@ -65,6 +65,8 @@
 #include "adapter/mysql/systemVar.h"
 #include "parser/parse_target.h"
 #include "parser/parser_helper.h"
+#include "parser/scanner.h"
+#include "parser/scansup.h"
 #include "parser/mysql/mys_gramparse.h"
 #include "parser/mysql/mys_parser.h"
 
@@ -230,6 +232,14 @@ static ResTarget *createResTargetWithFunc2Args(char *name, char *funcShemaName, 
 static RangeVar *createRangeVar(char *schemaName, char *tableName);
 static void checkJoinOn(JoinExpr *joinExpr, bool *hasNotOn);
 static void makeOnClause(Node **expr, JoinExpr *joinExpr);
+
+/* routine-body capture helpers (defined in the trailing C section) */
+static char *mys_capture_return_stmt_text(core_yyscan_t yyscanner,
+										  int return_loc,
+										  int lookahead_token,
+										  int lookahead_loc);
+static bool mys_optlist_pins_foreign_language(List *options);
+static char *mys_return_body_text;
 
 %}
 
@@ -11122,8 +11132,37 @@ CreateFunctionStmt:
 					n->funcname = $4;
 					n->parameters = $5;
 					n->returnType = $7;
-					n->options = $8;
-					n->sql_body = $9;
+
+					/*
+					 * MySQL's one-statement body "RETURN expr" lowers to the
+					 * plmysql engine, so that both spellings of a MySQL
+					 * routine body share one language, compiler, error
+					 * surface and protocol scope.  An explicit non-SQL
+					 * LANGUAGE (e.g. plpgsql) is respected instead; LANGUAGE
+					 * SQL is a MySQL no-op and still lowers.
+					 */
+					if (IsA($9, ReturnStmt) && mys_return_body_text != NULL &&
+						!mys_optlist_pins_foreign_language($8))
+					{
+						char	   *body;
+
+						body = psprintf("BEGIN %s; END", mys_return_body_text);
+						n->options = lappend($8,
+							makeDefElem("language",
+										(Node *) makeString(pstrdup("plmysql")),
+										@9));
+						n->options = lappend(n->options,
+							makeDefElem("as",
+										(Node *) list_make1(makeString(body)),
+										@9));
+						n->sql_body = NULL;
+					}
+					else
+					{
+						n->options = $8;
+						n->sql_body = $9;
+					}
+					mys_return_body_text = NULL;
 					$$ = (Node *)n;
 				}
 			| CREATE opt_or_replace FUNCTION func_name func_args_with_defaults
@@ -11545,7 +11584,15 @@ common_func_opt_item:
 				}
             | DETERMINISTIC
                 {
-                    $$ = makeDefElem("volatility", (Node *)makeString("immutable"), @1);
+                    /*
+                     * MySQL's DETERMINISTIC only promises "same input, same
+                     * output"; it does NOT forbid reading tables, so mapping
+                     * it to PostgreSQL IMMUTABLE lets the planner constant-
+                     * fold prepared statements to stale results.  Until a
+                     * stricter body-dependency analysis exists, the closest
+                     * safe approximation is STABLE.
+                     */
+                    $$ = makeDefElem("volatility", (Node *)makeString("stable"), @1);
                 }
             | NOT DETERMINISTIC
                 {
@@ -11671,6 +11718,17 @@ mysql_routine_body:
 opt_routine_body:
 			ReturnStmt
 				{
+					/*
+					 * Capture the raw "RETURN <expr>" text so the CREATE
+					 * FUNCTION production can lower this MySQL one-statement
+					 * body into the plmysql engine.  yychar/yylloc are
+					 * bison's lookahead -- the first token after the
+					 * expression -- and are forwarded because they are local
+					 * to yyparse and invisible inside the helper.
+					 */
+					mys_return_body_text =
+						mys_capture_return_stmt_text(yyscanner, @1,
+													 yychar, yylloc);
 					$$ = $1;
 				}
 			| BEGIN_P ATOMIC routine_body_stmt_list END_P
@@ -24285,6 +24343,93 @@ makeOnClause(Node **expr, JoinExpr *joinExpr)
 }
 
 
+
+/*
+ * Raw text of the most recently reduced single-statement routine body
+ * ("RETURN a_expr"), captured by the opt_routine_body: ReturnStmt action and
+ * consumed by the CREATE FUNCTION production that owns it.
+ *
+ * MySQL spells a one-statement function "CREATE FUNCTION f() RETURNS int
+ * RETURN expr;".  Lowering it into the plmysql engine (rather than the
+ * PostgreSQL SQL-function path) keeps one body form = one language = one set
+ * of compiler, error and protocol semantics; see the CREATE FUNCTION
+ * production for the lowering rules.  The static is safe because a backend
+ * never parses recursively, and every read is immediately preceded by the
+ * opt_routine_body: ReturnStmt reduction for the very node being inspected.
+ */
+static char *mys_return_body_text = NULL;
+
+/*
+ * Slice the raw "RETURN <expr>" text out of the scan buffer.
+ *
+ * return_loc is the offset of the RETURN keyword.  When this production
+ * reduces, bison is holding the first token after the expression (normally
+ * the ';' that ends the CREATE statement, else EOF) as its lookahead, so the
+ * text runs from RETURN up to (not including) that token's offset.  If no
+ * lookahead was ever read (bison's default reduction without peeking), fall
+ * back to the end of the buffer: for the EOF case that is exact, and the
+ * trailing-whitespace trim keeps it benign otherwise.
+ */
+static char *
+mys_capture_return_stmt_text(core_yyscan_t yyscanner, int return_loc,
+							 int lookahead_token, int lookahead_loc)
+{
+	mys_yy_extra_type *yyextra = mys_yyget_extra(yyscanner);
+	char	   *buf = yyextra->core_yy_extra.scanbuf;
+	Size		buflen = yyextra->core_yy_extra.scanbuflen;
+	Size		end;
+	char	   *text;
+
+	if (lookahead_token != YYEMPTY && lookahead_loc > return_loc &&
+		(Size) lookahead_loc <= buflen)
+		end = (Size) lookahead_loc;
+	else
+		end = buflen;
+
+	while (end > (Size) return_loc &&
+		   scanner_isspace(buf[end - 1]))
+		end--;
+
+	text = (char *) palloc(end - return_loc + 1);
+	memcpy(text, buf + return_loc, end - return_loc);
+	text[end - return_loc] = '\0';
+
+	return text;
+}
+
+/*
+ * True when the routine's characteristic list already pins a LANGUAGE whose
+ * semantics must not be overridden.  MySQL's LANGUAGE SQL is a no-op
+ * characteristic (SQL is the only language MySQL has), and plmysql is our
+ * spelling of the same thing, so both still lower to plmysql; anything else
+ * (e.g. LANGUAGE plpgsql) is an explicit request we must respect.
+ *
+ * NULL list elements come from unused_func_opt_item (LANGUAGE SQL and the
+ * other MySQL-only characteristics are parsed and discarded) and are skipped.
+ */
+static bool
+mys_optlist_pins_foreign_language(List *options)
+{
+	ListCell   *lc;
+
+	foreach(lc, options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (def == NULL || !IsA(def, DefElem))
+			continue;
+		if (strcmp(def->defname, "language") == 0)
+		{
+			char	   *lang = strVal(def->arg);
+
+			if (pg_strcasecmp(lang, "sql") != 0 &&
+				pg_strcasecmp(lang, "plmysql") != 0)
+				return true;
+		}
+	}
+
+	return false;
+}
 
 /*
  * The blocks whose openers mys_capture_routine_body() deliberately does not
