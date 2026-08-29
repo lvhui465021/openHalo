@@ -127,7 +127,7 @@ openHalo 已经实现了按会话切换的解析/执行引擎机制，新增语�
 | `[NOT] DETERMINISTIC` | ⚠️ 误映射为 IMMUTABLE | 低（改映射为 STABLE） |
 | `CONTAINS SQL｜NO SQL｜READS/MODIFIES SQL DATA` | ⚠️ 解析后丢弃 | 低（可继续丢弃或落元数据） |
 | `SQL SECURITY DEFINER/INVOKER` | ✅ | — |
-| **裸 `BEGIN...END` 过程体** | ❌ 仅 `BEGIN ATOMIC` | **高**（见 §4.2） |
+| **裸 `BEGIN...END` 过程体** | ✅（M1，§4.2） | — |
 | `ALTER`/`DROP {PROCEDURE｜FUNCTION}` | ✅ | — |
 
 ### B. 调用（§13.2.1）
@@ -135,44 +135,45 @@ openHalo 已经实现了按会话切换的解析/执行引擎机制，新增语�
 | 语法项 | 现状 | 难度 |
 |---|---|---|
 | `CALL sp(args)` | ✅ | — |
-| **OUT/INOUT 回写 `@var`** | ❌ `outargs` 已构建但无人消费 | 中（见 §4.6） |
-| **过程体多结果集** | ❌ 无触发点 | 高（见 §4.7） |
+| **OUT/INOUT 回写 `@var`** | ✅（M5，§4.6） | — |
+| **过程体多结果集**（裸 `SELECT`、`EXECUTE` 预处理语句） | ✅（M5，§4.7；`plmysql_push_execsql_resultset()`, `pl_exec_ext.c`） | — |
 
 ### C. 复合语句与流程控制（§13.6.1–13.6.5）
 
-| 语法项 | 现状 | plpgsql 映射目标 | 难度 |
-|---|---|---|---|
-| `[label:] BEGIN...END [label]` | ❌ | `PLpgSQL_stmt_block` | 中 |
-| `DECLARE v[,v2] type [DEFAULT expr]` | ❌ | `PLpgSQL_var` | 低 |
-| `SET var = expr` | ⚠️ 与系统/用户变量语法歧义 | `PLpgSQL_stmt_assign` | 中 |
-| `SELECT ... INTO var`（例程内） | ⚠️ 顶层 `MysSelectIntoStmt` 只写 `@var` | `PLpgSQL_stmt_execsql`(into) | 中 |
-| `IF/ELSEIF/ELSE/END IF` | ❌ | `PLpgSQL_stmt_if` | 低 |
-| `CASE ... END CASE` | ❌ | `PLpgSQL_stmt_case` | 低 |
-| `[label:] LOOP...END LOOP` | ❌ 死关键字 | `PLpgSQL_stmt_loop` | 低 |
-| `[label:] WHILE c DO...END WHILE` | ❌ 死关键字 | `PLpgSQL_stmt_while` | 低 |
-| `[label:] REPEAT...UNTIL c END REPEAT` | ❌ 死关键字 | `stmt_loop` + 尾部 exit | 低 |
-| `LEAVE label` / `ITERATE label` | ❌ 死关键字 | `stmt_exit`(is_exit=true/false) | 低 |
-| `RETURN expr`（FUNCTION） | ⚠️ 仅顶层有 | `PLpgSQL_stmt_return` | 低 |
+| 语法项 | 现状 | plpgsql 映射目标 |
+|---|---|---|
+| `[label:] BEGIN...END [label]` | ✅（M1） | `PLMySQL_stmt_block` |
+| `DECLARE v[,v2] type [DEFAULT expr]` | ✅（M1，支持一条声明多变量） | `PLMySQL_var` |
+| `SET var = expr` | ✅（M1 本地变量；`SET @uservar = expr` 于本次会话补上，透传给 SPI） | `PLMySQL_stmt_assign` |
+| `SELECT ... INTO var`（例程内） | ✅（M1） | `PLMySQL_stmt_execsql`(into) |
+| `IF/ELSEIF/ELSE/END IF` | ✅（M1） | `PLMySQL_stmt_if` |
+| `CASE ... END CASE` | ✅（M2） | `PLMySQL_stmt_case` |
+| `[label:] LOOP...END LOOP` | ✅（M2） | `PLMySQL_stmt_loop` |
+| `[label:] WHILE c DO...END WHILE` | ✅（M2） | `PLMySQL_stmt_while` |
+| `[label:] REPEAT...UNTIL c END REPEAT` | ✅（M2） | `stmt_loop` + 尾部 exit |
+| `LEAVE label` / `ITERATE label` | ✅（M2） | `stmt_exit`(is_exit=true/false) |
+| `RETURN expr`（FUNCTION） | ✅（M1） | `PLMySQL_stmt_return` |
 
 ### D. 游标（§13.6.6）
 
 MySQL 游标是只读、不可滚动、仅例程内可用——PG 游标的真子集。
 
-| 语法项 | 现状 | 难度 |
-|---|---|---|
-| `DECLARE c CURSOR FOR select_stmt` | ❌ | 低 |
-| `OPEN c` / `FETCH ... INTO vars` / `CLOSE c` | ❌ | 低 |
-| **游标耗尽 → `NOT FOUND` 可捕获条件** | ❌ | 中（须与 HANDLER 联动，plpgsql 原生 FETCH 越界只置 `FOUND=false`，不抛异常） |
+| 语法项 | 现状 |
+|---|---|
+| `DECLARE c CURSOR FOR select_stmt` | ✅（M3） |
+| `OPEN c` / `FETCH ... INTO vars` / `CLOSE c` | ✅（M3） |
+| **游标耗尽 → `NOT FOUND` 可捕获条件** | ✅（M3/M4，与 HANDLER 联动） |
 
-### E. 条件处理（§13.6.7）— 最难的一类
+### E. 条件处理（§13.6.7）
 
-| 语法项 | 现状 | 难度 |
-|---|---|---|
-| `DECLARE cond CONDITION FOR {errno｜SQLSTATE}` | ❌ | 低（编译期符号表） |
-| **`DECLARE {CONTINUE｜EXIT} HANDLER FOR conds stmt`** | ❌ | **高**（见 §4.5） |
-| 条件类：`SQLSTATE 'x'` / errno / `SQLWARNING` / `NOT FOUND` / `SQLEXCEPTION` | ❌ | 中（类前缀匹配） |
-| `SIGNAL cond [SET items]` / `RESIGNAL` | ❌ | 中（见 §4.8） |
-| `GET [CURRENT｜STACKED] DIAGNOSTICS` | ❌ | 中 |
+| 语法项 | 现状 |
+|---|---|
+| `DECLARE cond CONDITION FOR {errno｜SQLSTATE}` | ✅（M3） |
+| **`DECLARE {CONTINUE｜EXIT} HANDLER FOR conds stmt`** | ✅（M4，§4.5） |
+| 条件类：`SQLSTATE 'x'` / errno / `SQLWARNING` / `NOT FOUND` / `SQLEXCEPTION` | ✅（M4） |
+| `SIGNAL cond [SET items]` / `RESIGNAL` | ✅（M4，§4.8） |
+| `GET [CURRENT｜STACKED] DIAGNOSTICS` | ✅（M4） |
+| **`DECLARE` 声明顺序校验**（变量/条件→游标→处理程序） | ✅（本次会话修复：变量/游标声明此前从未调用顺序检查；HANDLER 动作体若自身是嵌套 `BEGIN...END`，会把外层块的顺序状态清零，已改为保存/恢复栈） | — |
 
 ### F. 内省（§13.7.5）
 
@@ -180,18 +181,21 @@ MySQL 游标是只读、不可滚动、仅例程内可用——PG 游标的真�
 |---|---|
 | `SHOW CREATE {PROCEDURE｜FUNCTION}` | ✅ 语法存在，输出依赖 `prosrc` 存什么 |
 | `SHOW {PROCEDURE｜FUNCTION} STATUS` | ✅ |
-| `information_schema.ROUTINES` / `mysql.proc` | ⚠️ 视图存在，`language`/`ROUTINE_BODY` 硬编码 `'SQL'` |
+| `information_schema.ROUTINES` / `mysql.proc` | ⚠️ 视图存在，`language`/`ROUTINE_BODY` 仍硬编码 `'SQL'`，未随 M1 起 `prolang` 实际指向 `plmysql` 更新（§4.9，M6 未做） |
 
 ### G. 运行时语义（非语法但须对齐）
 
-| 语义 | MySQL 5.7 行为 | 需要的工作 |
+| 语义 | MySQL 5.7 行为 | 现状 |
 |---|---|---|
-| `sql_mode` 快照 | 创建时记录，执行时应用 | 落元数据 + 执行期恢复 |
-| 过程/函数递归 | 受 `max_sp_recursion_depth`，默认 **0=禁止** | 新增 GUC + 深度检查 |
+| `sql_mode` 快照 | 创建时记录，执行时应用 | ❌ 未做（M6 未做） |
+| 过程/函数递归 | 受 `max_sp_recursion_depth`，默认 **0=禁止** | ❌ 未做（无新增 GUC） |
 | 函数内表访问限制 | 不能修改调用语句正在读写的表 | 可选，本期不做 |
-| 函数返回结果集 | 报错 1415 | 编译期检查 |
-| `PREPARE/EXECUTE` 作用域 | PROCEDURE 内可用，FUNCTION/TRIGGER 内不可 | 上下文检查 |
-| `DECLARE` 顺序约束 | 变量/条件 → 游标 → 处理程序 | 编译期校验 |
+| 函数返回结果集 | 报错 1415 | ⚠️ 部分：函数内裸 `SELECT` 仍报错，但走的是通用 "no destination for result data"，不是 MySQL 的 1415/文案 |
+| `PREPARE/EXECUTE` 作用域 | PROCEDURE 内可用，FUNCTION/TRIGGER 内不可 | ❌ 未做上下文检查（本次会话验证 `PREPARE`/`EXECUTE`/`DEALLOCATE PREPARE` 在 PROCEDURE 内可用，未验证/未拦截在 FUNCTION 内使用的情况） |
+| `DECLARE` 顺序约束 | 变量/条件 → 游标 → 处理程序 | ✅ 本次会话修复（见 §E） |
+
+**本次会话另修复的运行时缺陷**（均不改变本节的语法覆盖范围，但影响正确性）：
+- `SIGNAL SQLSTATE 'xxxxx'`（自定义、未在错误码表中登记的 SQLSTATE）之前在发包时被硬编码替换为 `"HY000"`，客户端拿不到真实 SQLSTATE；`adapter.c` 的 `sendErrorMessage()` 改为发送 `unpack_sql_state(edata->sqlerrcode)`。§4.8 提到的"错误码→MySQL 规范 SQLSTATE"反向映射仍未做，因此走既有错误码表命中的错误，发出的 SQLSTATE 仍是 PG 原生编码，不是 MySQL 规范编码。
 
 ---
 
@@ -389,16 +393,18 @@ Babelfish（AWS 的 SQL Server 兼容层）验证了"clone plpgsql 建新 PL"是
 
 ## 6. 分期计划
 
-| 里程碑 | 内容 | 依赖 |
+| 里程碑 | 内容 | 状态 |
 |---|---|---|
-| M1 | 语法层过程体捕获（§4.2）+ `src/pl/plmysql/` 骨架（克隆改名，`DECLARE`/赋值/`IF`/`RETURN` 可跑） | — |
-| M2 | 完整流程控制（`LOOP`/`WHILE`/`REPEAT`/`LEAVE`/`ITERATE`/`CASE`）+ 局部变量完整语义 | M1 |
-| M3 | 游标（`DECLARE CURSOR`/`OPEN`/`FETCH`/`CLOSE`）+ EXIT HANDLER（复用 plpgsql EXCEPTION） | M2 |
-| M4 | CONTINUE HANDLER（§4.5，含游标 NOT FOUND 联动）+ `SIGNAL`/`RESIGNAL`（§4.8）+ `GET DIAGNOSTICS` + 错误码表修复与扩充 | M3 |
-| M5 | CALL 链路 OUT/INOUT 回写（§4.6）+ 多结果集协议打通（§4.7） | M1（不依赖 M2-M4，可与之并行） |
-| M6 | 元数据视图修正（§4.9）+ `DEFINER`/`COMMENT` 语法补全 + 触发器预留验证（§4.10，不实现触发器本身） | M1 |
+| M1 | 语法层过程体捕获（§4.2）+ `src/pl/plmysql/` 骨架（克隆改名，`DECLARE`/赋值/`IF`/`RETURN` 可跑） | ✅ 完成 |
+| M2 | 完整流程控制（`LOOP`/`WHILE`/`REPEAT`/`LEAVE`/`ITERATE`/`CASE`）+ 局部变量完整语义 | ✅ 完成 |
+| M3 | 游标（`DECLARE CURSOR`/`OPEN`/`FETCH`/`CLOSE`）+ EXIT HANDLER（复用 plpgsql EXCEPTION） | ✅ 完成 |
+| M4 | CONTINUE HANDLER（§4.5，含游标 NOT FOUND 联动）+ `SIGNAL`/`RESIGNAL`（§4.8）+ `GET DIAGNOSTICS` | ✅ 完成；**错误码表扩充未做**（仍是 §4.8 提到的 ~14 条，未扩到预估的 40–60 条），反向 errno→MySQL 规范 SQLSTATE 映射也未做 |
+| M5 | CALL 链路 OUT/INOUT 回写（§4.6）+ 多结果集协议打通（§4.7） | ✅ 完成（多结果集协议打通是 2026-08-29 补的：编译期 `is_select`/`n_resultsets` 标记早就有，执行期一直没接上，`CALL` 内裸 `SELECT`/`EXECUTE` 预处理语句会报 "no destination for result data"；另外例程体内 `SET @uservar = expr` 与 MySQL 形态的 `EXECUTE stmtname [USING ...]` 当时也还不能用，一并修了） |
+| M6 | 元数据视图修正（§4.9）+ `DEFINER`/`COMMENT` 语法补全 + 触发器预留验证（§4.10，不实现触发器本身） | ⚠️ 部分完成：`DEFINER`/`COMMENT` 语法与 `DETERMINISTIC` 映射已完成；**§4.9 元数据视图修正未做**（`mysql.proc`/`mys_informa_schema` 的 `language`/`ROUTINE_BODY` 仍硬编码 `'SQL'`）；`sql_mode` 快照、`max_sp_recursion_depth` GUC 均未做；触发器预留验证未做 |
 
-M5 与 M2-M4 无强依赖，可并行推进。M6 里的元数据/语法补全可穿插在任意阶段做。
+**2026-08-29 追加修复**（运行时正确性问题，不改变上述里程碑范围）：
+- `DECLARE` 声明顺序校验（§E）此前对变量、游标声明完全不生效，且 HANDLER 动作体若自身是嵌套块会清空外层块的顺序/HANDLER 收集状态——已改为保存/恢复栈
+- `SIGNAL` 的自定义 SQLSTATE 发包时被硬编码替换为 `"HY000"`，客户端拿不到真实值——已改为发送真实 SQLSTATE（`adapter.c`）
 
 ---
 
