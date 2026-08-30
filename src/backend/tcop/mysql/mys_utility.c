@@ -56,12 +56,21 @@
 #include <ctype.h>
 
 #include "commands/mysql/mys_uservar.h"
+#include "access/genam.h"
+#include "access/table.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
 #include "executor/tstoreReceiver.h"
 #include "nodes/makefuncs.h"
 #include "nodes/mysql/mys_parsenodes.h"
 #include "rewrite/rewriteHandler.h"
+#include "adapter/mysql/errorConvertor.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "adapter/mysql/systemVar.h"
 #include "utils/timestamp.h"
 
@@ -249,6 +258,183 @@ mys_make_mysql_trigger_function(CreateTrigStmt *stmt)
 			mys_plmysql_meta_item("plmysql.definer", definer));
 	func->sql_body = NULL;
 	return func;
+}
+
+/*
+ * MySQL spells DROP TRIGGER without an ON-table clause ("DROP TRIGGER
+ * [schema.]name") because trigger names are schema-scoped in MySQL while
+ * they are table-scoped in PostgreSQL.  The parser marks such statements
+ * with a parser-private leading name; resolve the owning table here and
+ * rewrite each object into the standard PostgreSQL [table..., trigname]
+ * shape so the unmodified RemoveObjects() native path executes the drop.
+ *
+ * Candidates are triggers named <name> in the target schema (the current
+ * search-path schema when unqualified, matching MySQL's current-database
+ * rule).  Triggers whose function is the private __mysql_trigger_<name>
+ * created by MySQL CREATE TRIGGER win over native-name twins; a name still
+ * shared by several tables has no MySQL equivalent and is rejected rather
+ * than silently picking one.  As with CREATE, the private trigger function
+ * itself survives the drop so a same-name trigger can be recreated.
+ */
+#define MYS_MYSQL_DROP_TRIGGER_MARKER	"__mysql_drop_trigger__"
+#define MYS_ERR_TRG_DOES_NOT_EXIST		1360
+
+static bool
+mys_trigger_has_mysql_name(Oid tgfoid, const char *trigname)
+{
+	HeapTuple	protup;
+	Form_pg_proc procform;
+	bool		result;
+	char	   *expect = psprintf("__mysql_trigger_%s", trigname);
+
+	protup = SearchSysCache1(PROCOID, ObjectIdGetDatum(tgfoid));
+	if (!HeapTupleIsValid(protup))
+		return false;
+	procform = (Form_pg_proc) GETSTRUCT(protup);
+	result = strcmp(NameStr(procform->proname), expect) == 0;
+	ReleaseSysCache(protup);
+	return result;
+}
+
+static void
+mys_preprocess_mysql_drop_trigger(DropStmt *stmt)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmt->objects)
+	{
+		List	   *obj = lfirst(lc);
+		char	   *schemaname = NULL;
+		char	   *trigname;
+		Oid			namespaceOid = InvalidOid;
+		Relation	tgrel;
+		SysScanDesc scan;
+		HeapTuple	tuple;
+		Oid			mysql_relid = InvalidOid;
+		Oid			other_relid = InvalidOid;
+		int			n_mysql = 0;
+		int			n_other = 0;
+		Oid			resolved_relid = InvalidOid;
+
+		/* the parser sends [marker, trigname] or [marker, schema, trigname] */
+		if (list_length(obj) < 2 || list_length(obj) > 3 ||
+			!IsA(linitial(obj), String) ||
+			strcmp(strVal(linitial(obj)), MYS_MYSQL_DROP_TRIGGER_MARKER) != 0)
+			continue;
+
+		trigname = strVal(llast(obj));
+		if (list_length(obj) == 3)
+		{
+			schemaname = strVal(lsecond(obj));
+			/* with missing_ok, an unknown schema resolves to "not found" */
+			namespaceOid = get_namespace_oid(schemaname, stmt->missing_ok);
+		}
+		else
+		{
+			List	   *search_path = fetch_search_path(false);
+
+			if (search_path == NIL)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_SCHEMA),
+						 errmsg("no schema has been selected to resolve \"%s\"",
+								trigname)));
+			namespaceOid = linitial_oid(search_path);
+			schemaname = get_namespace_name(namespaceOid);
+			list_free(search_path);
+		}
+
+		if (OidIsValid(namespaceOid))
+		{
+			tgrel = table_open(TriggerRelationId, AccessShareLock);
+			scan = systable_beginscan(tgrel, InvalidOid, false, NULL, 0, NULL);
+			while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+			{
+				Form_pg_trigger trigform = (Form_pg_trigger) GETSTRUCT(tuple);
+				HeapTuple	reltup;
+				Form_pg_class relform;
+				bool		is_mysql;
+
+				if (strcmp(NameStr(trigform->tgname), trigname) != 0)
+					continue;
+
+				reltup = SearchSysCache1(RELOID,
+										 ObjectIdGetDatum(trigform->tgrelid));
+				if (!HeapTupleIsValid(reltup))
+					continue;
+				relform = (Form_pg_class) GETSTRUCT(reltup);
+				if (relform->relnamespace != namespaceOid)
+				{
+					ReleaseSysCache(reltup);
+					continue;
+				}
+				ReleaseSysCache(reltup);
+
+				is_mysql = mys_trigger_has_mysql_name(trigform->tgfoid,
+													  trigname);
+				if (is_mysql)
+				{
+					if (n_mysql == 0)
+						mysql_relid = trigform->tgrelid;
+					n_mysql++;
+				}
+				else
+				{
+					if (n_other == 0)
+						other_relid = trigform->tgrelid;
+					n_other++;
+				}
+			}
+			systable_endscan(scan);
+			table_close(tgrel, AccessShareLock);
+		}
+
+		if (n_mysql > 0)
+			resolved_relid = mysql_relid;
+		else if (n_other == 1)
+			resolved_relid = other_relid;
+
+		if (OidIsValid(resolved_relid))
+		{
+			List	   *table_name;
+
+			table_name = list_make2(makeString(
+										get_namespace_name(
+											get_rel_namespace(resolved_relid))),
+									makeString(get_rel_name(resolved_relid)));
+			lfirst(lc) = lappend(table_name, makeString(trigname));
+		}
+		else if (n_mysql > 1 || (n_mysql == 0 && n_other > 1))
+			ereport(ERROR,
+					(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+					 errmsg("trigger \"%s\" is defined on multiple tables in schema \"%s\"",
+							trigname, schemaname),
+					 errhint("Use PostgreSQL syntax: DROP TRIGGER name ON table.")));
+		else if (stmt->missing_ok)
+		{
+			ereport(NOTICE,
+					(errmsg("trigger \"%s\" does not exist, skipping",
+							schemaname ?
+							psprintf("%s.%s", schemaname, trigname) :
+							trigname)));
+			stmt->objects = foreach_delete_current(stmt->objects, lc);
+		}
+		else
+		{
+			/*
+			 * MySQL reports ER_TRG_DOES_NOT_EXIST (1360) here; deliver it
+			 * through the pending-errno channel instead of a global
+			 * SQLSTATE table entry, which would leak onto unrelated
+			 * ERRCODE_UNDEFINED_OBJECT reports.
+			 */
+			mysSetPendingMySQLErrno(MYS_ERR_TRG_DOES_NOT_EXIST);
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("trigger %s does not exist",
+							schemaname ?
+							psprintf("%s.%s", schemaname, trigname) :
+							trigname)));
+		}
+	}
 }
 
 static void mys_ProcessUtilitySlow(ParseState *pstate,
@@ -1736,6 +1922,9 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 static void
 mys_ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 {
+	if (stmt->removeType == OBJECT_TRIGGER)
+		mys_preprocess_mysql_drop_trigger(stmt);
+
 	switch (stmt->removeType)
 	{
 		case OBJECT_INDEX:

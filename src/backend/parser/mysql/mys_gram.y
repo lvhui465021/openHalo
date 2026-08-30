@@ -263,7 +263,10 @@ static char *mys_return_body_text;
 %pure-parser
 /* 期待的shift/reduce数量，CreateFunctionStmt语句 */
 /* joined_table: */
-%expect 47
+/* +1: DROP TRIGGER <ident> where "IF" is both the start of IF EXISTS and a
+ * legal name token; default shift resolves it as IF EXISTS, matching MySQL
+ * where IF is reserved. */
+%expect 48
 
 %name-prefix="mys_yy"
 
@@ -9827,6 +9830,53 @@ DropStmt:	DROP object_type_any_name IF_P EXISTS any_name_list opt_drop_behavior
 					n->concurrent = false;
 					$$ = (Node *) n;
 				}
+			/*
+			 * TRIGGER is spelled out explicitly rather than coming through
+			 * object_type_name_on_any_name: MySQL drops triggers by a
+			 * schema-scoped name with no ON clause ("DROP TRIGGER [IF
+			 * EXISTS] [schema.]name"), so both spellings share the
+			 * "DROP TRIGGER name" prefix and the divergence must be
+			 * deferred past the name (ON => PostgreSQL table-scoped form,
+			 * '.' or end of statement => MySQL schema-scoped form).  The
+			 * MySQL statements are marked with a parser-private leading
+			 * name so the utility layer can resolve the owning table (and
+			 * the generated __mysql_trigger_* function) before
+			 * RemoveObjects() runs; the marker never reaches catalog code.
+			 */
+			| DROP TRIGGER opt_if_exists name ON any_name opt_drop_behavior
+				{
+					DropStmt *n = makeNode(DropStmt);
+					n->removeType = OBJECT_TRIGGER;
+					n->objects = list_make1(lappend($6, makeString($4)));
+					n->behavior = $7;
+					n->missing_ok = $3;
+					n->concurrent = false;
+					$$ = (Node *) n;
+				}
+			| DROP TRIGGER opt_if_exists name opt_drop_behavior
+				{
+					DropStmt *n = makeNode(DropStmt);
+					n->removeType = OBJECT_TRIGGER;
+					n->objects = list_make1(
+						lcons(makeString(pstrdup("__mysql_drop_trigger__")),
+							  list_make1(makeString($4))));
+					n->behavior = $5;
+					n->missing_ok = $3;
+					n->concurrent = false;
+					$$ = (Node *) n;
+				}
+			| DROP TRIGGER opt_if_exists name '.' name opt_drop_behavior
+				{
+					DropStmt *n = makeNode(DropStmt);
+					n->removeType = OBJECT_TRIGGER;
+					n->objects = list_make1(
+						lcons(makeString(pstrdup("__mysql_drop_trigger__")),
+							  list_make2(makeString($4), makeString($6))));
+					n->behavior = $7;
+					n->missing_ok = $3;
+					n->concurrent = false;
+					$$ = (Node *) n;
+				}
 			| DROP TYPE_P type_name_list opt_drop_behavior
 				{
 					DropStmt *n = makeNode(DropStmt);
@@ -9947,11 +9997,12 @@ drop_type_name:
 			| SERVER								{ $$ = OBJECT_FOREIGN_SERVER; }
 		;
 
-/* object types attached to a table */
+/* object types attached to a table, spelled without an ON clause here;
+ * TRIGGER needs the explicit DROP/COMMENT productions below because MySQL
+ * drops triggers by schema-scoped name without ON (see the DropStmt rules) */
 object_type_name_on_any_name:
 			POLICY									{ $$ = OBJECT_POLICY; }
 			| RULE									{ $$ = OBJECT_RULE; }
-			| TRIGGER								{ $$ = OBJECT_TRIGGER; }
 		;
 
 any_name_list:
@@ -10095,6 +10146,14 @@ CommentStmt:
 				{
 					CommentStmt *n = makeNode(CommentStmt);
 					n->objtype = $3;
+					n->object = (Node *) lappend($6, makeString($4));
+					n->comment = $8;
+					$$ = (Node *) n;
+				}
+			| COMMENT ON TRIGGER name ON any_name IS comment_text
+				{
+					CommentStmt *n = makeNode(CommentStmt);
+					n->objtype = OBJECT_TRIGGER;
 					n->object = (Node *) lappend($6, makeString($4));
 					n->comment = $8;
 					$$ = (Node *) n;
