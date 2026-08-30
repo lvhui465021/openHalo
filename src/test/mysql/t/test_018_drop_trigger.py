@@ -132,5 +132,21 @@ def run(cluster):
     assert _trigger_count(cluster, "t018_trg") == 0, \
         "native PostgreSQL twin trigger could not be dropped afterwards"
 
+    # 10) Trigger names are schema-scoped: a second MySQL CREATE TRIGGER with
+    #     an existing name on another table in the schema is 1359.
+    _ddl(cluster,
+         "CREATE TABLE t018_dup(id INT PRIMARY KEY, val INT)",
+         "CREATE TRIGGER t018_dup_trg BEFORE INSERT ON t018_t "
+         "FOR EACH ROW SET NEW.val = NEW.val + 1")
+    try:
+        _ddl(cluster, "CREATE TRIGGER t018_dup_trg BEFORE INSERT ON t018_dup "
+                      "FOR EACH ROW SET NEW.val = NEW.val + 1")
+        raise AssertionError("same-name trigger on another table succeeded")
+    except (pymysql.err.ProgrammingError, pymysql.err.OperationalError,
+            pymysql.err.InternalError) as e:
+        assert e.args[0] == 1359, \
+            "duplicate trigger name must map to 1359, got %r" % (e.args,)
+
     _ddl(cluster, "DROP TABLE IF EXISTS t018_t")
     cluster.psql("DROP TABLE t018_other")
+    _ddl(cluster, "DROP TABLE t018_dup")

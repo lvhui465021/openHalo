@@ -1,4 +1,4 @@
 comment = 'MySQL Supplementary Extension'
-default_version = '1.9'
+default_version = '1.10'
 module_pathname = '$libdir/mysm'
 requires = 'plmysql'

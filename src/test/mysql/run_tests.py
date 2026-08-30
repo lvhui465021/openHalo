@@ -23,12 +23,15 @@ def load(path):
 
 def main():
     if len(sys.argv) < 2:
-        print("usage: run_tests.py <bindir> [basedir]", file=sys.stderr)
+        print("usage: run_tests.py <bindir> [basedir] [name-filter]", file=sys.stderr)
         return 2
     bindir = sys.argv[1]
     basedir = sys.argv[2] if len(sys.argv) > 2 else "/tmp/halo_mysql_test"
+    name_filter = sys.argv[3] if len(sys.argv) > 3 else None
     here = os.path.dirname(os.path.abspath(__file__))
     tests = sorted(glob.glob(os.path.join(here, "t", "test_*.py")))
+    if name_filter:
+        tests = [t for t in tests if name_filter in os.path.basename(t)]
 
     cluster = HaloCluster(bindir=bindir, basedir=basedir)
     try:

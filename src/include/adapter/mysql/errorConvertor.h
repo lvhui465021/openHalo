@@ -86,5 +86,14 @@ int convertErrorCode(int haloErrorCode);
 extern void mysSetPendingMySQLErrno(int errorCode);
 extern int	mysTakePendingMySQLErrno(void);
 
+/*
+ * Replace a PostgreSQL SQLSTATE with the canonical MySQL SQLSTATE for the
+ * same condition, if one is known (e.g. 42P01 -> 42S02, 23505 -> 23000).
+ * Used at error-packet send time; states raised by SIGNAL / custom codes
+ * are not keys and return false unchanged.  Returns true and fills out[6]
+ * when a canonical pair exists, otherwise false.
+ */
+extern bool mysCanonicalizeSqlState(const char *sqlstate, char *out);
+
 #endif                          /* ERRORCONVERTOR_H */
 

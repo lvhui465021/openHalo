@@ -262,3 +262,55 @@ convertErrorCode(int haloErrorCode)
     return 1105;
 }
 
+/*
+ * Canonical MySQL SQLSTATEs for the PostgreSQL SQLSTATEs that the forward
+ * table above produces, keyed by the PostgreSQL code and filled in from the
+ * MySQL 5.7 manual's server-error appendix.  Only pairs where the two
+ * spellings differ appear; a SIGNAL-chosen custom state (45000, A0001, ...)
+ * is never a key, so user-selected SQLSTATEs still round-trip verbatim.
+ * This is the wire-side companion of plmysql's errno<->SQLSTATE map, kept
+ * here because sendErrPacket lives in core and must not link the extension.
+ */
+static const struct
+{
+    const char *pgstate;        /* SQLSTATE PostgreSQL raises */
+    const char *mystate;        /* MySQL's canonical SQLSTATE for it */
+} mysql_pgstate_canonical_map[] =
+{
+    {"23502", "23000"},         /* 1048 ER_BAD_NULL_ERROR */
+    {"23503", "23000"},         /* 1451/1452 FK violation */
+    {"23505", "23000"},         /* 1022/1062/1169 duplicate entry */
+    {"40P01", "40001"},         /* 1213 ER_LOCK_DEADLOCK */
+    {"42P01", "42S02"},         /* 1051/1146 ER_BAD_TABLE_ERROR/NO_SUCH_TABLE */
+    {"42P07", "42S01"},         /* 1050 ER_TABLE_EXISTS_ERROR */
+    {"42601", "42000"},         /* 1064/1149 ER_PARSE_ERROR */
+    {"42622", "42000"},         /* 1059 ER_TOO_LONG_IDENT */
+    {"42701", "42S21"},         /* 1060 ER_DUP_FIELDNAME */
+    {"42702", "23000"},         /* 1052 ER_FIELD_SPECIFIED_TWICE */
+    {"42703", "42S22"},         /* 1054 ER_BAD_FIELD_ERROR */
+    {"42710", "42000"},         /* 1359 ER_TRG_ALREADY_EXISTS */
+    {"42883", "42000"},         /* 1305 ER_SP_DOES_NOT_EXIST */
+    {"42501", "42000"},         /* 1044 ER_DBACCESS_DENIED_ERROR */
+    {"55P03", "HY000"},         /* 1205 ER_LOCK_WAIT_TIMEOUT (generic) */
+    {"57014", "70100"},         /* 1317 ER_QUERY_INTERRUPTED */
+    {"P0001", "45000"},         /* 1644 ER_SIGNAL_EXCEPTION */
+};
+
+bool
+mysCanonicalizeSqlState(const char *sqlstate, char *out)
+{
+    int i;
+
+    if (sqlstate == NULL || strlen(sqlstate) != 5)
+        return false;
+    for (i = 0; i < lengthof(mysql_pgstate_canonical_map); i++)
+    {
+        if (strcmp(mysql_pgstate_canonical_map[i].pgstate, sqlstate) == 0)
+        {
+            strcpy(out, mysql_pgstate_canonical_map[i].mystate);
+            return true;
+        }
+    }
+    return false;
+}
+

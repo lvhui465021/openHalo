@@ -26,6 +26,9 @@
 #include "miscadmin.h"
 #include "nodes/nodes.h"
 #include "plmysql.h"
+#include "storage/ipc.h"
+#include "adapter/mysql/adapter.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -36,6 +39,17 @@ static bool plmysql_extra_checks_check_hook(char **newvalue, void **extra, GucSo
 static void plmysql_extra_warnings_assign_hook(const char *newvalue, void *extra);
 static void plmysql_extra_errors_assign_hook(const char *newvalue, void *extra);
 static void plmysql_require_mysql_protocol(void);
+
+typedef struct PLMySQL_sql_mode_scope
+{
+	uint64		saved_mode;
+	bool		saved_strict;
+	bool		active;
+} PLMySQL_sql_mode_scope;
+
+static void plmysql_restore_sql_mode(PLMySQL_sql_mode_scope *scope);
+static void plmysql_sql_mode_error_cleanup(int code, Datum arg);
+static bool plmysql_has_sql_mode_snapshot(Oid fn_oid);
 
 /*
  * This is deliberately a backend-local stack.  A PL handler invocation
@@ -83,6 +97,7 @@ int			plmysql_extra_errors;
 /* Routine metadata carried in pg_proc.proconfig (see _PG_init). */
 char	   *plmysql_definer_string = NULL;
 char	   *plmysql_sql_mode_string = NULL;
+char	   *plmysql_sql_data_access_string = NULL;
 char	   *plmysql_created_string = NULL;
 char	   *plmysql_last_altered_string = NULL;
 char	   *plmysql_trigger_body_string = NULL;
@@ -171,6 +186,80 @@ plmysql_extra_errors_assign_hook(const char *newvalue, void *extra)
 	plmysql_extra_errors = *((int *) extra);
 }
 
+/*
+ * pg_proc.proconfig activates plmysql.sql_mode before the handler runs, but
+ * the MySQL adapter's coercion/date code reads its own backend-local flags.
+ * Bridge the two states for one routine invocation and always put the caller
+ * state back, including a nested CALL or an ERROR unwinding through us.
+ */
+static void
+plmysql_restore_sql_mode(PLMySQL_sql_mode_scope *scope)
+{
+	if (!scope->active)
+		return;
+
+	mys_sqlMode = scope->saved_mode;
+	isStrictTransTablesOn = scope->saved_strict;
+	scope->active = false;
+}
+
+static void
+plmysql_sql_mode_error_cleanup(int code, Datum arg)
+{
+	(void) code;
+	plmysql_restore_sql_mode((PLMySQL_sql_mode_scope *) DatumGetPointer(arg));
+}
+
+/*
+ * An empty sql_mode is a real MySQL snapshot, not the absence of one.  The
+ * registered GUC alone cannot distinguish it from an old plmysql routine
+ * that has no plmysql.sql_mode item in proconfig, so inspect the catalog
+ * entry before deciding whether to override the caller's adapter state.
+ */
+static bool
+plmysql_has_sql_mode_snapshot(Oid fn_oid)
+{
+	static const char setting[] = "plmysql.sql_mode=";
+	HeapTuple	tuple;
+	Datum		datum;
+	bool		isnull;
+	ArrayType  *config;
+	Datum	   *values;
+	bool	   *nulls;
+	int			nelems;
+	int			i;
+	bool		found = false;
+
+	tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn_oid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for function %u", fn_oid);
+
+	datum = SysCacheGetAttr(PROCOID, tuple, Anum_pg_proc_proconfig, &isnull);
+	if (!isnull)
+	{
+		config = DatumGetArrayTypeP(datum);
+		deconstruct_array(config, TEXTOID, -1, false, TYPALIGN_INT,
+						  &values, &nulls, &nelems);
+		for (i = 0; i < nelems; i++)
+		{
+			text	   *value;
+
+			if (nulls[i])
+				continue;
+			value = DatumGetTextPP(values[i]);
+			if (VARSIZE_ANY_EXHDR(value) >= sizeof(setting) - 1 &&
+				memcmp(VARDATA_ANY(value), setting, sizeof(setting) - 1) == 0)
+			{
+				found = true;
+				break;
+			}
+		}
+	}
+	ReleaseSysCache(tuple);
+
+	return found;
+}
+
 
 /*
  * _PG_init()			- library load-time initialization
@@ -252,6 +341,13 @@ _PG_init(void)
 							   gettext_noop("sql_mode snapshot recorded at routine creation."),
 							   NULL,
 							   &plmysql_sql_mode_string,
+							   "",
+							   PGC_USERSET, 0,
+							   NULL, NULL, NULL);
+	DefineCustomStringVariable("plmysql.sql_data_access",
+							   gettext_noop("MySQL SQL-data-access routine characteristic."),
+							   NULL,
+							   &plmysql_sql_data_access_string,
 							   "",
 							   PGC_USERSET, 0,
 							   NULL, NULL, NULL);
@@ -413,6 +509,7 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 	PLMySQL_execstate *save_cur_estate;
 	ResourceOwner procedure_resowner;
 	PLMySQL_call_stack_entry call_stack_entry;
+	PLMySQL_sql_mode_scope sql_mode_scope;
 	volatile Datum retval = (Datum) 0;
 	int			rc;
 
@@ -421,6 +518,24 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 	nonatomic = fcinfo->context &&
 		IsA(fcinfo->context, CallContext) &&
 		!castNode(CallContext, fcinfo->context)->atomic;
+
+	sql_mode_scope.saved_mode = mys_sqlMode;
+	sql_mode_scope.saved_strict = isStrictTransTablesOn;
+	sql_mode_scope.active = false;
+
+	/*
+	 * Legacy routines without the metadata GUC retain their caller session
+	 * mode.  The proconfig lookup deliberately treats an explicit empty value
+	 * as a snapshot, because MySQL uses sql_mode='' to disable all modes.
+	 */
+	PG_ENSURE_ERROR_CLEANUP(plmysql_sql_mode_error_cleanup,
+							PointerGetDatum(&sql_mode_scope));
+	{
+		if (plmysql_has_sql_mode_snapshot(fcinfo->flinfo->fn_oid))
+		{
+			sql_mode_scope.active = true;
+			mysApplySqlMode(plmysql_sql_mode_string, false);
+		}
 
 	/*
 	 * Connect to SPI manager
@@ -495,6 +610,11 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 	 */
 	if ((rc = SPI_finish()) != SPI_OK_FINISH)
 		elog(ERROR, "SPI_finish failed: %s", SPI_result_code_string(rc));
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(plmysql_sql_mode_error_cleanup,
+							PointerGetDatum(&sql_mode_scope));
+
+	plmysql_restore_sql_mode(&sql_mode_scope);
 
 	return retval;
 }

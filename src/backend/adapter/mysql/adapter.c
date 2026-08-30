@@ -1064,6 +1064,9 @@ endCommand(QueryCompletion *qc, CommandDest dest)
              (qc->commandTag == CMDTAG_ALTER_SYSTEM) || 
              (qc->commandTag == CMDTAG_ALTER_CONSTRAINT) || 
              (qc->commandTag == CMDTAG_ALTER_TRIGGER) || 
+             (qc->commandTag == CMDTAG_ALTER_FUNCTION) ||
+             (qc->commandTag == CMDTAG_ALTER_PROCEDURE) ||
+             (qc->commandTag == CMDTAG_ALTER_ROUTINE) ||
              (qc->commandTag == CMDTAG_COMMENT) || 
              (qc->commandTag == CMDTAG_DROP_DATABASE) || 
              (qc->commandTag == CMDTAG_DROP_ROLE) || 
@@ -5429,6 +5432,7 @@ sendErrPacket(int errCode, const char *errMsg, const char *sqlState)
     int mySQLErrorCode;
     int sqlStateMarker;
     int msgLen;
+    char canonicalState[6];
 
     mySQLErrorCode = convertErrorCode(errCode);
     warnErrCode = mySQLErrorCode;
@@ -5437,6 +5441,12 @@ sendErrPacket(int errCode, const char *errMsg, const char *sqlState)
     memcpy(warnErrMsg, errMsg, msgLen);
     warnErrMsg[msgLen] = '\0';
     sqlStateMarker = 0;
+
+    /* Canonical MySQL SQLSTATE when one exists; SIGNAL-chosen custom
+     * states are not keys and go out verbatim. */
+    if (mysCanonicalizeSqlState(sqlState, canonicalState))
+        sqlState = canonicalState;
+
     netTransceiver->getWriteBufForHeaderPayload(&payloadBuf);
 
     payloadLen = assembleErrorPacketPayload(mySQLErrorCode, 
@@ -6565,4 +6575,3 @@ getCaseInsensitiveId(void)
         elog(ERROR, "caseInsensitiveId is invalid");
     }
 }
-

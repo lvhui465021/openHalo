@@ -1,5 +1,5 @@
 """Routine characteristics: DETERMINISTIC volatility, single-statement
-RETURN lowering, COMMENT / DEFINER acceptance.
+RETURN lowering, COMMENT / DEFINER acceptance, and SQL-data-access metadata.
 
 fix.md P1: DETERMINISTIC used to map to IMMUTABLE, letting the planner
 constant-fold prepared statements to stale results; it must map to
@@ -112,6 +112,81 @@ def run(cluster):
         "SELECT l.lanname FROM pg_proc p JOIN pg_language l "
         "ON l.oid = p.prolang WHERE p.proname = 't006_cmp';")
     assert out.strip() == "plmysql", "got %r" % out
+
+    # ----------------------------------------- SQL data access preservation
+    # These characteristics are advisory in MySQL, but they are durable
+    # catalog metadata: callers, mysqldump, mysql.proc, and SHOW CREATE must
+    # observe the declared value rather than the former hard-coded
+    # MODIFIES_SQL_DATA value.  Absence means MySQL's CONTAINS SQL default.
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t006_no_sql",
+         "CREATE PROCEDURE t006_no_sql() NO SQL BEGIN SET @t006 = 1; END",
+         "DROP PROCEDURE IF EXISTS t006_reads",
+         "CREATE PROCEDURE t006_reads() READS SQL DATA BEGIN SET @t006 = 2; END",
+         "DROP PROCEDURE IF EXISTS t006_modifies",
+         "CREATE PROCEDURE t006_modifies() MODIFIES SQL DATA BEGIN SET @t006 = 3; END",
+         "DROP PROCEDURE IF EXISTS t006_default_access",
+         "CREATE PROCEDURE t006_default_access() BEGIN SET @t006 = 4; END",
+         "DROP FUNCTION IF EXISTS t006_reads_fn",
+         "CREATE FUNCTION t006_reads_fn() RETURNS INT READS SQL DATA RETURN 42")
+    assert _scalar(cluster, "SELECT t006_reads_fn()") == (42,)
+
+    out = cluster.psql(
+        "SELECT proconfig FROM pg_proc WHERE proname = 't006_no_sql';")
+    assert "plmysql.sql_data_access=NO SQL" in out, \
+        "explicit NO SQL characteristic was not stored: %r" % out
+
+    out = cluster.psql("""
+        SELECT pg_catalog.concat(name::text, '|', sql_data_access::text)
+        FROM mysql.proc
+        WHERE name IN ('t006_no_sql', 't006_reads', 't006_modifies',
+                       't006_default_access')
+        ORDER BY name;""")
+    assert out.splitlines() == [
+        "t006_default_access|CONTAINS_SQL",
+        "t006_modifies|MODIFIES_SQL_DATA",
+        "t006_no_sql|NO_SQL",
+        "t006_reads|READS_SQL_DATA"], out
+
+    out = cluster.psql("""
+        SELECT pg_catalog.concat(routine_name, '|', sql_data_access)
+        FROM mys_informa_schema.routines
+        WHERE routine_name IN ('t006_no_sql', 't006_reads', 't006_modifies',
+                               't006_default_access')
+        ORDER BY routine_name;""")
+    assert out.splitlines() == [
+        "t006_default_access|CONTAINS SQL",
+        "t006_modifies|MODIFIES SQL DATA",
+        "t006_no_sql|NO SQL",
+        "t006_reads|READS SQL DATA"], out
+
+    assert _scalar(cluster, """
+        SELECT SQL_DATA_ACCESS FROM information_schema.ROUTINES
+        WHERE ROUTINE_SCHEMA = 'public' AND ROUTINE_NAME = 't006_no_sql'""") \
+        == ("NO SQL",)
+
+    with cluster.mysql(dbname="public") as conn:
+        with conn.cursor() as cur:
+            cur.execute("SHOW CREATE PROCEDURE t006_no_sql")
+            show = cur.fetchone()
+    assert ") NO SQL\nBEGIN" in show[2], \
+        "SHOW CREATE lost SQL data access: %r" % (show,)
+
+    with cluster.mysql(dbname="public") as conn:
+        with conn.cursor() as cur:
+            cur.execute("SHOW CREATE FUNCTION t006_reads_fn")
+            show = cur.fetchone()
+    assert " READS SQL DATA\nBEGIN" in show[2], \
+        "SHOW CREATE FUNCTION lost SQL data access: %r" % (show,)
+
+    # ALTER PROCEDURE may change the same advisory characteristic.  The
+    # native ALTER path must replace the function-local GUC, not append a
+    # stale value that metadata lookup would continue to read.
+    _ddl(cluster, "ALTER PROCEDURE t006_no_sql MODIFIES SQL DATA")
+    out = cluster.psql("""
+        SELECT sql_data_access::text FROM mysql.proc
+        WHERE name = 't006_no_sql';""")
+    assert out.strip() == "MODIFIES_SQL_DATA", out
 
     # Protocol scope consistency: both forms refuse PostgreSQL-protocol
     # execution (subprocess.CalledProcessError via ON_ERROR_STOP).

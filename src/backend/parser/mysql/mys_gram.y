@@ -507,7 +507,8 @@ static char *mys_return_body_text;
 %type <list>    select_var_list
 %type <node>    select_var
 
-%type <defelt>	createfunc_opt_item common_func_opt_item dostmt_opt_item
+%type <defelt>	createfunc_opt_item common_func_opt_item
+				mysql_routine_data_access_opt_item dostmt_opt_item
 %type <fun_param> func_arg func_arg_with_default table_func_column aggr_arg
 %type <fun_param_mode> arg_class
 %type <typnam>	func_return func_type
@@ -11810,23 +11811,50 @@ common_func_opt_item:
 				}
 		;
 
-unused_func_opt_item:
-            LANGUAGE SQL_P
-            | CONTAINS SQL_P
-            | NO SQL_P
-            | READS SQL_P DATA_P
-            | MODIFIES SQL_P DATA_P
-        ;
+/*
+ * MySQL's SQL-data-access characteristic is advisory, but it is visible in
+ * mysql.proc, INFORMATION_SCHEMA.ROUTINES, and SHOW CREATE.  Preserve the
+ * spelling in a function-local GUC rather than dropping it at parse time.
+ * The GUC travels with pg_proc through dump/restore just like the other
+ * plmysql routine metadata.
+ */
+mysql_routine_data_access_opt_item:
+			CONTAINS SQL_P
+				{
+					$$ = mys_make_routine_meta_item("plmysql.sql_data_access",
+																 "CONTAINS SQL", @1);
+				}
+			| NO SQL_P
+				{
+					$$ = mys_make_routine_meta_item("plmysql.sql_data_access",
+																 "NO SQL", @1);
+				}
+			| READS SQL_P DATA_P
+				{
+					$$ = mys_make_routine_meta_item("plmysql.sql_data_access",
+																 "READS SQL DATA", @1);
+				}
+			| MODIFIES SQL_P DATA_P
+				{
+					$$ = mys_make_routine_meta_item("plmysql.sql_data_access",
+																 "MODIFIES SQL DATA", @1);
+				}
+		;
 
 createfunc_opt_item:
 			common_func_opt_item
 				{
 					$$ = $1;
 				}
-            | unused_func_opt_item
-                {
-                    $$ = NULL;
-                }
+			| LANGUAGE SQL_P
+				{
+					/* SQL is MySQL's only routine language; keep plmysql. */
+					$$ = NULL;
+				}
+			| mysql_routine_data_access_opt_item
+				{
+					$$ = $1;
+				}
 		;
 
 ReturnStmt:	RETURN a_expr
@@ -11994,6 +12022,9 @@ alterfunc_opt_list:
 			/* At least one option must be specified */
 			common_func_opt_item					{ $$ = list_make1($1); }
 			| alterfunc_opt_list common_func_opt_item { $$ = lappend($1, $2); }
+			| mysql_routine_data_access_opt_item { $$ = list_make1($1); }
+			| alterfunc_opt_list mysql_routine_data_access_opt_item
+				{ $$ = lappend($1, $2); }
 		;
 
 /* Ignored, merely for SQL compliance */
@@ -24682,8 +24713,8 @@ mys_capture_return_stmt_text(core_yyscan_t yyscanner, int return_loc,
  * spelling of the same thing, so both still lower to plmysql; anything else
  * (e.g. LANGUAGE plpgsql) is an explicit request we must respect.
  *
- * NULL list elements come from unused_func_opt_item (LANGUAGE SQL and the
- * other MySQL-only characteristics are parsed and discarded) and are skipped.
+ * NULL list elements come from LANGUAGE SQL, which is a MySQL no-op and is
+ * skipped.  Other MySQL-only characteristics are kept as plmysql metadata.
  */
 static bool
 mys_optlist_pins_foreign_language(List *options)
@@ -25039,7 +25070,13 @@ mys_capture_trigger_body(core_yyscan_t yyscanner, int lookahead_token,
 		tok = mys_yylex(&lval, &lloc, yyscanner);
 		if (tok == 0)
 		{
-			body_end_loc = strlen(buf);
+			/*
+			 * End of input: stop at the last token instead of at the end of
+			 * the buffer, so trailing whitespace and the closing mark of a
+			 * MySQL executable comment ("... SET NEW.x = 1" followed by
+			 * "star-slash") stay out of the captured body.
+			 */
+			body_end_loc = yyextra->core_yy_extra.last_token_end;
 			break;
 		}
 		if (tok == ';')

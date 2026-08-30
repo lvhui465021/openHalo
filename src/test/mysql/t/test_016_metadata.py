@@ -222,3 +222,18 @@ def run(cluster):
     except (pymysql.err.ProgrammingError, pymysql.err.OperationalError) as e:
         assert e.args[0] == 1060, \
             "duplicate column must map to 1060, got %r" % (e.args,)
+        # The wire SQLSTATE is now MySQL-canonical (42S21), not PG's 42701.
+        assert getattr(e, "sqlstate", None) == "42S21" or \
+            "42S21" in e.args, \
+            "duplicate column must carry canonical 42S21, got %r" % (e.args,)
+
+    try:
+        _ddl(cluster, "CREATE TABLE t016_dup2(x INT)",
+             "CREATE TABLE t016_dup2(x INT)")
+        raise AssertionError("duplicate table CREATE succeeded")
+    except (pymysql.err.ProgrammingError, pymysql.err.OperationalError) as e:
+        assert e.args[0] == 1050, \
+            "duplicate table must map to 1050, got %r" % (e.args,)
+        assert getattr(e, "sqlstate", None) == "42S01" or \
+            "42S01" in e.args, \
+            "duplicate table must carry canonical 42S01, got %r" % (e.args,)

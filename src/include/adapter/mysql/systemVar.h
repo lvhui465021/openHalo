@@ -104,6 +104,14 @@ extern int default_week_format;
  */
 extern char *mysGetSqlModeText(void);
 
+/*
+ * Apply a MySQL sql_mode string to the backend-local execution state.  Normal
+ * SET sql_mode calls pass remember_text=true so CREATE ROUTINE can retain the
+ * exact source spelling; PL/MySQL routine calls use false because the saved
+ * routine snapshot must not overwrite the caller's session setting.
+ */
+extern void mysApplySqlMode(const char *value, bool remember_text);
+
 extern HTAB *globalSystemVars;
 extern HTAB *globalSystemVarsLock;
 
@@ -124,4 +132,3 @@ bool isSystemVariable(char *varName);
 
 
 #endif                          /* SYSTEMVAR_H */
-

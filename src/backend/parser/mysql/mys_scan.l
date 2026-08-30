@@ -122,6 +122,22 @@ const uint16 MysScanKeywordTokens[] = {
 #define PUSH_YYLLOC()	(yyextra->save_yylloc = *(yylloc))
 #define POP_YYLLOC()	(*(yylloc) = yyextra->save_yylloc)
 
+/*
+ * Leave a literal state (quoted string, backtick identifier, dollar quote).
+ * If the literal was opened while lexing the content of a MySQL executable
+ * comment, resume that comment instead of the statement itself.
+ */
+#define MYS_END_LITERAL() \
+	do { \
+		if (yyextra->xce_return) \
+		{ \
+			yyextra->xce_return = false; \
+			BEGIN(xce); \
+		} \
+		else \
+			BEGIN(INITIAL); \
+	} while (0)
+
 #define startlit()	( yyextra->literallen = 0 )
 static void addlit(char *ytext, int yleng, core_yyscan_t yyscanner);
 static void addlitchar(unsigned char ychar, core_yyscan_t yyscanner);
@@ -193,6 +209,7 @@ extern void core_yyset_column(int column_no, yyscan_t yyscanner);
 
 %x xb
 %x xc
+%s xce
 %x xbt
 %x xh
 %x xq
@@ -348,6 +365,18 @@ xcstart			\/\*{op_chars}*
 xcstop			\*+\/
 xcinside		[^*/]+
 
+/*
+ * MySQL executable comment opener: a slash-star followed by an exclamation
+ * mark and an optional numeric version gate ("/*!50003").  mysqldump wraps
+ * DDL (triggers, routines, SET statements) in these so that servers outside
+ * the target version range skip the statement; MySQL servers lex the content
+ * as real input when the gate is at or below their own version.  When an
+ * operator character follows the exclamation mark directly (never emitted by
+ * real dumps), the plain xcstart rule below wins by its longer match and the
+ * text is skipped as an ordinary comment.
+ */
+xcstart_exec	\/\*!{digit}*
+
 digit			[0-9]
 
 /* ident_start		[A-Za-z\200-\377_] */
@@ -442,8 +471,76 @@ other			.
 
 %%
 
+<xce>{
+{xcstop}		{
+					/* End of an executable comment: its content was lexed. */
+					BEGIN(INITIAL);
+				}
+
+{xcstart}		{
+					/*
+					 * A plain comment inside an executable comment: lex it
+					 * as a comment, then resume the executable comment.
+					 */
+					yyextra->xcdepth = 0;
+					yyextra->xce_return = true;
+					yyless(2);
+					BEGIN(xc);
+				}
+
+{xcstart_exec}	{
+					/*
+					 * Executable comments do not nest (and mysqldump never
+					 * emits them nested).  Treat an inner marker as a plain
+					 * comment so the outer star-slash still terminates.
+					 */
+					yyextra->xcdepth = 0;
+					yyextra->xce_return = true;
+					BEGIN(xc);
+				}
+
+<<EOF>>			{
+					yyerror("unterminated /*! comment");
+				}
+} /* <xce> */
+
 {whitespace}	{
 					/* ignore */
+				}
+
+{xcstart_exec}	{
+					/*
+					 * MySQL executable comment: slash-star-exclamation with
+					 * an optional version gate.  The enclosed text is lexed
+					 * as real input when there is no gate or the gate is at
+					 * or below the MySQL 5.7 dialect level that openHalo
+					 * implements (MySQL executes the content only when its
+					 * own version is at least the gate); higher gates are
+					 * skipped exactly like a plain comment.  The match is
+					 * just the opener plus any gate digits.
+					 */
+					const char *gate = yytext + 3;
+					long		version = 0;
+					bool		have_version = false;
+
+					while (*gate >= '0' && *gate <= '9')
+					{
+						version = version * 10 + (*gate - '0');
+						have_version = true;
+						gate++;
+					}
+
+					if (!have_version || version <= 50700)
+					{
+						/* Execute: the matching star-slash ends it. */
+						BEGIN(xce);
+					}
+					else
+					{
+						/* Skip: behave like a plain comment from here. */
+						yyextra->xcdepth = 0;
+						BEGIN(xc);
+					}
 				}
 
 {xcstart}		{
@@ -464,7 +561,15 @@ other			.
 
 {xcstop}		{
 					if (yyextra->xcdepth <= 0)
-						BEGIN(INITIAL);
+					{
+						if (yyextra->xce_return)
+						{
+							yyextra->xce_return = false;
+							BEGIN(xce);
+						}
+						else
+							BEGIN(INITIAL);
+					}
 					else
 						(yyextra->xcdepth)--;
 				}
@@ -598,7 +703,7 @@ other			.
 					 * according to the state we were in previously.
 					 */
 					yyless(0);
-					BEGIN(INITIAL);
+					MYS_END_LITERAL();
 
 					switch (yyextra->state_before_str_stop)
 					{
@@ -713,7 +818,7 @@ other			.
 					 * according to the state we were in previously.
 					 */
 					yyless(0);
-					BEGIN(INITIAL);
+					MYS_END_LITERAL();
 
 					switch (yyextra->state_before_str_stop)
 					{
@@ -797,7 +902,7 @@ other			.
 					{
 						pfree(yyextra->dolqstart);
 						yyextra->dolqstart = NULL;
-						BEGIN(INITIAL);
+						MYS_END_LITERAL();
 						yylval->str = litbufdup(yyscanner);
 						return SCONST;
 					}
@@ -832,7 +937,7 @@ other			.
 <xbt>{xbtstop}  {
                     char	   *ident;
 
-					BEGIN(INITIAL);
+					MYS_END_LITERAL();
 					if (yyextra->literallen == 0)
 						yyerror("zero-length delimited identifier");
 					// ident = litbufdup(yyscanner);
@@ -1328,6 +1433,8 @@ mys_scanner_init(const char *str,
 	yyext->escape_string_warning = escape_string_warning;
 	yyext->standard_conforming_strings = standard_conforming_strings;
     yyext->saw_underscore_binary = false;
+	yyext->xce_return = false;
+	yyext->last_token_end = 0;
 
 	/*
 	 * Make a scan buffer with special termination needed by flex.

@@ -77,9 +77,13 @@
 #define SYSTEM_VAR_RESULT_RULE_NUM 16
 #define SYSTEM_VAR_RESULT_RULE_LEN 64
 
-uint64 mys_sqlMode = MYS_MODE_ONLY_FULL_GROUP_BY | MYS_MODE_STRICT_TRANS_TABLES | MYS_MODE_NO_ZERO_IN_DATE |
-                     MYS_MODE_NO_ZERO_DATE | MYS_MODE_ERROR_FOR_DIVISION_BY_ZERO | MYS_MODE_NO_AUTO_CREATE_USER |
-                     MYS_MODE_NO_ENGINE_SUBSTITUTION;
+#define MYS_DEFAULT_SQL_MODE_MASK \
+	(MYS_MODE_ONLY_FULL_GROUP_BY | MYS_MODE_STRICT_TRANS_TABLES | \
+	 MYS_MODE_NO_ZERO_IN_DATE | MYS_MODE_NO_ZERO_DATE | \
+	 MYS_MODE_ERROR_FOR_DIVISION_BY_ZERO | MYS_MODE_NO_AUTO_CREATE_USER | \
+	 MYS_MODE_NO_ENGINE_SUBSTITUTION)
+
+uint64 mys_sqlMode = MYS_DEFAULT_SQL_MODE_MASK;
 
 /*
  * The textual form of the session sql_mode.  mys_sqlMode is a bitmask that
@@ -91,6 +95,8 @@ uint64 mys_sqlMode = MYS_MODE_ONLY_FULL_GROUP_BY | MYS_MODE_STRICT_TRANS_TABLES 
 #define MYS_DEFAULT_SQL_MODE_TEXT "STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION"
 static char *mysSqlModeText = NULL;
 
+extern bool isStrictTransTablesOn;
+
 char *
 mysGetSqlModeText(void)
 {
@@ -99,11 +105,106 @@ mysGetSqlModeText(void)
 	return mysSqlModeText;
 }
 
+/*
+ * Keep sql_mode's textual catalog value and the backend-local flags used by
+ * coercion/date code in one place.  The latter are intentionally not GUCs:
+ * the adapter's system-variable implementation owns their per-session state.
+ * A PL/MySQL routine therefore calls this with remember_text=false while its
+ * function-local plmysql.sql_mode GUC is active.
+ */
+void
+mysApplySqlMode(const char *value, bool remember_text)
+{
+	char	   *raw_value;
+	List	   *value_list = NIL;
+	ListCell   *lc;
+	uint64		mode = 0;
+
+	if (value == NULL)
+		value = "";
+
+	if (remember_text)
+		mysSqlModeText = pstrdup(value);
+
+	/* SplitIdentifierString() needs writable storage and accepts MySQL's
+	 * comma-separated, case-insensitive mode names. */
+	raw_value = pstrdup(value);
+	if (!SplitIdentifierString(raw_value, ',', &value_list))
+	{
+		pfree(raw_value);
+		list_free(value_list);
+		elog(ERROR, "List syntax is invalid.");
+	}
+
+	foreach(lc, value_list)
+	{
+		char	   *item = (char *) lfirst(lc);
+
+		if (pg_strcasecmp(item, "REAL_AS_FLOAT") == 0)
+			mode |= MYS_MODE_REAL_AS_FLOAT;
+		else if (pg_strcasecmp(item, "PIPES_AS_CONCAT") == 0)
+			mode |= MYS_MODE_PIPES_AS_CONCAT;
+		else if (pg_strcasecmp(item, "ANSI_QUOTES") == 0)
+			mode |= MYS_MODE_ANSI_QUOTES;
+		else if (pg_strcasecmp(item, "IGNORE_SPACE") == 0)
+			mode |= MYS_MODE_IGNORE_SPACE;
+		else if (pg_strcasecmp(item, "ONLY_FULL_GROUP_BY") == 0)
+			mode |= MYS_MODE_ONLY_FULL_GROUP_BY;
+		else if (pg_strcasecmp(item, "NO_UNSIGNED_SUBTRACTION") == 0)
+			mode |= MYS_MODE_NO_UNSIGNED_SUBTRACTION;
+		else if (pg_strcasecmp(item, "NO_AUTO_VALUE_ON_ZERO") == 0)
+			mode |= MYS_MODE_NO_AUTO_VALUE_ON_ZERO;
+		else if (pg_strcasecmp(item, "NO_BACKSLASH_ESCAPES") == 0)
+			mode |= MYS_MODE_NO_BACKSLASH_ESCAPES;
+		else if (pg_strcasecmp(item, "STRICT_TRANS_TABLES") == 0)
+			mode |= MYS_MODE_STRICT_TRANS_TABLES;
+		else if (pg_strcasecmp(item, "STRICT_ALL_TABLES") == 0)
+			mode |= MYS_MODE_STRICT_ALL_TABLES;
+		else if (pg_strcasecmp(item, "NO_ZERO_IN_DATE") == 0)
+			mode |= MYS_MODE_NO_ZERO_IN_DATE;
+		else if (pg_strcasecmp(item, "NO_ZERO_DATE") == 0)
+			mode |= MYS_MODE_NO_ZERO_DATE;
+		else if (pg_strcasecmp(item, "ALLOW_INVALID_DATES") == 0)
+			mode |= MYS_MODE_INVALID_DATES;
+		else if (pg_strcasecmp(item, "ERROR_FOR_DIVISION_BY_ZERO") == 0)
+			mode |= MYS_MODE_ERROR_FOR_DIVISION_BY_ZERO;
+		else if (pg_strcasecmp(item, "NO_AUTO_CREATE_USER") == 0)
+			mode |= MYS_MODE_NO_AUTO_CREATE_USER;
+		else if (pg_strcasecmp(item, "NO_ENGINE_SUBSTITUTION") == 0)
+			mode |= MYS_MODE_NO_ENGINE_SUBSTITUTION;
+		else if (pg_strcasecmp(item, "PAD_CHAR_TO_FULL_LENGTH") == 0)
+			mode |= MYS_MODE_PAD_CHAR_TO_FULL_LENGTH;
+		else if (pg_strcasecmp(item, "ANSI") == 0)
+		{
+			/* MySQL's ANSI composite mode. */
+			mode |= MYS_MODE_ANSI | MYS_MODE_REAL_AS_FLOAT |
+				MYS_MODE_PIPES_AS_CONCAT | MYS_MODE_ANSI_QUOTES |
+				MYS_MODE_IGNORE_SPACE;
+		}
+		else if (pg_strcasecmp(item, "TRADITIONAL") == 0)
+		{
+			/* MySQL's strict composite mode. */
+			mode |= MYS_MODE_TRADITIONAL | MYS_MODE_STRICT_TRANS_TABLES |
+				MYS_MODE_STRICT_ALL_TABLES | MYS_MODE_NO_ZERO_IN_DATE |
+				MYS_MODE_NO_ZERO_DATE | MYS_MODE_ERROR_FOR_DIVISION_BY_ZERO |
+				MYS_MODE_NO_AUTO_CREATE_USER | MYS_MODE_NO_ENGINE_SUBSTITUTION;
+		}
+		else if (pg_strcasecmp(item, "DEFAULT") == 0)
+			mode |= MYS_DEFAULT_SQL_MODE_MASK;
+	}
+
+	pfree(raw_value);
+	list_free(value_list);
+
+	mys_sqlMode = mode;
+	isStrictTransTablesOn =
+		(mode & (MYS_MODE_STRICT_TRANS_TABLES | MYS_MODE_STRICT_ALL_TABLES)) != 0;
+}
+
 int autoCommit = 2;
 int default_week_format = 0;
 extern bool needCommitTrx;
 extern bool needStartNewTrx;
-extern bool isStrictTransTablesOn;
 
 HTAB *globalSystemVars = NULL;
 HTAB *globalSystemVarsLock = NULL;
@@ -1450,54 +1551,7 @@ applySystemVarValue(const char *varName, const char *varValue)
     }
     else if (strncasecmp(varName, "sql_mode", 8) == 0)
     {
-        char *rawValue;
-        List *valueList;
-        uint64 tempSqlMode = 0;
-
-        isStrictTransTablesOn = false;
-
-        /* Remember the exact text for routine sql_mode snapshots. */
-        mysSqlModeText = pstrdup(varValue);
-
-        /* Need a modifiable copy of string */
-        rawValue = pstrdup(varValue);
-        if (SplitIdentifierString(rawValue, ',', &valueList))
-        {
-            ListCell *lc;
-
-            foreach(lc, valueList)
-            {
-                char *curValue = (char *)lfirst(lc);
-                if (strncasecmp(curValue, "STRICT_TRANS_TABLES", 19) == 0)
-                {
-                    //isStrictTransTablesOn = true;
-                    isStrictTransTablesOn = false;
-                }
-                else if (strncasecmp(curValue, "NO_ZERO_IN_DATE", 15) == 0)
-                {
-                    tempSqlMode |= MYS_MODE_NO_ZERO_IN_DATE;
-                }
-                else if (strncasecmp(curValue, "NO_ZERO_DATE", 12) == 0)
-                {
-                    tempSqlMode |= MYS_MODE_NO_ZERO_DATE;
-                }
-                else if (strncasecmp(curValue, "ALLOW_INVALID_DATES", 12) == 0)
-                {
-                    tempSqlMode |= MYS_MODE_INVALID_DATES;
-                }
-            }
-
-            mys_sqlMode = tempSqlMode;
-        }
-        else
-        {
-            pfree(rawValue);
-		    list_free(valueList);
-            elog(ERROR, "List syntax is invalid.");
-        }
-
-        pfree(rawValue);
-		list_free(valueList);
+        mysApplySqlMode(varValue, true);
     }
     else if (strncasecmp(varName, "default_week_format", 19) == 0)
     {

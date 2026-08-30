@@ -33,8 +33,11 @@ import platform
 
 
 def checkPythonVersion():
-    versionInfo = platform.python_version_tuple();
-    if ((versionInfo[0] < '3') or (versionInfo[1] < '6')):
+    # Version parts must be compared as integers: "3.12" sorts below "3.6"
+    # as plain strings, which wrongly rejected every Python >= 3.10.
+    versionInfo = platform.python_version_tuple()
+    if ((int(versionInfo[0]) < 3)
+            or (int(versionInfo[0]) == 3 and int(versionInfo[1]) < 6)):
         print("Python版本过低，请使用3.6或更高版本的Python！")
         sys.exit(0)
 
@@ -89,111 +92,15 @@ def rewrite_foreign_key_stmt(tableName, origStmt):
     return ret
 
 
-def convertTrigger(origTrigger, delimiter):
-    # /*!50003 CREATE*/ /*!50017 DEFINER=`root`@`%`*/ /*!50003 TRIGGER `TRG_INSERT_MENU` AFTER INSERT ON `base_menubase` FOR EACH ROW BEGIN
-    # INSERT INTO BASE_MENU (MENUID,PARENTID,MENUDESC,ORDERCODE,MENUBASEID,LEAF,`SYSTEM`)
-    # VALUES (NEW.MENUBASEID,NEW.PARENTID,NEW.MENUDESC,NEW.ORDERCODE,NEW.MENUBASEID,NEW.LEAF,NEW.`SYSTEM`);
-    # END */;;
+def passthrough_trigger_ddl(line):
+    """mysqldump trigger DDL passes through verbatim.
 
-    # CREATE DEFINER=`root`@`%` TRIGGER `TRG_INSERT_MENU` AFTER INSERT ON `base_menubase` FOR EACH ROW BEGIN
-    # INSERT INTO BASE_MENU (MENUID,PARENTID,MENUDESC,ORDERCODE,MENUBASEID,LEAF,`SYSTEM`)
-    # VALUES (NEW.MENUBASEID,NEW.PARENTID,NEW.MENUDESC,NEW.ORDERCODE,NEW.MENUBASEID,NEW.LEAF,NEW.`SYSTEM`);
-    # END ;;
-
-    # CREATE OR REPLACE FUNCTION TRG_INSERT_MENU_FUNC()
-    # RETURNS TRIGGER AS $$
-    # BEGIN
-    # IF NEW.last_name <> OLD.last_name THEN
-    # INSERT INTO employee_audits(employee_id, last_name, changed_on)
-    # VALUES (OLD.id, OLD.last_name, now());
-    # END IF;
-    # RETURN NEW;
-    # END;
-    # $$ LANGUAGE plmyssql;;
-    # CREATE TRIGGER `TRG_INSERT_MENU` BEFORE insert ON `base_menubase` FOR EACH ROW EXECUTE PROCEDURE TRG_INSERT_MENU_FUNC();;
-    ret = ""
-
-    triggerName = ""
-    triggerPrefix = ""
-    triggerBody = ""
-    triggerFuncName = ""
-    createTriggerFuncStmt = ""
-    createTriggerStmt = ""
-
-    # 分析和判断内联注释 
-    # TODO:
-
-    # 剔除内联注释
-    origTriggerWithoutComment = ""
-    origTriggerWithoutComment = origTrigger.replace("*/", "")
-    items = origTriggerWithoutComment.split()
-    origTriggerWithoutComment = ""
-    for item in items:
-        if (not item.startswith("/*!")):
-            origTriggerWithoutComment = origTriggerWithoutComment + item
-            origTriggerWithoutComment = origTriggerWithoutComment + " "
-
-    items = origTriggerWithoutComment.split()
-    itemsLen = len(items)
-
-    triggerName = ""
-    for i in range(itemsLen):
-        if (items[i] == "trigger"):
-            triggerName = items[i + 1]
-            triggerName = triggerName.strip("`")
-            break
-
-    triggerPrefix = ""
-    for i in range(itemsLen):
-        if (not items[i].startswith("definer")):
-            triggerPrefix = triggerPrefix + items[i]
-            triggerPrefix = triggerPrefix + " "
-            if ((items[i] == "for") and (items[i + 1] == "each") and (items[i + 2] == "row")):
-                triggerPrefix = triggerPrefix + items[i + 1]
-                triggerPrefix = triggerPrefix + " "
-                triggerPrefix = triggerPrefix + items[i + 2]
-                triggerPrefix = triggerPrefix + " "
-                break
-
-    triggerBody = ""
-    for i in range(itemsLen):
-        if ((items[i] == "for") and (items[i + 1] == "each") and (items[i + 2] == "row")):
-            for j in range(itemsLen):
-                if ((i + 2) < j):
-                    triggerBody = triggerBody + items[j]
-                    triggerBody = triggerBody + " "
-            break
-    triggerBody = triggerBody.rstrip()
-    triggerBody = triggerBody.rstrip(";")
-    triggerBody = triggerBody.rstrip()
-    triggerBody = triggerBody.rstrip(delimiter)
-    triggerBody = triggerBody.rstrip()
-
-    triggerFuncName = triggerName + "Func"
-    createTriggerFuncStmt = "CREATE FUNCTION " + triggerFuncName + "() "
-    createTriggerFuncStmt = createTriggerFuncStmt + "RETURNS TRIGGER "
-    if (triggerBody.startswith("begin")):
-        triggerBody = triggerBody.rstrip("end")
-        createTriggerFuncStmt = createTriggerFuncStmt + triggerBody
-    else:
-        createTriggerFuncStmt = createTriggerFuncStmt + "BEGIN "
-        createTriggerFuncStmt = createTriggerFuncStmt + triggerBody
-        createTriggerFuncStmt = createTriggerFuncStmt + "; "
-    createTriggerFuncStmt = createTriggerFuncStmt + " return NEW; END"
-    createTriggerFuncStmt = createTriggerFuncStmt + delimiter
-    createTriggerFuncStmt = createTriggerFuncStmt + "\n"
-
-    # 创建trigger
-    createTriggerStmt = triggerPrefix
-    createTriggerStmt = createTriggerStmt + " EXECUTE PROCEDURE " 
-    createTriggerStmt = createTriggerStmt + triggerFuncName + "()"
-    createTriggerStmt = createTriggerStmt + delimiter
-    createTriggerStmt = createTriggerStmt + "\n"
-
-    ret = ret + createTriggerFuncStmt
-    ret = ret + " "
-    ret = ret + createTriggerStmt
-    return ret
+    The kernel now lexes MySQL version-conditional comments and executes
+    them at the MySQL 5.7 level, and CREATE/DROP TRIGGER accept the MySQL
+    spellings, so - unlike in the past - no rewriting into two-part
+    PostgreSQL DDL is wanted or performed.
+    """
+    return line
 
 
 if __name__ == "__main__":

@@ -113,9 +113,21 @@ typedef struct core_yy_extra_type
 	/* state variables for literal-lexing warnings */
 	bool		warn_on_first_escape;
 	bool		saw_non_ascii;
-    
+
     bool        saw_underscore_binary;     /* MySQL: 是否看到_binary */
-    
+
+	/*
+	 * MySQL executable-comment state (mys_scan.l only).  xce_return is set
+	 * when a plain comment opens inside an executable comment, so that its
+	 * closing star-slash resumes the executable comment instead of leaving
+	 * it.  last_token_end is the scanbuf offset just past the token most
+	 * recently returned by the mys_yylex wrapper (mys_parser.c); the MySQL
+	 * raw-body capture uses it to exclude trailing text, such as the closing
+	 * comment mark of an executable comment, from a captured body.
+	 */
+	bool		xce_return;
+	int			last_token_end;
+
 } core_yy_extra_type;
 
 /*

@@ -196,6 +196,57 @@ mys_is_mysql_trigger_stmt(CreateTrigStmt *stmt)
 	return mys_mysql_trigger_marker(stmt, "mysql_trigger_body") != NULL;
 }
 
+/*
+ * MySQL trigger names are schema-scoped and unique (DROP TRIGGER has no
+ * ON-table clause for that reason), so creating a trigger whose name
+ * already exists on another table in the same schema is ER_TRG_ALREADY_EXISTS
+ * (1359).  Native PostgreSQL triggers on other tables do not share this
+ * restriction, so an existing native name must still reject the MySQL
+ * spelling; the name that remains only after DROP TABLE (whose pg_trigger
+ * row went with it) is reusable.
+ */
+static void
+mys_check_mysql_trigger_uniqueness(CreateTrigStmt *stmt)
+{
+	Oid			relid;
+	Oid			namespaceOid;
+	Relation	tgrel;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		found = false;
+
+	relid = RangeVarGetRelid(stmt->relation, NoLock, true);
+	if (!OidIsValid(relid))
+		return;					/* missing table: CreateTrigger reports it */
+	namespaceOid = get_rel_namespace(relid);
+
+	tgrel = table_open(TriggerRelationId, AccessShareLock);
+	scan = systable_beginscan(tgrel, InvalidOid, false, NULL, 0, NULL);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_trigger trigform = (Form_pg_trigger) GETSTRUCT(tuple);
+
+		if (strcmp(NameStr(trigform->tgname), stmt->trigname) != 0)
+			continue;
+
+		if (get_rel_namespace(trigform->tgrelid) == namespaceOid)
+		{
+			found = true;
+			break;
+		}
+	}
+	systable_endscan(scan);
+	table_close(tgrel, AccessShareLock);
+
+	if (found)
+	{
+		mysSetPendingMySQLErrno(1359);	/* ER_TRG_ALREADY_EXISTS */
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("trigger \"%s\" already exists", stmt->trigname)));
+	}
+}
+
 static char *
 mys_mysql_trigger_function_body(CreateTrigStmt *stmt, const char *body)
 {
@@ -1633,6 +1684,7 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 				{
 					PlannedStmt *wrapper = makeNode(PlannedStmt);
 
+					mys_check_mysql_trigger_uniqueness((CreateTrigStmt *) parsetree);
 					wrapper->commandType = CMD_UTILITY;
 					wrapper->canSetTag = false;
 					wrapper->utilityStmt = (Node *)

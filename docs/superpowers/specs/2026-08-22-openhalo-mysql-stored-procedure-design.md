@@ -108,7 +108,7 @@ openHalo 已经实现了按会话切换的解析/执行引擎机制，新增语�
 
 ### 2.7 mysqldump 触发器导入现状（旁证）
 
-历史上 [`tools/convert_mysqldump_file.py:173-190`](../../../tools/convert_mysqldump_file.py) 的未接入 `convertTrigger()` 辅助函数会生成裸 PG `CREATE FUNCTION ... RETURNS TRIGGER`，当时无法解析。M7 已使直接的 MySQL `CREATE TRIGGER ... FOR EACH ROW <body>` 可导入；该旧辅助函数仍应在后续 mysqldump 黑盒测试中改为保留原 MySQL 触发器 DDL，而不是继续生成已过时的两段 PG DDL。
+历史上 [`tools/convert_mysqldump_file.py:173-190`](../../../tools/convert_mysqldump_file.py) 的未接入 `convertTrigger()` 辅助函数会生成裸 PG `CREATE FUNCTION ... RETURNS TRIGGER`，当时无法解析。2026-08-30 已清理：该死函数删除，触发器 DDL 原样透传；另修复其 Python 版本检查（字符串比较把 ≥3.10 全部误判为"版本过低"而退出）。配套地，服务端现支持 MySQL 可执行注释（`mys_scan.l` 的 `/*!版本门 ...*/`，≤5.7 门执行、更高门跳过），并补齐单语句触发器体捕获在 EOF 处把尾部 `*/` 吞进存储体的问题——mysqldump 导出的脚本现在可直接导入（黑盒回归见 §8）。
 
 ---
 
@@ -126,7 +126,7 @@ openHalo 已经实现了按会话切换的解析/执行引擎机制，新增语�
 | `COMMENT 'string'` | ✅（持久化到 `pg_description`，并由 aux_mysql 1.7 元数据视图公开） | — |
 | `LANGUAGE SQL` | ✅ MySQL no-op 特性；例程仍选定 `plmysql` | — |
 | `[NOT] DETERMINISTIC` | ✅ 映射为 STABLE / VOLATILE | — |
-| `CONTAINS SQL｜NO SQL｜READS/MODIFIES SQL DATA` | ⚠️ 解析后丢弃 | 低（可继续丢弃或落元数据） |
+| `CONTAINS SQL｜NO SQL｜READS/MODIFIES SQL DATA` | ✅ 显式值写入 `pg_proc.proconfig` 的 `plmysql.sql_data_access`，并由 `mysql.proc`、`information_schema.ROUTINES` 和 `SHOW CREATE` 展示；未指定时按 MySQL 默认 `CONTAINS SQL` | — |
 | `SQL SECURITY DEFINER/INVOKER` | ✅ | — |
 | **裸 `BEGIN...END` 过程体** | ✅（M1，§4.2） | — |
 | `ALTER`/`DROP {PROCEDURE｜FUNCTION}` | ✅ | — |
@@ -182,13 +182,13 @@ MySQL 游标是只读、不可滚动、仅例程内可用——PG 游标的真�
 |---|---|
 | `SHOW CREATE {PROCEDURE｜FUNCTION}` | ✅ 语法存在，输出依赖 `prosrc` 存什么 |
 | `SHOW {PROCEDURE｜FUNCTION} STATUS` | ✅ |
-| `information_schema.ROUTINES` / `mysql.proc` | ✅ `language`/`ROUTINE_BODY = 'SQL'`；COMMENT、创建/修改时间、`sql_mode` 快照与原始 `DEFINER user@host` 均由 aux_mysql 投影 `pg_proc.proconfig` |
+| `information_schema.ROUTINES` / `mysql.proc` | ✅ `language`/`ROUTINE_BODY = 'SQL'`；COMMENT、创建/修改时间、`sql_mode` 快照、SQL data access 与原始 `DEFINER user@host` 均由 aux_mysql 投影 `pg_proc.proconfig` |
 
 ### G. 运行时语义（非语法但须对齐）
 
 | 语义 | MySQL 5.7 行为 | 现状 |
 |---|---|---|
-| `sql_mode` 快照 | 创建时记录，执行时应用 | ⚠️ 已创建时记录并在调用时设置函数级 GUC；具体类型/截断等全局 MySQL mode 位仍未全部映射 |
+| `sql_mode` 快照 | 创建时记录，执行时应用 | ⚠️ 已在例程调用时把函数级 GUC 快照同步到适配器运行时状态，支持空快照、嵌套 CALL 与 ERROR 清理；`STRICT_TRANS_TABLES`/`STRICT_ALL_TABLES` 已驱动现有数值转换路径。扫描/语法重写类 mode 与 MySQL DML warning 行为仍未全部映射 |
 | 过程递归 | 受 `max_sp_recursion_depth`，默认 **0=禁止**，范围 0–255 | ✅ 会话变量已实现并在调用栈检查（超限 1456） |
 | 函数递归 | MySQL 禁止 | ✅ 拒绝重入（1424） |
 | 函数内表访问限制 | 不能修改调用语句正在读写的表 | 可选，本期不做 |
@@ -197,7 +197,7 @@ MySQL 游标是只读、不可滚动、仅例程内可用——PG 游标的真�
 | `DECLARE` 顺序约束 | 变量/条件 → 游标 → 处理程序 | ✅ 本次会话修复（见 §E） |
 
 **本次会话另修复的运行时缺陷**（均不改变本节的语法覆盖范围，但影响正确性）：
-- `SIGNAL SQLSTATE 'xxxxx'`（自定义、未在错误码表中登记的 SQLSTATE）之前在发包时被硬编码替换为 `"HY000"`，客户端拿不到真实 SQLSTATE；`adapter.c` 的 `sendErrorMessage()` 改为发送 `unpack_sql_state(edata->sqlerrcode)`。§4.8 提到的"错误码→MySQL 规范 SQLSTATE"反向映射仍未做，因此走既有错误码表命中的错误，发出的 SQLSTATE 仍是 PG 原生编码，不是 MySQL 规范编码。
+- `SIGNAL SQLSTATE 'xxxxx'`（自定义、未在错误码表中登记的 SQLSTATE）之前在发包时被硬编码替换为 `"HY000"`，客户端拿不到真实 SQLSTATE；`adapter.c` 的 `sendErrorMessage()` 改为发送 `unpack_sql_state(edata->sqlerrcode)`。§4.8 提到的"错误码→MySQL 规范 SQLSTATE"反向映射也已补齐（2026-08-30）：`errorConvertor.c` 新增 17 条 PG SQLSTATE→MySQL 规范 SQLSTATE 键值（`mysCanonicalizeSqlState()`，与 `pl_exec_ext.c` 的 28 条 errno 三元组人工审核口径一致），`sendErrPacket()` 发包时把命中的 PG 状态改写为 MySQL 规范值（如 `42P01→42S02`、`23505→23000`）；`SIGNAL`/`RESIGNAL` 选择的自定义状态（`45000`、`A0001` 等）不是键，仍原样回传。
 
 ---
 
@@ -353,7 +353,7 @@ EXIT handler 复用 plpgsql 原生 `EXCEPTION WHEN` 机制（零新增）；CONT
 
 ### 4.9 元数据层修正
 
-保留视图路线（`mysql.proc`/`mys_informa_schema.procedures/functions/routines` 继续投影 `pg_proc`），不新建独立目录表。最终落地时没有采用 Babelfish 的窄侧表（`sys.babelfish_function_ext`）补充方案，而是用 **`pg_proc.proconfig` + 自定义 GUC**（`plmysql.definer`/`plmysql.sql_mode`/`plmysql.created`/`plmysql.last_altered`，由 plmysql 扩展注册）承载 `pg_proc` 存不下的列，理由：
+保留视图路线（`mysql.proc`/`mys_informa_schema.procedures/functions/routines` 继续投影 `pg_proc`），不新建独立目录表。最终落地时没有采用 Babelfish 的窄侧表（`sys.babelfish_function_ext`）补充方案，而是用 **`pg_proc.proconfig` + 自定义 GUC**（`plmysql.definer`/`plmysql.sql_mode`/`plmysql.sql_data_access`/`plmysql.created`/`plmysql.last_altered`，由 plmysql 扩展注册）承载 `pg_proc` 存不下的列，理由：
 
 - `proconfig` 随 `pg_proc` 行整体 dump/restore 与逻辑复制，无需在恢复路径上补写窄侧表（窄侧表的行在 `pg_restore`/逻辑复制重建例程后必然丢失或需要额外钩子）
 - 函数级 GUC 在调用时由 fmgr 自动应用到会话，plmysql 编译器/执行器可以零成本读取快照（执行期 `plmysql.sql_mode` 即创建时值，为 §G 的"创建时记录、执行时应用"铺路）
@@ -361,9 +361,9 @@ EXIT handler 复用 plpgsql 原生 `EXCEPTION WHEN` 机制（零新增）；CONT
 
 已落地内容（2026-08-29 晚）：
 
-- 语法层 `DEFINER=user@host` 原文经选项 `SET` 子句写入 `proconfig`（创建/替换路径；`mys_utility.c` 在执行期按会话 `sql_mode` 与当前时间追加 `sql_mode`/`created`/`last_altered`，避免在 PREPARE 解析期快照到错误值）
-- `mysql.proc`/`mys_informa_schema.{procedures,functions,routines}` 与 `SHOW CREATE` 读取 `proconfig` 展示真实 definer/sql_mode/时间戳；无记录时（如旧版本重建的例程）回退到原展示值（owner@%、默认 sql_mode、`2024-1-1`）
-- `mysql.get_proc_def()`/`get_func_def()` 直接输出 `prosrc`（本来存的就是原文）并在头部渲染记录的 DEFINER
+- 语法层 `DEFINER=user@host` 原文与显式 SQL data-access 特性经选项 `SET` 子句写入 `proconfig`；`mys_utility.c` 在执行期按会话 `sql_mode` 与当前时间追加 `sql_mode`/`created`/`last_altered`，避免在 PREPARE 解析期快照到错误值
+- `mysql.proc`/`mys_informa_schema.{procedures,functions,routines}` 与 `SHOW CREATE` 读取 `proconfig` 展示真实 definer/sql_mode/SQL data access/时间戳；无记录时（如旧版本重建的例程）回退到原展示值（owner@%、默认 sql_mode、`CONTAINS SQL`、`2024-1-1`）
+- `mysql.get_proc_def()`/`get_func_def()` 直接输出 `prosrc`（本来存的就是原文），并在头部渲染记录的 DEFINER 与 SQL data access
 - 仍保持 `ROUTINE_BODY`/`language = 'SQL'`：这是 MySQL 5.7 的协议值，内部 `prolang = plmysql` 不应泄露
 
 ### 4.10 触发器：MySQL 行级 DML 子集
@@ -380,7 +380,7 @@ CREATE [DEFINER = user] TRIGGER name
 
 原始 MySQL 体、名称和 DEFINER 保存为函数级 GUC（`plmysql.trigger_body`/`plmysql.trigger_name`/`plmysql.definer`）；aux_mysql 1.9 的 `mys_informa_schema.triggers` 与 `SHOW CREATE TRIGGER` 读取这些值，避免把内部 `RETURN` 包装泄露给客户端。私有函数使用受保留前缀的 `CREATE OR REPLACE`，故删表后同名触发器可以重建。
 
-MySQL 专用的 `DROP TRIGGER [IF EXISTS] [schema.]name`（无 ON 子句，名字是 schema 级作用域）也已支持（2026-08-30）：解析器用私有前导名 `__mysql_drop_trigger__` 标记该形态，utility 层在 `RemoveObjects()` 之前解析出所属表并把对象改写为 PG 标准的 `[表名…, 触发器名]` 形态，之后走完全原生的删除路径。解析规则：先找 MySQL `CREATE TRIGGER` 生成的私有函数 `__mysql_trigger_<名>` 所对应的触发器；否则在目标 schema（限定名指定，未限定名取 search_path 首个 schema，对应 MySQL 的当前数据库）内找同名且唯一的触发器（兼容原生 PG 触发器）；同名多表歧义时报错并提示改用 PG 语法。触发器不存在时按 MySQL 语义报 1360（`ER_TRG_DOES_NOT_EXIST`，经 pending-errno 通道穿透，不污染全局 SQLSTATE 映射表），`IF EXISTS` 则发 NOTICE 跳过。与 CREATE 侧一致，显式 DROP TRIGGER 后私有函数保留，同名触发器可直接重建。
+MySQL 专用的 `DROP TRIGGER [IF EXISTS] [schema.]name`（无 ON 子句，名字是 schema 级作用域）也已支持（2026-08-30）：解析器用私有前导名 `__mysql_drop_trigger__` 标记该形态，utility 层在 `RemoveObjects()` 之前解析出所属表并把对象改写为 PG 标准的 `[表名…, 触发器名]` 形态，之后走完全原生的删除路径。解析规则：先找 MySQL `CREATE TRIGGER` 生成的私有函数 `__mysql_trigger_<名>` 所对应的触发器；否则在目标 schema（限定名指定，未限定名取 search_path 首个 schema，对应 MySQL 的当前数据库）内找同名且唯一的触发器（兼容原生 PG 触发器）；同名多表歧义时报错并提示改用 PG 语法。触发器不存在时按 MySQL 语义报 1360（`ER_TRG_DOES_NOT_EXIST`，经 pending-errno 通道穿透，不污染全局 SQLSTATE 映射表），`IF EXISTS` 则发 NOTICE 跳过。与 CREATE 侧一致，显式 DROP TRIGGER 后私有函数保留，同名触发器可直接重建。另补 schema 级唯一性检查（2026-08-30）：MySQL 触发器名在 schema 内唯一，`CREATE TRIGGER` 时若同名触发器已存在于该 schema 的任意表上（含原生 PG 触发器），按 MySQL 报 1359（`ER_TRG_ALREADY_EXISTS`，pending-errno 通道）；`DROP TABLE` 与被 `DROP TRIGGER` 移除后名字可复用。
 
 刻意不支持：多事件、`TRUNCATE`、`INSTEAD OF`、语句级触发器以及 `FOLLOWS`/`PRECEDES` 顺序；这些不应静默降级为 PG 语义。
 
@@ -420,7 +420,7 @@ Babelfish（AWS 的 SQL Server 兼容层）验证了"clone plpgsql 建新 PL"是
 | M3 | 游标（`DECLARE CURSOR`/`OPEN`/`FETCH`/`CLOSE`）+ EXIT HANDLER（复用 plpgsql EXCEPTION） | ✅ 完成 |
 | M4 | CONTINUE HANDLER（§4.5，含游标 NOT FOUND 联动）+ `SIGNAL`/`RESIGNAL`（§4.8）+ `GET DIAGNOSTICS` | ✅ 完成；错误码体系（§4.8）三项均已落地：正向表已扩至 44 条（含存储过程/DDL 常用 errno，`errorConvertor.c`），errno→SQLSTATE 双向/规范性反向映射在 `pl_exec_ext.c` 的 `mysql_errno_sqlstate_map`（28 条三元组：errno/PG SQLSTATE/MySQL 规范 SQLSTATE） |
 | M5 | CALL 链路 OUT/INOUT 回写（§4.6）+ 多结果集协议打通（§4.7） | ✅ 完成（多结果集协议打通是 2026-08-29 补的：编译期 `is_select`/`n_resultsets` 标记早就有，执行期一直没接上，`CALL` 内裸 `SELECT`/`EXECUTE` 预处理语句会报 "no destination for result data"；另外例程体内 `SET @uservar = expr` 与 MySQL 形态的 `EXECUTE stmtname [USING ...]` 当时也还不能用，一并修了） |
-| M6 | 元数据视图修正（§4.9）+ `DEFINER`/`COMMENT` 语法补全 + 触发器预留验证（§4.10，不实现触发器本身） | ✅ 完成（2026-08-29 晚）：`DEFINER` 的 `user@host` 原文、创建时 `sql_mode` 快照、`created`/`last_altered` 时间戳以函数级 GUC 形式写入 `pg_proc.proconfig`（`plmysql.definer`/`plmysql.sql_mode`/`plmysql.created`/`plmysql.last_altered`，由 plmysql 扩展定义并随 dump/restore 自动携带），`mysql.proc`/`mys_informa_schema.routines/procedures/functions` 视图与 `SHOW CREATE` 全部改读真实值（无记录时回退到原展示值）；触发器入口预留已验证：三态枚举、编译器 switch、`plmysql_exec_trigger`/`plmysql_exec_event_trigger` 执行器、调用分派与语法 guard（如 1336 动态 SQL 拒绝）均就位 |
+| M6 | 元数据视图修正（§4.9）+ `DEFINER`/`COMMENT` 语法补全 + 触发器预留验证（§4.10，不实现触发器本身） | ✅ 完成：`DEFINER` 的 `user@host` 原文、创建时 `sql_mode` 快照、SQL data-access 特性、`created`/`last_altered` 时间戳以函数级 GUC 形式写入 `pg_proc.proconfig`（`plmysql.definer`/`plmysql.sql_mode`/`plmysql.sql_data_access`/`plmysql.created`/`plmysql.last_altered`，由 plmysql 扩展定义并随 dump/restore 自动携带），`mysql.proc`/`mys_informa_schema.routines/procedures/functions` 视图与 `SHOW CREATE` 全部改读真实值（SQL data access 缺省时回退为 `CONTAINS SQL`）；触发器入口预留已验证：三态枚举、编译器 switch、`plmysql_exec_trigger`/`plmysql_exec_event_trigger` 执行器、调用分派与语法 guard（如 1336 动态 SQL 拒绝）均就位 |
 | M7 | MySQL `CREATE TRIGGER` 行级 DML 子集 + 原始体元数据/`SHOW CREATE TRIGGER` | ✅ 完成（2026-08-30）：单语句与 `BEGIN...END` 体降级到私有 `plmysql RETURNS trigger` 包装函数；支持 DEFINER、`NEW`/`OLD`、BEFORE/AFTER 单事件，以及删表后的同名重建；MySQL 专用 `DROP TRIGGER [IF EXISTS] [schema.]name` 同日补齐（见 §4.10）；aux_mysql 升至 1.9 |
 
 **2026-08-29 追加修复**（运行时正确性问题，不改变上述里程碑范围）：
@@ -437,13 +437,13 @@ Babelfish（AWS 的 SQL Server 兼容层）验证了"clone plpgsql 建新 PL"是
 2. **`SET` 语句歧义**：MySQL 模式下 `SET` 已被系统变量/用户变量语法占用，例程内 `SET localvar = expr` 需要与现有 `MysVariableSetStmt` 语法在 `plmysql` 编译器内部（不是主语法）做区分，具体消歧规则需要在 M1 实现时敲定。
 3. **原生 `label:` 拼写**：✅ 已支持（2026-08-29 晚）。实现要点：plmysql 语句以 `T_WORD` 开头时（`SELECT` 等经 `stmt_execsql` 的 T_WORD 分支捕获整句），不能在 bison 里用 `T_WORD ':'` 双 token 产生式区分 label——bison 需要两 token 前瞻，而 pl_scanner 的动作内 `yylex()` 与 bison 的 lookahead 缓冲错位，会导致所有 T_WORD 开头的语句解析错乱（`SELECT CASE WHEN...` 报 `missing "WHEN"`）。正确做法是把 `标识符 + ':'` 在 scanner 层合并为单一 `T_WORD_COLON` token（`pl_scanner.c`），与 `A.B`/`A:=`/`A[B]` 的既有组合机制同构；label 只接受普通标识符（`T_WORD`），不接受关键字/引号标识符，符合 MySQL 语义。
 4. **反向错误码表的规范化选择**：非单射的反向映射（如多个 SQLSTATE 对应同一 MySQL errno）需要逐条人工选定规范源，M4 阶段需要一份人工审核的映射表，不能全自动生成。✅ 已按 MySQL 5.7 手册附录逐条人工选定（`pl_exec_ext.c` 的 28 条三元组）。
-5. **`sql_mode` 快照的实际使用范围**：快照已落地存储（`plmysql.sql_mode` proconfig GUC），但具体哪些 `sql_mode` 位在执行期实际生效（如 `STRICT_TRANS_TABLES` 影响类型截断行为）仍超出本次存储过程设计范围，需要与 openHalo 现有类型系统兼容性工作对齐，本文档不展开。
+5. **`sql_mode` 快照的实际使用范围**：快照已落地存储（`plmysql.sql_mode` proconfig GUC），并在例程进入时映射到适配器的运行时 mode 位；空字符串也是有效快照，嵌套例程和 ERROR 展开均恢复调用者状态。现有 `STRICT_TRANS_TABLES`/`STRICT_ALL_TABLES` 数值转换路径已由该状态驱动。`ANSI_QUOTES`、`PIPES_AS_CONCAT`、`REAL_AS_FLOAT`、`NO_BACKSLASH_ESCAPES` 等必须在扫描/解析期生效的 mode，以及完整 MySQL DML 截断告警语义，仍需与对应的解析器、类型系统兼容性工作对齐。
 
 ---
 
 ## 8. 测试策略
 
-现状：MySQL 协议回归位于 `src/test/mysql/t/test_000` 至 `test_018`，覆盖过程体、流程控制、游标/HANDLER、OUT/INOUT、多结果集、动态 SQL、扩展升级、dump/restore、例程特性、递归/函数限制、元数据（DEFINER/sql_mode 快照/时间戳/`SHOW CREATE`）、原生 `label:` 与错误码映射，CREATE TRIGGER 的复合/单语句体、`NEW`/`OLD`、DEFINER、元数据还原和同名重建，以及 DROP TRIGGER 的 MySQL/PG 双拼写、IF EXISTS、1360 错误、删表后的孤儿名字和同名触发器优先级；`PYTHONPATH=/home/unvdb/pylibs make -C src/test/mysql check` 当前为 **19/19 通过**。
+现状：MySQL 协议回归位于 `src/test/mysql/t/test_000` 至 `test_020`，覆盖过程体、流程控制、游标/HANDLER、OUT/INOUT、多结果集、动态 SQL、扩展升级、dump/restore、例程特性、递归/函数限制、元数据（DEFINER/sql_mode 快照/SQL data access/时间戳/`SHOW CREATE`，含 `ALTER PROCEDURE` 响应）、原生 `label:` 与错误码映射（含发包 SQLSTATE 规范化断言）、CREATE TRIGGER 的复合/单语句体、`NEW`/`OLD`、DEFINER、元数据还原和同名重建、MySQL 触发器唯一的 1359，DROP TRIGGER 的 MySQL/PG 双拼写、IF EXISTS、1360 错误、删表后的孤儿名字和同名触发器优先级，mysqldump 格式黑盒导入（可执行注释、DELIMITER 切分、NOT VALID 外键，`test_019_mysqldump_import.py`），以及 sql_mode 快照的执行期语义（`test_020_sql_mode_semantics.py`：嵌套 CALL、ERROR 清理）；`PYTHONPATH=/home/unvdb/pylibs make -C src/test/mysql check` 当前为 **21/21 通过**。
 
 后续需补充：
 
@@ -454,3 +454,4 @@ Babelfish（AWS 的 SQL Server 兼容层）验证了"clone plpgsql 建新 PL"是
 - 错误码：修复的 4 条错误映射 + 3 条死条目补全后的正确性，`SIGNAL` 带/不带 `MYSQL_ERRNO` 两种场景
 - 跨协议边界：psql 协议调用 `plmysql` 例程应报错；`pg_dump`/还原链路下创建应成功
 - mysqldump 导入回归：`tools/convert_mysqldump_file.py` 转换后的触发器/过程体可以作为黑盒用例，覆盖真实 dump 的 DELIMITER、注释和 DEFINER 形态
+- `sql_mode`：严格/非严格快照、空快照与嵌套例程恢复（`test_020_sql_mode_semantics.py`）

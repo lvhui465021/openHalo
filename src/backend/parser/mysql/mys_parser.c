@@ -94,7 +94,20 @@ mys_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 		yyextra->have_lookahead = false;
 	}
 	else
+	{
 		cur_token = mys_core_yylex(&(lvalp->core_yystype), llocp, yyscanner);
+
+		/*
+		 * Record where this token ends while the scanner still holds its
+		 * NUL there; the MySQL raw-body capture uses it to stop at the last
+		 * token instead of at end of input.  A replayed token is not
+		 * re-scanned here, and its end was recorded when it was scanned as
+		 * the lookahead below.
+		 */
+		if (cur_token != 0)
+			yyextra->core_yy_extra.last_token_end =
+				*llocp + strlen(yyextra->core_yy_extra.scanbuf + *llocp);
+	}
 
     /*
      * If this token isn't one that requires lookahead, just return it.  If it
@@ -146,6 +159,9 @@ mys_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 
 	/* Get next token, saving outputs into lookahead variables */
 	next_token = mys_core_yylex(&(yyextra->lookahead_yylval), llocp, yyscanner);
+	if (next_token != 0)
+		yyextra->core_yy_extra.last_token_end =
+			*llocp + strlen(yyextra->core_yy_extra.scanbuf + *llocp);
 	yyextra->lookahead_token = next_token;
 	yyextra->lookahead_yylloc = *llocp;
 
