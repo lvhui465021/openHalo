@@ -122,7 +122,7 @@ static ResourceOwner shared_simple_eval_resowner = NULL;
  * A suitable context is created on-demand by get_stmt_mcontext(), and must
  * be reset at the end of the requesting routine.  Error recovery will clean
  * it up automatically.  Nested statements requiring statement-lifespan
- * workspace will result in a stack of such contexts, see push_stmt_mcontext().
+ * workspace will result in a stack of such contexts, see pop_stmt_mcontext().
  *
  * 3. We use the eval_econtext's per-tuple memory context for expression
  * evaluation, and as a general-purpose workspace for short-lived allocations.
@@ -270,7 +270,6 @@ static void copy_plmysql_datums(PLMySQL_execstate *estate,
 static void plmysql_fulfill_promise(PLMySQL_execstate *estate,
 									PLMySQL_var *var);
 static MemoryContext get_stmt_mcontext(PLMySQL_execstate *estate);
-static void push_stmt_mcontext(PLMySQL_execstate *estate);
 static void pop_stmt_mcontext(PLMySQL_execstate *estate);
 
 static int	exec_toplevel_block(PLMySQL_execstate *estate,
@@ -296,14 +295,6 @@ static int	exec_stmt_loop(PLMySQL_execstate *estate,
 						   PLMySQL_stmt_loop *stmt);
 static int	exec_stmt_while(PLMySQL_execstate *estate,
 							PLMySQL_stmt_while *stmt);
-static int	exec_stmt_fori(PLMySQL_execstate *estate,
-						   PLMySQL_stmt_fori *stmt);
-static int	exec_stmt_fors(PLMySQL_execstate *estate,
-						   PLMySQL_stmt_fors *stmt);
-static int	exec_stmt_forc(PLMySQL_execstate *estate,
-						   PLMySQL_stmt_forc *stmt);
-static int	exec_stmt_foreach_a(PLMySQL_execstate *estate,
-								PLMySQL_stmt_foreach_a *stmt);
 static int	exec_stmt_open(PLMySQL_execstate *estate,
 						   PLMySQL_stmt_open *stmt);
 static int	exec_stmt_fetch(PLMySQL_execstate *estate,
@@ -336,8 +327,6 @@ static int	exec_stmt_execsql(PLMySQL_execstate *estate,
 							  PLMySQL_stmt_execsql *stmt);
 static int	exec_stmt_dynexecute(PLMySQL_execstate *estate,
 								 PLMySQL_stmt_dynexecute *stmt);
-static int	exec_stmt_dynfors(PLMySQL_execstate *estate,
-							  PLMySQL_stmt_dynfors *stmt);
 static int	exec_stmt_commit(PLMySQL_execstate *estate,
 							 PLMySQL_stmt_commit *stmt);
 static int	exec_stmt_rollback(PLMySQL_execstate *estate,
@@ -392,8 +381,6 @@ static Datum exec_eval_expr(PLMySQL_execstate *estate,
 							int32 *rettypmod);
 static int	exec_run_select(PLMySQL_execstate *estate,
 							PLMySQL_expr *expr, long maxtuples, Portal *portalP);
-static int	exec_for_query(PLMySQL_execstate *estate, PLMySQL_stmt_forq *stmt,
-						   Portal portal, bool prefetch_ok);
 static ParamListInfo setup_param_list(PLMySQL_execstate *estate,
 									  PLMySQL_expr *expr);
 static ParamExternData *plmysql_param_fetch(ParamListInfo params,
@@ -1543,25 +1530,6 @@ get_stmt_mcontext(PLMySQL_execstate *estate)
 }
 
 /*
- * Push down the current stmt_mcontext so that called statements won't use it.
- * This is needed by statements that have statement-lifespan data and need to
- * preserve it across some inner statements.  The caller should eventually do
- * pop_stmt_mcontext().
- */
-static void
-push_stmt_mcontext(PLMySQL_execstate *estate)
-{
-	/* Should have done get_stmt_mcontext() first */
-	Assert(estate->stmt_mcontext != NULL);
-	/* Assert we've not messed up the stack linkage */
-	Assert(MemoryContextGetParent(estate->stmt_mcontext) == estate->stmt_mcontext_parent);
-	/* Push it down to become the parent of any nested stmt mcontext */
-	estate->stmt_mcontext_parent = estate->stmt_mcontext;
-	/* And make it not available for use directly */
-	estate->stmt_mcontext = NULL;
-}
-
-/*
  * Undo push_stmt_mcontext().  We assume this is done just before or after
  * resetting the caller's stmt_mcontext; since that action will also delete
  * any child contexts, there's no need to explicitly delete whatever context
@@ -2513,22 +2481,6 @@ exec_stmt(PLMySQL_execstate *estate, PLMySQL_stmt *stmt)
 				rc = exec_stmt_while(estate, (PLMySQL_stmt_while *) stmt);
 				break;
 
-			case PLMYSQL_STMT_FORI:
-				rc = exec_stmt_fori(estate, (PLMySQL_stmt_fori *) stmt);
-				break;
-
-			case PLMYSQL_STMT_FORS:
-				rc = exec_stmt_fors(estate, (PLMySQL_stmt_fors *) stmt);
-				break;
-
-			case PLMYSQL_STMT_FORC:
-				rc = exec_stmt_forc(estate, (PLMySQL_stmt_forc *) stmt);
-				break;
-
-			case PLMYSQL_STMT_FOREACH_A:
-				rc = exec_stmt_foreach_a(estate, (PLMySQL_stmt_foreach_a *) stmt);
-				break;
-
 			case PLMYSQL_STMT_EXIT:
 				rc = exec_stmt_exit(estate, (PLMySQL_stmt_exit *) stmt);
 				break;
@@ -2563,10 +2515,6 @@ exec_stmt(PLMySQL_execstate *estate, PLMySQL_stmt *stmt)
 
 			case PLMYSQL_STMT_DYNEXECUTE:
 				rc = exec_stmt_dynexecute(estate, (PLMySQL_stmt_dynexecute *) stmt);
-				break;
-
-			case PLMYSQL_STMT_DYNFORS:
-				rc = exec_stmt_dynfors(estate, (PLMySQL_stmt_dynfors *) stmt);
 				break;
 
 			case PLMYSQL_STMT_OPEN:
@@ -2884,21 +2832,6 @@ exec_stmt_getdiag(PLMySQL_execstate *estate, PLMySQL_stmt_getdiag *stmt)
 								  false, INT8OID, -1);
 				break;
 
-			case PLMYSQL_GETDIAG_ERROR_CONTEXT:
-				exec_assign_c_string(estate, var,
-									 estate->cur_error->context);
-				break;
-
-			case PLMYSQL_GETDIAG_ERROR_DETAIL:
-				exec_assign_c_string(estate, var,
-									 estate->cur_error->detail);
-				break;
-
-			case PLMYSQL_GETDIAG_ERROR_HINT:
-				exec_assign_c_string(estate, var,
-									 estate->cur_error->hint);
-				break;
-
 			case PLMYSQL_GETDIAG_RETURNED_SQLSTATE:
 				exec_assign_c_string(estate, var,
 									 unpack_sql_state(estate->cur_error->sqlerrcode));
@@ -2912,11 +2845,6 @@ exec_stmt_getdiag(PLMySQL_execstate *estate, PLMySQL_stmt_getdiag *stmt)
 			case PLMYSQL_GETDIAG_CONSTRAINT_NAME:
 				exec_assign_c_string(estate, var,
 									 estate->cur_error->constraint_name);
-				break;
-
-			case PLMYSQL_GETDIAG_DATATYPE_NAME:
-				exec_assign_c_string(estate, var,
-									 estate->cur_error->datatype_name);
 				break;
 
 			case PLMYSQL_GETDIAG_MESSAGE_TEXT:
@@ -2958,20 +2886,6 @@ exec_stmt_getdiag(PLMySQL_execstate *estate, PLMySQL_stmt_getdiag *stmt)
 						snprintf(buf, sizeof(buf), "%d", errno_val);
 						exec_assign_c_string(estate, var, buf);
 					}
-				}
-				break;
-
-			case PLMYSQL_GETDIAG_CONTEXT:
-				{
-					char	   *contextstackstr;
-					MemoryContext oldcontext;
-
-					/* Use eval_mcontext for short-lived string */
-					oldcontext = MemoryContextSwitchTo(get_eval_mcontext(estate));
-					contextstackstr = GetErrorContextStack();
-					MemoryContextSwitchTo(oldcontext);
-
-					exec_assign_c_string(estate, var, contextstackstr);
 				}
 				break;
 
@@ -3151,470 +3065,6 @@ exec_stmt_while(PLMySQL_execstate *estate, PLMySQL_stmt_while *stmt)
 
 		LOOP_RC_PROCESSING(stmt->label, break);
 	}
-
-	return rc;
-}
-
-
-/* ----------
- * exec_stmt_fori			Iterate an integer variable
- *					from a lower to an upper value
- *					incrementing or decrementing by the BY value
- * ----------
- */
-static int
-exec_stmt_fori(PLMySQL_execstate *estate, PLMySQL_stmt_fori *stmt)
-{
-	PLMySQL_var *var;
-	Datum		value;
-	bool		isnull;
-	Oid			valtype;
-	int32		valtypmod;
-	int32		loop_value;
-	int32		end_value;
-	int32		step_value;
-	bool		found = false;
-	int			rc = PLMYSQL_RC_OK;
-
-	var = (PLMySQL_var *) (estate->datums[stmt->var->dno]);
-
-	/*
-	 * Get the value of the lower bound
-	 */
-	value = exec_eval_expr(estate, stmt->lower,
-						   &isnull, &valtype, &valtypmod);
-	value = exec_cast_value(estate, value, &isnull,
-							valtype, valtypmod,
-							var->datatype->typoid,
-							var->datatype->atttypmod);
-	if (isnull)
-		ereport(ERROR,
-				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("lower bound of FOR loop cannot be null")));
-	loop_value = DatumGetInt32(value);
-	exec_eval_cleanup(estate);
-
-	/*
-	 * Get the value of the upper bound
-	 */
-	value = exec_eval_expr(estate, stmt->upper,
-						   &isnull, &valtype, &valtypmod);
-	value = exec_cast_value(estate, value, &isnull,
-							valtype, valtypmod,
-							var->datatype->typoid,
-							var->datatype->atttypmod);
-	if (isnull)
-		ereport(ERROR,
-				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("upper bound of FOR loop cannot be null")));
-	end_value = DatumGetInt32(value);
-	exec_eval_cleanup(estate);
-
-	/*
-	 * Get the step value
-	 */
-	if (stmt->step)
-	{
-		value = exec_eval_expr(estate, stmt->step,
-							   &isnull, &valtype, &valtypmod);
-		value = exec_cast_value(estate, value, &isnull,
-								valtype, valtypmod,
-								var->datatype->typoid,
-								var->datatype->atttypmod);
-		if (isnull)
-			ereport(ERROR,
-					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-					 errmsg("BY value of FOR loop cannot be null")));
-		step_value = DatumGetInt32(value);
-		exec_eval_cleanup(estate);
-		if (step_value <= 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("BY value of FOR loop must be greater than zero")));
-	}
-	else
-		step_value = 1;
-
-	/*
-	 * Now do the loop
-	 */
-	for (;;)
-	{
-		/*
-		 * Check against upper bound
-		 */
-		if (stmt->reverse)
-		{
-			if (loop_value < end_value)
-				break;
-		}
-		else
-		{
-			if (loop_value > end_value)
-				break;
-		}
-
-		found = true;			/* looped at least once */
-
-		/*
-		 * Assign current value to loop var
-		 */
-		assign_simple_var(estate, var, Int32GetDatum(loop_value), false, false);
-
-		/*
-		 * Execute the statements
-		 */
-		rc = exec_stmts(estate, stmt->body);
-
-		LOOP_RC_PROCESSING(stmt->label, break);
-
-		/*
-		 * Increase/decrease loop value, unless it would overflow, in which
-		 * case exit the loop.
-		 */
-		if (stmt->reverse)
-		{
-			if (loop_value < (PG_INT32_MIN + step_value))
-				break;
-			loop_value -= step_value;
-		}
-		else
-		{
-			if (loop_value > (PG_INT32_MAX - step_value))
-				break;
-			loop_value += step_value;
-		}
-	}
-
-	/*
-	 * Set the FOUND variable to indicate the result of executing the loop
-	 * (namely, whether we looped one or more times). This must be set here so
-	 * that it does not interfere with the value of the FOUND variable inside
-	 * the loop processing itself.
-	 */
-	exec_set_found(estate, found);
-
-	return rc;
-}
-
-
-/* ----------
- * exec_stmt_fors			Execute a query, assign each
- *					tuple to a record or row and
- *					execute a group of statements
- *					for it.
- * ----------
- */
-static int
-exec_stmt_fors(PLMySQL_execstate *estate, PLMySQL_stmt_fors *stmt)
-{
-	Portal		portal;
-	int			rc;
-
-	/*
-	 * Open the implicit cursor for the statement using exec_run_select
-	 */
-	exec_run_select(estate, stmt->query, 0, &portal);
-
-	/*
-	 * Execute the loop
-	 */
-	rc = exec_for_query(estate, (PLMySQL_stmt_forq *) stmt, portal, true);
-
-	/*
-	 * Close the implicit cursor
-	 */
-	SPI_cursor_close(portal);
-
-	return rc;
-}
-
-
-/* ----------
- * exec_stmt_forc			Execute a loop for each row from a cursor.
- * ----------
- */
-static int
-exec_stmt_forc(PLMySQL_execstate *estate, PLMySQL_stmt_forc *stmt)
-{
-	PLMySQL_var *curvar;
-	MemoryContext stmt_mcontext = NULL;
-	char	   *curname = NULL;
-	PLMySQL_expr *query;
-	ParamListInfo paramLI;
-	Portal		portal;
-	int			rc;
-
-	/* ----------
-	 * Get the cursor variable and if it has an assigned name, check
-	 * that it's not in use currently.
-	 * ----------
-	 */
-	curvar = (PLMySQL_var *) (estate->datums[stmt->curvar]);
-	if (!curvar->isnull)
-	{
-		MemoryContext oldcontext;
-
-		/* We only need stmt_mcontext to hold the cursor name string */
-		stmt_mcontext = get_stmt_mcontext(estate);
-		oldcontext = MemoryContextSwitchTo(stmt_mcontext);
-		curname = TextDatumGetCString(curvar->value);
-		MemoryContextSwitchTo(oldcontext);
-
-		if (SPI_cursor_find(curname) != NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_DUPLICATE_CURSOR),
-					 errmsg("cursor \"%s\" already in use", curname)));
-	}
-
-	/* ----------
-	 * Open the cursor just like an OPEN command
-	 *
-	 * Note: parser should already have checked that statement supplies
-	 * args iff cursor needs them, but we check again to be safe.
-	 * ----------
-	 */
-	if (stmt->argquery != NULL)
-	{
-		/* ----------
-		 * OPEN CURSOR with args.  We fake a SELECT ... INTO ...
-		 * statement to evaluate the args and put 'em into the
-		 * internal row.
-		 * ----------
-		 */
-		PLMySQL_stmt_execsql set_args;
-
-		if (curvar->cursor_explicit_argrow < 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("arguments given for cursor without arguments")));
-
-		memset(&set_args, 0, sizeof(set_args));
-		set_args.cmd_type = PLMYSQL_STMT_EXECSQL;
-		set_args.lineno = stmt->lineno;
-		set_args.sqlstmt = stmt->argquery;
-		set_args.into = true;
-		/* XXX historically this has not been STRICT */
-		set_args.target = (PLMySQL_variable *)
-			(estate->datums[curvar->cursor_explicit_argrow]);
-
-		if (exec_stmt_execsql(estate, &set_args) != PLMYSQL_RC_OK)
-			elog(ERROR, "open cursor failed during argument processing");
-	}
-	else
-	{
-		if (curvar->cursor_explicit_argrow >= 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("arguments required for cursor")));
-	}
-
-	query = curvar->cursor_explicit_expr;
-	Assert(query);
-
-	if (query->plan == NULL)
-		exec_prepare_plan(estate, query, curvar->cursor_options);
-
-	/*
-	 * Set up ParamListInfo for this query
-	 */
-	paramLI = setup_param_list(estate, query);
-
-	/*
-	 * Open the cursor (the paramlist will get copied into the portal)
-	 */
-	portal = SPI_cursor_open_with_paramlist(curname, query->plan,
-											paramLI,
-											estate->readonly_func);
-	if (portal == NULL)
-		elog(ERROR, "could not open cursor: %s",
-			 SPI_result_code_string(SPI_result));
-
-	/*
-	 * If cursor variable was NULL, store the generated portal name in it
-	 */
-	if (curname == NULL)
-		assign_text_var(estate, curvar, portal->name);
-
-	/*
-	 * Clean up before entering exec_for_query
-	 */
-	exec_eval_cleanup(estate);
-	if (stmt_mcontext)
-		MemoryContextReset(stmt_mcontext);
-
-	/*
-	 * Execute the loop.  We can't prefetch because the cursor is accessible
-	 * to the user, for instance via UPDATE WHERE CURRENT OF within the loop.
-	 */
-	rc = exec_for_query(estate, (PLMySQL_stmt_forq *) stmt, portal, false);
-
-	/* ----------
-	 * Close portal, and restore cursor variable if it was initially NULL.
-	 * ----------
-	 */
-	SPI_cursor_close(portal);
-
-	if (curname == NULL)
-		assign_simple_var(estate, curvar, (Datum) 0, true, false);
-
-	return rc;
-}
-
-
-/* ----------
- * exec_stmt_foreach_a			Loop over elements or slices of an array
- *
- * When looping over elements, the loop variable is the same type that the
- * array stores (eg: integer), when looping through slices, the loop variable
- * is an array of size and dimensions to match the size of the slice.
- * ----------
- */
-static int
-exec_stmt_foreach_a(PLMySQL_execstate *estate, PLMySQL_stmt_foreach_a *stmt)
-{
-	ArrayType  *arr;
-	Oid			arrtype;
-	int32		arrtypmod;
-	PLMySQL_datum *loop_var;
-	Oid			loop_var_elem_type;
-	bool		found = false;
-	int			rc = PLMYSQL_RC_OK;
-	MemoryContext stmt_mcontext;
-	MemoryContext oldcontext;
-	ArrayIterator array_iterator;
-	Oid			iterator_result_type;
-	int32		iterator_result_typmod;
-	Datum		value;
-	bool		isnull;
-
-	/* get the value of the array expression */
-	value = exec_eval_expr(estate, stmt->expr, &isnull, &arrtype, &arrtypmod);
-	if (isnull)
-		ereport(ERROR,
-				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("FOREACH expression must not be null")));
-
-	/*
-	 * Do as much as possible of the code below in stmt_mcontext, to avoid any
-	 * leaks from called subroutines.  We need a private stmt_mcontext since
-	 * we'll be calling arbitrary statement code.
-	 */
-	stmt_mcontext = get_stmt_mcontext(estate);
-	push_stmt_mcontext(estate);
-	oldcontext = MemoryContextSwitchTo(stmt_mcontext);
-
-	/* check the type of the expression - must be an array */
-	if (!OidIsValid(get_element_type(arrtype)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("FOREACH expression must yield an array, not type %s",
-						format_type_be(arrtype))));
-
-	/*
-	 * We must copy the array into stmt_mcontext, else it will disappear in
-	 * exec_eval_cleanup.  This is annoying, but cleanup will certainly happen
-	 * while running the loop body, so we have little choice.
-	 */
-	arr = DatumGetArrayTypePCopy(value);
-
-	/* Clean up any leftover temporary memory */
-	exec_eval_cleanup(estate);
-
-	/* Slice dimension must be less than or equal to array dimension */
-	if (stmt->slice < 0 || stmt->slice > ARR_NDIM(arr))
-		ereport(ERROR,
-				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
-				 errmsg("slice dimension (%d) is out of the valid range 0..%d",
-						stmt->slice, ARR_NDIM(arr))));
-
-	/* Set up the loop variable and see if it is of an array type */
-	loop_var = estate->datums[stmt->varno];
-	if (loop_var->dtype == PLMYSQL_DTYPE_REC ||
-		loop_var->dtype == PLMYSQL_DTYPE_ROW)
-	{
-		/*
-		 * Record/row variable is certainly not of array type, and might not
-		 * be initialized at all yet, so don't try to get its type
-		 */
-		loop_var_elem_type = InvalidOid;
-	}
-	else
-		loop_var_elem_type = get_element_type(plmysql_exec_get_datum_type(estate,
-																		  loop_var));
-
-	/*
-	 * Sanity-check the loop variable type.  We don't try very hard here, and
-	 * should not be too picky since it's possible that exec_assign_value can
-	 * coerce values of different types.  But it seems worthwhile to complain
-	 * if the array-ness of the loop variable is not right.
-	 */
-	if (stmt->slice > 0 && loop_var_elem_type == InvalidOid)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("FOREACH ... SLICE loop variable must be of an array type")));
-	if (stmt->slice == 0 && loop_var_elem_type != InvalidOid)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("FOREACH loop variable must not be of an array type")));
-
-	/* Create an iterator to step through the array */
-	array_iterator = array_create_iterator(arr, stmt->slice, NULL);
-
-	/* Identify iterator result type */
-	if (stmt->slice > 0)
-	{
-		/* When slicing, nominal type of result is same as array type */
-		iterator_result_type = arrtype;
-		iterator_result_typmod = arrtypmod;
-	}
-	else
-	{
-		/* Without slicing, results are individual array elements */
-		iterator_result_type = ARR_ELEMTYPE(arr);
-		iterator_result_typmod = arrtypmod;
-	}
-
-	/* Iterate over the array elements or slices */
-	while (array_iterate(array_iterator, &value, &isnull))
-	{
-		found = true;			/* looped at least once */
-
-		/* exec_assign_value and exec_stmts must run in the main context */
-		MemoryContextSwitchTo(oldcontext);
-
-		/* Assign current element/slice to the loop variable */
-		exec_assign_value(estate, loop_var, value, isnull,
-						  iterator_result_type, iterator_result_typmod);
-
-		/* In slice case, value is temporary; must free it to avoid leakage */
-		if (stmt->slice > 0)
-			pfree(DatumGetPointer(value));
-
-		/*
-		 * Execute the statements
-		 */
-		rc = exec_stmts(estate, stmt->body);
-
-		LOOP_RC_PROCESSING(stmt->label, break);
-
-		MemoryContextSwitchTo(stmt_mcontext);
-	}
-
-	/* Restore memory context state */
-	MemoryContextSwitchTo(oldcontext);
-	pop_stmt_mcontext(estate);
-
-	/* Release temporary memory, including the array value */
-	MemoryContextReset(stmt_mcontext);
-
-	/*
-	 * Set the FOUND variable to indicate the result of executing the loop
-	 * (namely, whether we looped one or more times). This must be set here so
-	 * that it does not interfere with the value of the FOUND variable inside
-	 * the loop processing itself.
-	 */
-	exec_set_found(estate, found);
 
 	return rc;
 }
@@ -5097,36 +4547,6 @@ exec_stmt_dynexecute(PLMySQL_execstate *estate,
 
 
 /* ----------
- * exec_stmt_dynfors			Execute a dynamic query, assign each
- *					tuple to a record or row and
- *					execute a group of statements
- *					for it.
- * ----------
- */
-static int
-exec_stmt_dynfors(PLMySQL_execstate *estate, PLMySQL_stmt_dynfors *stmt)
-{
-	Portal		portal;
-	int			rc;
-
-	portal = exec_dynquery_with_params(estate, stmt->query, stmt->params,
-									   NULL, CURSOR_OPT_NO_SCROLL);
-
-	/*
-	 * Execute the loop
-	 */
-	rc = exec_for_query(estate, (PLMySQL_stmt_forq *) stmt, portal, true);
-
-	/*
-	 * Close the implicit cursor
-	 */
-	SPI_cursor_close(portal);
-
-	return rc;
-}
-
-
-/* ----------
  * exec_stmt_open			Execute an OPEN cursor statement
  * ----------
  */
@@ -6322,167 +5742,6 @@ exec_run_select(PLMySQL_execstate *estate,
 
 	return rc;
 }
-
-
-/*
- * exec_for_query --- execute body of FOR loop for each row from a portal
- *
- * Used by exec_stmt_fors, exec_stmt_forc and exec_stmt_dynfors
- */
-static int
-exec_for_query(PLMySQL_execstate *estate, PLMySQL_stmt_forq *stmt,
-			   Portal portal, bool prefetch_ok)
-{
-	PLMySQL_variable *var;
-	SPITupleTable *tuptab;
-	bool		found = false;
-	int			rc = PLMYSQL_RC_OK;
-	uint64		previous_id = INVALID_TUPLEDESC_IDENTIFIER;
-	bool		tupdescs_match = true;
-	uint64		n;
-
-	/* Fetch loop variable's datum entry */
-	var = (PLMySQL_variable *) estate->datums[stmt->var->dno];
-
-	/*
-	 * Make sure the portal doesn't get closed by the user statements we
-	 * execute.
-	 */
-	PinPortal(portal);
-
-	/*
-	 * In a non-atomic context, we dare not prefetch, even if it would
-	 * otherwise be safe.  Aside from any semantic hazards that that might
-	 * create, if we prefetch toasted data and then the user commits the
-	 * transaction, the toast references could turn into dangling pointers.
-	 * (Rows we haven't yet fetched from the cursor are safe, because the
-	 * PersistHoldablePortal mechanism handles this scenario.)
-	 */
-	if (!estate->atomic)
-		prefetch_ok = false;
-
-	/*
-	 * Fetch the initial tuple(s).  If prefetching is allowed then we grab a
-	 * few more rows to avoid multiple trips through executor startup
-	 * overhead.
-	 */
-	SPI_cursor_fetch(portal, true, prefetch_ok ? 10 : 1);
-	tuptab = SPI_tuptable;
-	n = SPI_processed;
-
-	/*
-	 * If the query didn't return any rows, set the target to NULL and fall
-	 * through with found = false.
-	 */
-	if (n == 0)
-	{
-		exec_move_row(estate, var, NULL, tuptab->tupdesc);
-		exec_eval_cleanup(estate);
-	}
-	else
-		found = true;			/* processed at least one tuple */
-
-	/*
-	 * Now do the loop
-	 */
-	while (n > 0)
-	{
-		uint64		i;
-
-		for (i = 0; i < n; i++)
-		{
-			/*
-			 * Assign the tuple to the target.  Here, because we know that all
-			 * loop iterations should be assigning the same tupdesc, we can
-			 * optimize away repeated creations of expanded records with
-			 * identical tupdescs.  Testing for changes of er_tupdesc_id is
-			 * reliable even if the loop body contains assignments that
-			 * replace the target's value entirely, because it's assigned from
-			 * a process-global counter.  The case where the tupdescs don't
-			 * match could possibly be handled more efficiently than this
-			 * coding does, but it's not clear extra effort is worthwhile.
-			 */
-			if (var->dtype == PLMYSQL_DTYPE_REC)
-			{
-				PLMySQL_rec *rec = (PLMySQL_rec *) var;
-
-				if (rec->erh &&
-					rec->erh->er_tupdesc_id == previous_id &&
-					tupdescs_match)
-				{
-					/* Only need to assign a new tuple value */
-					expanded_record_set_tuple(rec->erh, tuptab->vals[i],
-											  true, !estate->atomic);
-				}
-				else
-				{
-					/*
-					 * First time through, or var's tupdesc changed in loop,
-					 * or we have to do it the hard way because type coercion
-					 * is needed.
-					 */
-					exec_move_row(estate, var,
-								  tuptab->vals[i], tuptab->tupdesc);
-
-					/*
-					 * Check to see if physical assignment is OK next time.
-					 * Once the tupdesc comparison has failed once, we don't
-					 * bother rechecking in subsequent loop iterations.
-					 */
-					if (tupdescs_match)
-					{
-						tupdescs_match =
-							(rec->rectypeid == RECORDOID ||
-							 rec->rectypeid == tuptab->tupdesc->tdtypeid ||
-							 compatible_tupdescs(tuptab->tupdesc,
-												 expanded_record_get_tupdesc(rec->erh)));
-					}
-					previous_id = rec->erh->er_tupdesc_id;
-				}
-			}
-			else
-				exec_move_row(estate, var, tuptab->vals[i], tuptab->tupdesc);
-
-			exec_eval_cleanup(estate);
-
-			/*
-			 * Execute the statements
-			 */
-			rc = exec_stmts(estate, stmt->body);
-
-			LOOP_RC_PROCESSING(stmt->label, goto loop_exit);
-		}
-
-		SPI_freetuptable(tuptab);
-
-		/*
-		 * Fetch more tuples.  If prefetching is allowed, grab 50 at a time.
-		 */
-		SPI_cursor_fetch(portal, true, prefetch_ok ? 50 : 1);
-		tuptab = SPI_tuptable;
-		n = SPI_processed;
-	}
-
-loop_exit:
-
-	/*
-	 * Release last group of tuples (if any)
-	 */
-	SPI_freetuptable(tuptab);
-
-	UnpinPortal(portal);
-
-	/*
-	 * Set the FOUND variable to indicate the result of executing the loop
-	 * (namely, whether we looped one or more times). This must be set last so
-	 * that it does not interfere with the value of the FOUND variable inside
-	 * the loop processing itself.
-	 */
-	exec_set_found(estate, found);
-
-	return rc;
-}
-
 
 /* ----------
  * exec_eval_simple_expr -		Evaluate a simple expression returning

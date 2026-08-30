@@ -124,12 +124,21 @@ def run(cluster):
          "ELSE 3 END; NULL; END"),
         ("IF nested in IF",
          "BEGIN IF 1 = 1 THEN IF 2 = 2 THEN NULL; END IF; ELSE NULL; END IF; NULL; END"),
-        # plpgsql 风格的 WHILE/FOR：WHILE 与 LOOP 相邻出现，只有一个 END LOOP
+        # plpgsql 风格的 WHILE：WHILE 与 LOOP 相邻出现，只有一个 END LOOP。
+        # plmysql 的 stmt_while 同时保留 MySQL 拼写（WHILE..DO..END WHILE）和
+        # 这种 plpgsql 拼写，两者都编译得过。
         ("WHILE..LOOP (plpgsql)",
          "BEGIN WHILE 1 = 0 LOOP NULL; END LOOP; NULL; END"),
-        ("FOR..LOOP (plpgsql)",
-         "BEGIN FOR i IN 1..3 LOOP NULL; END LOOP; NULL; END"),
     ])
+
+    # plpgsql 风格的 FOR..LOOP：整数范围/游标/查询 FOR 循环不是 MySQL 语法，
+    # 存储过程兼容性清理已经把它从 plmysql 语法里关掉（不像 WHILE 那样保留双
+    # 拼写），所以这里必须 validate=False 才能编译过——这条用例钉的是 mys_gram.y
+    # 外层原文捕获层对 LOOP/END LOOP 嵌套配对的计数，不是 plmysql 能不能跑 FOR。
+    _check_bodies(cluster, [
+        ("FOR..LOOP (plpgsql, capture-only)",
+         "BEGIN FOR i IN 1..3 LOOP NULL; END LOOP; NULL; END"),
+    ], validate=False)
 
     # ------------------------------------- 语句形式 IF：条件的形状不应影响判定
     #

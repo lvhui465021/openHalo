@@ -110,9 +110,8 @@ static	PLMySQL_stmt	*make_execsql_stmt(int firsttoken, int location,
 										   PLword *word);
 static	void			mysql_check_dynamic_sql_context(int firsttoken,
 													  PLword *word, int location);
+static	void			mysql_check_transaction_context(int location);
 static	PLMySQL_stmt_fetch *read_fetch_direction(void);
-static	void			 complete_direction(PLMySQL_stmt_fetch *fetch,
-											bool *check_FROM);
 static	PLMySQL_stmt	*make_return_stmt(int location);
 static	PLMySQL_stmt	*make_return_next_stmt(int location);
 static	PLMySQL_stmt	*make_return_query_stmt(int location);
@@ -125,9 +124,6 @@ static	void			 read_into_target(PLMySQL_variable **target,
 static	PLMySQL_row		*read_into_scalar_list(char *initial_name,
 											   PLMySQL_datum *initial_datum,
 											   int initial_location);
-static	PLMySQL_row		*make_scalar_list1(char *initial_name,
-										   PLMySQL_datum *initial_datum,
-										   int lineno, int location);
 static	void			 check_sql_expr(const char *stmt,
 										RawParseMode parseMode, int location);
 static	void			 plmysql_sql_error_callback(void *arg);
@@ -204,16 +200,12 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %type <dtype>	decl_datatype
 
 %type <expr>	expr_until_semi
-%type <expr>	expr_until_then expr_until_loop opt_expr_until_when
+%type <expr>	expr_until_then opt_expr_until_when
 %type <expr>	expr_until_end mysql_while_cond
 %type <expr>	decl_cursor_query
 %type <expr>	opt_exitcond
 
 %type <var>		cursor_variable
-%type <forvariable>	for_variable
-%type <ival>	foreach_slice
-%type <stmt>	for_control
-
 %type <str>		any_identifier opt_block_label opt_loop_label opt_label
 %type <str>		option_value
 
@@ -222,10 +214,10 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %type <stmt>	proc_stmt pl_block
 %type <stmt>	stmt_assign stmt_if stmt_loop stmt_while stmt_exit
 %type <stmt>	stmt_return stmt_execsql
-%type <stmt>	stmt_dynexecute stmt_for stmt_call stmt_getdiag
-%type <stmt>	stmt_open stmt_fetch stmt_move stmt_close stmt_null
+%type <stmt>	stmt_dynexecute stmt_call stmt_getdiag
+%type <stmt>	stmt_open stmt_fetch stmt_close stmt_null
 %type <stmt>	stmt_commit stmt_rollback
-%type <stmt>	stmt_case stmt_foreach_a
+%type <stmt>	stmt_case
 %type <stmt>	stmt_repeat stmt_leave stmt_iterate set_item
 %type <stmt>	stmt_signal
 %type <condition> condition_value
@@ -243,10 +235,7 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
  */
 %type <list>	stmt_set set_assign_list
 
-%type <list>	proc_exceptions
 %type <exception_block> exception_sect
-%type <exception>	proc_exception
-%type <condition>	proc_conditions proc_condition
 
 %type <casewhen>	case_when
 %type <list>	case_when_list opt_case_else
@@ -291,13 +280,8 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
  * see pl_scanner.c for info.  Be sure unreserved keywords are listed
  * in the "unreserved_keyword" production below.
  */
-%token <keyword>	K_ABSOLUTE
-%token <keyword>	K_ALL
 %token <keyword>	K_AND
-%token <keyword>	K_ARRAY
-%token <keyword>	K_BACKWARD
 %token <keyword>	K_BEGIN
-%token <keyword>	K_BY
 %token <keyword>	K_CALL
 %token <keyword>	K_CASE
 %token <keyword>	K_CHAIN
@@ -331,10 +315,15 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %token <keyword>	K_EXECUTE
 %token <keyword>	K_EXIT
 %token <keyword>	K_FETCH
-%token <keyword>	K_FIRST
 %token <keyword>	K_FOR
+/*
+ * K_FOREACH is deliberately kept as a reserved keyword token with no
+ * grammar production (FOREACH..IN ARRAY is plpgsql-only, not MySQL syntax).
+ * Removing the token entirely would make "foreach" a plain identifier,
+ * letting a FOREACH statement silently fall through to stmt_execsql's
+ * generic T_WORD passthrough instead of failing with a clear syntax error.
+ */
 %token <keyword>	K_FOREACH
-%token <keyword>	K_FORWARD
 %token <keyword>	K_FROM
 %token <keyword>	K_GET
 %token <keyword>	K_HANDLER
@@ -347,14 +336,20 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %token <keyword>	K_INTO
 %token <keyword>	K_IS
 %token <keyword>	K_ITERATE
-%token <keyword>	K_LAST
 %token <keyword>	K_LEAVE
 %token <keyword>	K_LOG
 %token <keyword>	K_LOOP
 %token <keyword>	K_MESSAGE
 %token <keyword>	K_MESSAGE_TEXT
-%token <keyword>	K_MYSQL_ERRNO
+/*
+ * K_MOVE is likewise kept reserved with no production: PostgreSQL's own SQL
+ * grammar has a real top-level "MOVE cursor_name" statement, so demoting
+ * "move" to a plain identifier would make MOVE compile via stmt_execsql's
+ * passthrough (and actually execute as PG's MOVE) instead of erroring --
+ * MySQL cursors are not scrollable/movable and MOVE is not MySQL syntax.
+ */
 %token <keyword>	K_MOVE
+%token <keyword>	K_MYSQL_ERRNO
 %token <keyword>	K_NEXT
 %token <keyword>	K_NO
 %token <keyword>	K_NOT
@@ -363,29 +358,19 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %token <keyword>	K_OPEN
 %token <keyword>	K_OPTION
 %token <keyword>	K_OR
-%token <keyword>	K_PG_CONTEXT
-%token <keyword>	K_PG_DATATYPE_NAME
-%token <keyword>	K_PG_EXCEPTION_CONTEXT
-%token <keyword>	K_PG_EXCEPTION_DETAIL
-%token <keyword>	K_PG_EXCEPTION_HINT
 %token <keyword>	K_PRINT_STRICT_PARAMS
-%token <keyword>	K_PRIOR
 %token <keyword>	K_QUERY
-%token <keyword>	K_RELATIVE
 %token <keyword>	K_REPEAT
 %token <keyword>	K_RESIGNAL
 %token <keyword>	K_RETURN
 %token <keyword>	K_RETURNED_SQLSTATE
-%token <keyword>	K_REVERSE
 %token <keyword>	K_ROLLBACK
 %token <keyword>	K_ROW_COUNT
 %token <keyword>	K_ROWTYPE
 %token <keyword>	K_SCHEMA
 %token <keyword>	K_SCHEMA_NAME
-%token <keyword>	K_SCROLL
 %token <keyword>	K_SET
 %token <keyword>	K_SIGNAL
-%token <keyword>	K_SLICE
 %token <keyword>	K_SQLEXCEPTION
 %token <keyword>	K_SQLSTATE
 %token <keyword>	K_SQLWARNING
@@ -980,10 +965,6 @@ proc_stmt		: pl_block ';'
 						{ $$ = $1; }
 				| stmt_iterate
 						{ $$ = $1; }
-				| stmt_for
-						{ $$ = $1; }
-				| stmt_foreach_a
-						{ $$ = $1; }
 				| stmt_exit
 						{ $$ = $1; }
 				| stmt_signal
@@ -1001,8 +982,6 @@ proc_stmt		: pl_block ';'
 				| stmt_open
 						{ $$ = $1; }
 				| stmt_fetch
-						{ $$ = $1; }
-				| stmt_move
 						{ $$ = $1; }
 				| stmt_close
 						{ $$ = $1; }
@@ -1369,26 +1348,11 @@ getdiag_item :
 										   K_ROW_COUNT, "row_count"))
 							$$ = PLMYSQL_GETDIAG_ROW_COUNT;
 						else if (tok_is_keyword(tok, &yylval,
-												K_PG_CONTEXT, "pg_context"))
-							$$ = PLMYSQL_GETDIAG_CONTEXT;
-						else if (tok_is_keyword(tok, &yylval,
-												K_PG_EXCEPTION_DETAIL, "pg_exception_detail"))
-							$$ = PLMYSQL_GETDIAG_ERROR_DETAIL;
-						else if (tok_is_keyword(tok, &yylval,
-												K_PG_EXCEPTION_HINT, "pg_exception_hint"))
-							$$ = PLMYSQL_GETDIAG_ERROR_HINT;
-						else if (tok_is_keyword(tok, &yylval,
-												K_PG_EXCEPTION_CONTEXT, "pg_exception_context"))
-							$$ = PLMYSQL_GETDIAG_ERROR_CONTEXT;
-						else if (tok_is_keyword(tok, &yylval,
 												K_COLUMN_NAME, "column_name"))
 							$$ = PLMYSQL_GETDIAG_COLUMN_NAME;
 						else if (tok_is_keyword(tok, &yylval,
 												K_CONSTRAINT_NAME, "constraint_name"))
 							$$ = PLMYSQL_GETDIAG_CONSTRAINT_NAME;
-						else if (tok_is_keyword(tok, &yylval,
-												K_PG_DATATYPE_NAME, "pg_datatype_name"))
-							$$ = PLMYSQL_GETDIAG_DATATYPE_NAME;
 						else if (tok_is_keyword(tok, &yylval,
 												K_MESSAGE_TEXT, "message_text"))
 							$$ = PLMYSQL_GETDIAG_MESSAGE_TEXT;
@@ -1739,392 +1703,6 @@ stmt_iterate	: K_ITERATE any_identifier ';'
 					}
 				;
 
-stmt_for		: opt_loop_label K_FOR for_control loop_body
-					{
-						/* This runs after we've scanned the loop body */
-						if ($3->cmd_type == PLMYSQL_STMT_FORI)
-						{
-							PLMySQL_stmt_fori		*new;
-
-							new = (PLMySQL_stmt_fori *) $3;
-							new->lineno   = plmysql_location_to_lineno(@2);
-							new->label	  = $1;
-							new->body	  = $4.stmts;
-							$$ = (PLMySQL_stmt *) new;
-						}
-						else
-						{
-							PLMySQL_stmt_forq		*new;
-
-							Assert($3->cmd_type == PLMYSQL_STMT_FORS ||
-								   $3->cmd_type == PLMYSQL_STMT_FORC ||
-								   $3->cmd_type == PLMYSQL_STMT_DYNFORS);
-							/* forq is the common supertype of all three */
-							new = (PLMySQL_stmt_forq *) $3;
-							new->lineno   = plmysql_location_to_lineno(@2);
-							new->label	  = $1;
-							new->body	  = $4.stmts;
-							$$ = (PLMySQL_stmt *) new;
-						}
-
-						check_labels($1, $4.end_label, $4.end_label_location);
-						/* close namespace started in opt_loop_label */
-						plmysql_ns_pop();
-					}
-				;
-
-for_control		: for_variable K_IN
-					{
-						int			tok = yylex();
-						int			tokloc = yylloc;
-
-						if (tok == K_EXECUTE)
-						{
-							/* EXECUTE means it's a dynamic FOR loop */
-							PLMySQL_stmt_dynfors	*new;
-							PLMySQL_expr			*expr;
-							int						term;
-
-							expr = read_sql_expression2(K_LOOP, K_USING,
-														"LOOP or USING",
-														&term);
-
-							new = palloc0(sizeof(PLMySQL_stmt_dynfors));
-							new->cmd_type = PLMYSQL_STMT_DYNFORS;
-							new->stmtid	  = ++plmysql_curr_compile->nstatements;
-							if ($1.row)
-							{
-								new->var = (PLMySQL_variable *) $1.row;
-								check_assignable($1.row, @1);
-							}
-							else if ($1.scalar)
-							{
-								/* convert single scalar to list */
-								new->var = (PLMySQL_variable *)
-									make_scalar_list1($1.name, $1.scalar,
-													  $1.lineno, @1);
-								/* make_scalar_list1 did check_assignable */
-							}
-							else
-							{
-								ereport(ERROR,
-										(errcode(ERRCODE_DATATYPE_MISMATCH),
-										 errmsg("loop variable of loop over rows must be a record variable or list of scalar variables"),
-										 parser_errposition(@1)));
-							}
-							new->query = expr;
-
-							if (term == K_USING)
-							{
-								do
-								{
-									expr = read_sql_expression2(',', K_LOOP,
-																", or LOOP",
-																&term);
-									new->params = lappend(new->params, expr);
-								} while (term == ',');
-							}
-
-							$$ = (PLMySQL_stmt *) new;
-						}
-						else if (tok == T_DATUM &&
-								 yylval.wdatum.datum->dtype == PLMYSQL_DTYPE_VAR &&
-								 ((PLMySQL_var *) yylval.wdatum.datum)->datatype->typoid == REFCURSOROID)
-						{
-							/* It's FOR var IN cursor */
-							PLMySQL_stmt_forc	*new;
-							PLMySQL_var			*cursor = (PLMySQL_var *) yylval.wdatum.datum;
-
-							new = (PLMySQL_stmt_forc *) palloc0(sizeof(PLMySQL_stmt_forc));
-							new->cmd_type = PLMYSQL_STMT_FORC;
-							new->stmtid = ++plmysql_curr_compile->nstatements;
-							new->curvar = cursor->dno;
-
-							/* Should have had a single variable name */
-							if ($1.scalar && $1.row)
-								ereport(ERROR,
-										(errcode(ERRCODE_SYNTAX_ERROR),
-										 errmsg("cursor FOR loop must have only one target variable"),
-										 parser_errposition(@1)));
-
-							/* can't use an unbound cursor this way */
-							if (cursor->cursor_explicit_expr == NULL)
-								ereport(ERROR,
-										(errcode(ERRCODE_SYNTAX_ERROR),
-										 errmsg("cursor FOR loop must use a bound cursor variable"),
-										 parser_errposition(tokloc)));
-
-							/* collect cursor's parameters if any */
-							new->argquery = read_cursor_args(cursor,
-															 K_LOOP);
-
-							/* create loop's private RECORD variable */
-							new->var = (PLMySQL_variable *)
-								plmysql_build_record($1.name,
-													 $1.lineno,
-													 NULL,
-													 RECORDOID,
-													 true);
-
-							$$ = (PLMySQL_stmt *) new;
-						}
-						else
-						{
-							PLMySQL_expr	*expr1;
-							int				expr1loc;
-							bool			reverse = false;
-
-							/*
-							 * We have to distinguish between two
-							 * alternatives: FOR var IN a .. b and FOR
-							 * var IN query. Unfortunately this is
-							 * tricky, since the query in the second
-							 * form needn't start with a SELECT
-							 * keyword.  We use the ugly hack of
-							 * looking for two periods after the first
-							 * token. We also check for the REVERSE
-							 * keyword, which means it must be an
-							 * integer loop.
-							 */
-							if (tok_is_keyword(tok, &yylval,
-											   K_REVERSE, "reverse"))
-								reverse = true;
-							else
-								plmysql_push_back_token(tok);
-
-							/*
-							 * Read tokens until we see either a ".."
-							 * or a LOOP.  The text we read may be either
-							 * an expression or a whole SQL statement, so
-							 * we need to invoke read_sql_construct directly,
-							 * and tell it not to check syntax yet.
-							 */
-							expr1 = read_sql_construct(DOT_DOT,
-													   K_LOOP,
-													   0,
-													   "LOOP",
-													   RAW_PARSE_DEFAULT,
-													   true,
-													   false,
-													   &expr1loc,
-													   &tok);
-
-							if (tok == DOT_DOT)
-							{
-								/* Saw "..", so it must be an integer loop */
-								PLMySQL_expr		*expr2;
-								PLMySQL_expr		*expr_by;
-								PLMySQL_var			*fvar;
-								PLMySQL_stmt_fori	*new;
-
-								/*
-								 * Relabel first expression as an expression;
-								 * then we can check its syntax.
-								 */
-								expr1->parseMode = RAW_PARSE_PLPGSQL_EXPR;
-								check_sql_expr(expr1->query, expr1->parseMode,
-											   expr1loc);
-
-								/* Read and check the second one */
-								expr2 = read_sql_expression2(K_LOOP, K_BY,
-															 "LOOP",
-															 &tok);
-
-								/* Get the BY clause if any */
-								if (tok == K_BY)
-									expr_by = read_sql_expression(K_LOOP,
-																  "LOOP");
-								else
-									expr_by = NULL;
-
-								/* Should have had a single variable name */
-								if ($1.scalar && $1.row)
-									ereport(ERROR,
-											(errcode(ERRCODE_SYNTAX_ERROR),
-											 errmsg("integer FOR loop must have only one target variable"),
-											 parser_errposition(@1)));
-
-								/* create loop's private variable */
-								fvar = (PLMySQL_var *)
-									plmysql_build_variable($1.name,
-														   $1.lineno,
-														   plmysql_build_datatype(INT4OID,
-																				  -1,
-																				  InvalidOid,
-																				  NULL),
-														   true);
-
-								new = palloc0(sizeof(PLMySQL_stmt_fori));
-								new->cmd_type = PLMYSQL_STMT_FORI;
-								new->stmtid	  = ++plmysql_curr_compile->nstatements;
-								new->var	  = fvar;
-								new->reverse  = reverse;
-								new->lower	  = expr1;
-								new->upper	  = expr2;
-								new->step	  = expr_by;
-
-								$$ = (PLMySQL_stmt *) new;
-							}
-							else
-							{
-								/*
-								 * No "..", so it must be a query loop.
-								 */
-								PLMySQL_stmt_fors	*new;
-
-								if (reverse)
-									ereport(ERROR,
-											(errcode(ERRCODE_SYNTAX_ERROR),
-											 errmsg("cannot specify REVERSE in query FOR loop"),
-											 parser_errposition(tokloc)));
-
-								/* Check syntax as a regular query */
-								check_sql_expr(expr1->query, expr1->parseMode,
-											   expr1loc);
-
-								new = palloc0(sizeof(PLMySQL_stmt_fors));
-								new->cmd_type = PLMYSQL_STMT_FORS;
-								new->stmtid = ++plmysql_curr_compile->nstatements;
-								if ($1.row)
-								{
-									new->var = (PLMySQL_variable *) $1.row;
-									check_assignable($1.row, @1);
-								}
-								else if ($1.scalar)
-								{
-									/* convert single scalar to list */
-									new->var = (PLMySQL_variable *)
-										make_scalar_list1($1.name, $1.scalar,
-														  $1.lineno, @1);
-									/* make_scalar_list1 did check_assignable */
-								}
-								else
-								{
-									ereport(ERROR,
-											(errcode(ERRCODE_SYNTAX_ERROR),
-											 errmsg("loop variable of loop over rows must be a record variable or list of scalar variables"),
-											 parser_errposition(@1)));
-								}
-
-								new->query = expr1;
-								$$ = (PLMySQL_stmt *) new;
-							}
-						}
-					}
-				;
-
-/*
- * Processing the for_variable is tricky because we don't yet know if the
- * FOR is an integer FOR loop or a loop over query results.  In the former
- * case, the variable is just a name that we must instantiate as a loop
- * local variable, regardless of any other definition it might have.
- * Therefore, we always save the actual identifier into $$.name where it
- * can be used for that case.  We also save the outer-variable definition,
- * if any, because that's what we need for the loop-over-query case.  Note
- * that we must NOT apply check_assignable() or any other semantic check
- * until we know what's what.
- *
- * However, if we see a comma-separated list of names, we know that it
- * can't be an integer FOR loop and so it's OK to check the variables
- * immediately.  In particular, for T_WORD followed by comma, we should
- * complain that the name is not known rather than say it's a syntax error.
- * Note that the non-error result of this case sets *both* $$.scalar and
- * $$.row; see the for_control production.
- */
-for_variable	: T_DATUM
-					{
-						$$.name = NameOfDatum(&($1));
-						$$.lineno = plmysql_location_to_lineno(@1);
-						if ($1.datum->dtype == PLMYSQL_DTYPE_ROW ||
-							$1.datum->dtype == PLMYSQL_DTYPE_REC)
-						{
-							$$.scalar = NULL;
-							$$.row = $1.datum;
-						}
-						else
-						{
-							int			tok;
-
-							$$.scalar = $1.datum;
-							$$.row = NULL;
-							/* check for comma-separated list */
-							tok = yylex();
-							plmysql_push_back_token(tok);
-							if (tok == ',')
-								$$.row = (PLMySQL_datum *)
-									read_into_scalar_list($$.name,
-														  $$.scalar,
-														  @1);
-						}
-					}
-				| T_WORD
-					{
-						int			tok;
-
-						$$.name = $1.ident;
-						$$.lineno = plmysql_location_to_lineno(@1);
-						$$.scalar = NULL;
-						$$.row = NULL;
-						/* check for comma-separated list */
-						tok = yylex();
-						plmysql_push_back_token(tok);
-						if (tok == ',')
-							word_is_not_variable(&($1), @1);
-					}
-				| T_CWORD
-					{
-						/* just to give a better message than "syntax error" */
-						cword_is_not_variable(&($1), @1);
-					}
-				;
-
-stmt_foreach_a	: opt_loop_label K_FOREACH for_variable foreach_slice K_IN K_ARRAY expr_until_loop loop_body
-					{
-						PLMySQL_stmt_foreach_a *new;
-
-						new = palloc0(sizeof(PLMySQL_stmt_foreach_a));
-						new->cmd_type = PLMYSQL_STMT_FOREACH_A;
-						new->lineno = plmysql_location_to_lineno(@2);
-						new->stmtid = ++plmysql_curr_compile->nstatements;
-						new->label = $1;
-						new->slice = $4;
-						new->expr = $7;
-						new->body = $8.stmts;
-
-						if ($3.row)
-						{
-							new->varno = $3.row->dno;
-							check_assignable($3.row, @3);
-						}
-						else if ($3.scalar)
-						{
-							new->varno = $3.scalar->dno;
-							check_assignable($3.scalar, @3);
-						}
-						else
-						{
-							ereport(ERROR,
-									(errcode(ERRCODE_SYNTAX_ERROR),
-									 errmsg("loop variable of FOREACH must be a known variable or list of variables"),
-											 parser_errposition(@3)));
-						}
-
-						check_labels($1, $8.end_label, $8.end_label_location);
-						plmysql_ns_pop();
-
-						$$ = (PLMySQL_stmt *) new;
-					}
-				;
-
-foreach_slice	:
-					{
-						$$ = 0;
-					}
-				| K_SLICE ICONST
-					{
-						$$ = $2;
-					}
-				;
 
 stmt_exit		: exit_type opt_label opt_exitcond
 					{
@@ -2298,7 +1876,17 @@ stmt_dynexecute : K_EXECUTE
 stmt_open		: K_OPEN cursor_variable
 					{
 						PLMySQL_stmt_open *new;
-						int				  tok;
+
+						/*
+						 * MySQL's DECLARE CURSOR always binds a query at
+						 * declare time (no Oracle/plpgsql-style unbound
+						 * "OPEN c FOR ..." form, and no scrollable-cursor
+						 * options), so cursor_explicit_expr is always set
+						 * here; the "predefined cursor query" path below is
+						 * the only reachable one.  See the DECLARE CURSOR
+						 * comment in mysql_decl_stmt.
+						 */
+						Assert($2->cursor_explicit_expr != NULL);
 
 						new = palloc0(sizeof(PLMySQL_stmt_open));
 						new->cmd_type = PLMYSQL_STMT_OPEN;
@@ -2307,67 +1895,8 @@ stmt_open		: K_OPEN cursor_variable
 						new->curvar = $2->dno;
 						new->cursor_options = CURSOR_OPT_FAST_PLAN;
 
-						if ($2->cursor_explicit_expr == NULL)
-						{
-							/* be nice if we could use opt_scrollable here */
-							tok = yylex();
-							if (tok_is_keyword(tok, &yylval,
-											   K_NO, "no"))
-							{
-								tok = yylex();
-								if (tok_is_keyword(tok, &yylval,
-												   K_SCROLL, "scroll"))
-								{
-									new->cursor_options |= CURSOR_OPT_NO_SCROLL;
-									tok = yylex();
-								}
-							}
-							else if (tok_is_keyword(tok, &yylval,
-													K_SCROLL, "scroll"))
-							{
-								new->cursor_options |= CURSOR_OPT_SCROLL;
-								tok = yylex();
-							}
-
-							if (tok != K_FOR)
-								yyerror("syntax error, expected \"FOR\"");
-
-							tok = yylex();
-							if (tok == K_EXECUTE)
-							{
-								int		endtoken;
-
-								new->dynquery =
-									read_sql_expression2(K_USING, ';',
-														 "USING or ;",
-														 &endtoken);
-
-								/* If we found "USING", collect argument(s) */
-								if (endtoken == K_USING)
-								{
-									PLMySQL_expr *expr;
-
-									do
-									{
-										expr = read_sql_expression2(',', ';',
-																	", or ;",
-																	&endtoken);
-										new->params = lappend(new->params,
-															  expr);
-									} while (endtoken == ',');
-								}
-							}
-							else
-							{
-								plmysql_push_back_token(tok);
-								new->query = read_sql_stmt();
-							}
-						}
-						else
-						{
-							/* predefined cursor query, so read args */
-							new->argquery = read_cursor_args($2, ';');
-						}
+						/* MySQL cursors take no arguments */
+						new->argquery = read_cursor_args($2, ';');
 
 						$$ = (PLMySQL_stmt *)new;
 					}
@@ -2403,18 +1932,6 @@ stmt_fetch		: K_FETCH opt_fetch_direction cursor_variable K_INTO
 					}
 				;
 
-stmt_move		: K_MOVE opt_fetch_direction cursor_variable ';'
-					{
-						PLMySQL_stmt_fetch *fetch = $2;
-
-						fetch->lineno = plmysql_location_to_lineno(@1);
-						fetch->curvar	= $3->dno;
-						fetch->is_move	= true;
-
-						$$ = (PLMySQL_stmt *)fetch;
-					}
-				;
-
 opt_fetch_direction	:
 					{
 						$$ = read_fetch_direction();
@@ -2435,6 +1952,12 @@ stmt_close		: K_CLOSE cursor_variable ';'
 					}
 				;
 
+/*
+ * A bare "NULL;" no-op statement is not MySQL syntax, but unlike the
+ * plpgsql-only constructs stripped elsewhere in this cleanup, it cannot
+ * diverge from MySQL semantics (a no-op is a no-op), and plmysql's own test
+ * suite uses it pervasively as inert filler.  Kept as a harmless superset.
+ */
 stmt_null		: K_NULL ';'
 					{
 						/* We do not bother building a node for NULL */
@@ -2445,6 +1968,8 @@ stmt_null		: K_NULL ';'
 stmt_commit		: K_COMMIT opt_transaction_chain ';'
 					{
 						PLMySQL_stmt_commit *new;
+
+						mysql_check_transaction_context(@1);
 
 						new = palloc(sizeof(PLMySQL_stmt_commit));
 						new->cmd_type = PLMYSQL_STMT_COMMIT;
@@ -2459,6 +1984,8 @@ stmt_commit		: K_COMMIT opt_transaction_chain ';'
 stmt_rollback	: K_ROLLBACK opt_transaction_chain ';'
 					{
 						PLMySQL_stmt_rollback *new;
+
+						mysql_check_transaction_context(@1);
 
 						new = palloc(sizeof(PLMySQL_stmt_rollback));
 						new->cmd_type = PLMYSQL_STMT_ROLLBACK;
@@ -2511,122 +2038,15 @@ cursor_variable	: T_DATUM
 					}
 				;
 
+/*
+ * MySQL has no plpgsql-style "EXCEPTION WHEN cond THEN ..." clause on a
+ * BEGIN...END block -- error handling is exclusively DECLARE HANDLER (see
+ * mysql_decl_stmt).  exception_sect is therefore always empty; PLMySQL_stmt_
+ * block's exceptions field stays NULL and only its handlers field (built by
+ * DECLARE HANDLER) carries condition actions.
+ */
 exception_sect	:
 					{ $$ = NULL; }
-				| K_EXCEPTION
-					{
-						/*
-						 * We use a mid-rule action to add these
-						 * special variables to the namespace before
-						 * parsing the WHEN clauses themselves.  The
-						 * scope of the names extends to the end of the
-						 * current block.
-						 */
-						int			lineno = plmysql_location_to_lineno(@1);
-						PLMySQL_exception_block *new = palloc(sizeof(PLMySQL_exception_block));
-						PLMySQL_variable *var;
-
-						var = plmysql_build_variable("sqlstate", lineno,
-													 plmysql_build_datatype(TEXTOID,
-																			-1,
-																			plmysql_curr_compile->fn_input_collation,
-																			NULL),
-													 true);
-						var->isconst = true;
-						new->sqlstate_varno = var->dno;
-
-						var = plmysql_build_variable("sqlerrm", lineno,
-													 plmysql_build_datatype(TEXTOID,
-																			-1,
-																			plmysql_curr_compile->fn_input_collation,
-																			NULL),
-													 true);
-						var->isconst = true;
-						new->sqlerrm_varno = var->dno;
-
-						$<exception_block>$ = new;
-					}
-					proc_exceptions
-					{
-						PLMySQL_exception_block *new = $<exception_block>2;
-						new->exc_list = $3;
-
-						$$ = new;
-					}
-				;
-
-proc_exceptions	: proc_exceptions proc_exception
-						{
-							$$ = lappend($1, $2);
-						}
-				| proc_exception
-						{
-							$$ = list_make1($1);
-						}
-				;
-
-proc_exception	: K_WHEN proc_conditions K_THEN proc_sect
-					{
-						PLMySQL_exception *new;
-
-						new = palloc0(sizeof(PLMySQL_exception));
-						new->lineno = plmysql_location_to_lineno(@1);
-						new->conditions = $2;
-						new->action = $4;
-
-						$$ = new;
-					}
-				;
-
-proc_conditions	: proc_conditions K_OR proc_condition
-						{
-							PLMySQL_condition	*old;
-
-							for (old = $1; old->next != NULL; old = old->next)
-								/* skip */ ;
-							old->next = $3;
-							$$ = $1;
-						}
-				| proc_condition
-						{
-							$$ = $1;
-						}
-				;
-
-proc_condition	: any_identifier
-						{
-							if (strcmp($1, "sqlstate") != 0)
-							{
-								$$ = plmysql_parse_err_condition($1);
-							}
-							else
-							{
-								PLMySQL_condition *new;
-								char   *sqlstatestr;
-
-								/* next token should be a string literal */
-								if (yylex() != SCONST)
-									yyerror("syntax error");
-								sqlstatestr = yylval.str;
-
-								if (strlen(sqlstatestr) != 5)
-									yyerror("invalid SQLSTATE code");
-								if (strspn(sqlstatestr, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") != 5)
-									yyerror("invalid SQLSTATE code");
-
-								new = palloc(sizeof(PLMySQL_condition));
-								new->sqlerrstate =
-									MAKE_SQLSTATE(sqlstatestr[0],
-												  sqlstatestr[1],
-												  sqlstatestr[2],
-												  sqlstatestr[3],
-												  sqlstatestr[4]);
-								new->condname = sqlstatestr;
-								new->next = NULL;
-
-								$$ = new;
-							}
-						}
 				;
 
 expr_until_semi :
@@ -2635,10 +2055,6 @@ expr_until_semi :
 
 expr_until_then :
 					{ $$ = read_sql_expression(K_THEN, "THEN"); }
-				;
-
-expr_until_loop :
-					{ $$ = read_sql_expression(K_LOOP, "LOOP"); }
 				;
 
 opt_block_label	:
@@ -2728,10 +2144,7 @@ any_identifier	: T_WORD
 				;
 
 unreserved_keyword	:
-				K_ABSOLUTE
-				| K_AND
-				| K_ARRAY
-				| K_BACKWARD
+				K_AND
 				| K_CALL
 				| K_CHAIN
 				| K_CLOSE
@@ -2756,43 +2169,29 @@ unreserved_keyword	:
 				| K_ERROR
 				| K_EXCEPTION
 				| K_FETCH
-				| K_FIRST
-				| K_FORWARD
 				| K_GET
 				| K_HINT
 				| K_IMPORT
 				| K_INFO
 				| K_INSERT
 				| K_IS
-				| K_LAST
 				| K_LOG
 				| K_MESSAGE
 				| K_MESSAGE_TEXT
-				| K_MOVE
 				| K_NEXT
 				| K_NO
 				| K_NOTICE
 				| K_OPEN
 				| K_OPTION
-				| K_PG_CONTEXT
-				| K_PG_DATATYPE_NAME
-				| K_PG_EXCEPTION_CONTEXT
-				| K_PG_EXCEPTION_DETAIL
-				| K_PG_EXCEPTION_HINT
 				| K_PRINT_STRICT_PARAMS
-				| K_PRIOR
 				| K_QUERY
-				| K_RELATIVE
 				| K_RETURN
 				| K_RETURNED_SQLSTATE
-				| K_REVERSE
 				| K_ROLLBACK
 				| K_ROW_COUNT
 				| K_ROWTYPE
 				| K_SCHEMA
 				| K_SCHEMA_NAME
-				| K_SCROLL
-				| K_SLICE
 				| K_STACKED
 				| K_TABLE
 				| K_TABLE_NAME
@@ -3386,6 +2785,27 @@ mysql_check_dynamic_sql_context(int firsttoken, PLword *word, int location)
 			 parser_errposition(location)));
 }
 
+/*
+ * MySQL allows explicit COMMIT/ROLLBACK inside a stored PROCEDURE, but
+ * rejects them while a stored FUNCTION or TRIGGER is being compiled
+ * (ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG).  Unlike PostgreSQL's plpgsql, which
+ * this grammar was cloned from and which allows COMMIT/ROLLBACK in any
+ * procedure-language routine, MySQL draws this line at the routine kind.
+ */
+static void
+mysql_check_transaction_context(int location)
+{
+	if (plmysql_curr_compile->fn_prokind != PROKIND_FUNCTION &&
+		plmysql_curr_compile->fn_is_trigger == PLMYSQL_NOT_TRIGGER)
+		return;
+
+	mysSetPendingMySQLErrno(1422); /* ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG */
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("Explicit or implicit commit is not allowed in stored function or trigger"),
+			 parser_errposition(location)));
+}
+
 
 /*
  * Read FETCH or MOVE direction clause (everything through FROM/IN).
@@ -3395,16 +2815,16 @@ read_fetch_direction(void)
 {
 	PLMySQL_stmt_fetch *fetch;
 	int			tok;
-	bool		check_FROM = true;
 
 	/*
-	 * We create the PLMySQL_stmt_fetch struct here, but only fill in
-	 * the fields arising from the optional direction clause
+	 * MySQL's FETCH syntax is "FETCH [[NEXT] FROM] cursor_name INTO
+	 * var_name [, var_name] ...".  Cursors are forward-only and
+	 * non-scrollable, so unlike plpgsql there is no PRIOR/FIRST/LAST/
+	 * ABSOLUTE/RELATIVE/FORWARD/BACKWARD/ALL direction and no row count.
 	 */
 	fetch = (PLMySQL_stmt_fetch *) palloc0(sizeof(PLMySQL_stmt_fetch));
 	fetch->cmd_type = PLMYSQL_STMT_FETCH;
 	fetch->stmtid	= ++plmysql_curr_compile->nstatements;
-	/* set direction defaults: */
 	fetch->direction = FETCH_FORWARD;
 	fetch->how_many  = 1;
 	fetch->expr		 = NULL;
@@ -3417,136 +2837,23 @@ read_fetch_direction(void)
 	if (tok_is_keyword(tok, &yylval,
 					   K_NEXT, "next"))
 	{
-		/* use defaults */
+		/* "NEXT" must be followed by "FROM" */
+		tok = yylex();
+		if (tok != K_FROM)
+			yyerror("expected FROM");
 	}
-	else if (tok_is_keyword(tok, &yylval,
-							K_PRIOR, "prior"))
+	else if (tok == K_FROM)
 	{
-		fetch->direction = FETCH_BACKWARD;
-	}
-	else if (tok_is_keyword(tok, &yylval,
-							K_FIRST, "first"))
-	{
-		fetch->direction = FETCH_ABSOLUTE;
-	}
-	else if (tok_is_keyword(tok, &yylval,
-							K_LAST, "last"))
-	{
-		fetch->direction = FETCH_ABSOLUTE;
-		fetch->how_many  = -1;
-	}
-	else if (tok_is_keyword(tok, &yylval,
-							K_ABSOLUTE, "absolute"))
-	{
-		fetch->direction = FETCH_ABSOLUTE;
-		fetch->expr = read_sql_expression2(K_FROM, K_IN,
-										   "FROM or IN",
-										   NULL);
-		check_FROM = false;
-	}
-	else if (tok_is_keyword(tok, &yylval,
-							K_RELATIVE, "relative"))
-	{
-		fetch->direction = FETCH_RELATIVE;
-		fetch->expr = read_sql_expression2(K_FROM, K_IN,
-										   "FROM or IN",
-										   NULL);
-		check_FROM = false;
-	}
-	else if (tok_is_keyword(tok, &yylval,
-							K_ALL, "all"))
-	{
-		fetch->how_many = FETCH_ALL;
-		fetch->returns_multiple_rows = true;
-	}
-	else if (tok_is_keyword(tok, &yylval,
-							K_FORWARD, "forward"))
-	{
-		complete_direction(fetch, &check_FROM);
-	}
-	else if (tok_is_keyword(tok, &yylval,
-							K_BACKWARD, "backward"))
-	{
-		fetch->direction = FETCH_BACKWARD;
-		complete_direction(fetch, &check_FROM);
-	}
-	else if (tok == K_FROM || tok == K_IN)
-	{
-		/* empty direction */
-		check_FROM = false;
-	}
-	else if (tok == T_DATUM)
-	{
-		/* Assume there's no direction clause and tok is a cursor name */
-		plmysql_push_back_token(tok);
-		check_FROM = false;
+		/* "FROM" with no preceding "NEXT" */
 	}
 	else
 	{
-		/*
-		 * Assume it's a count expression with no preceding keyword.
-		 * Note: we allow this syntax because core SQL does, but it's
-		 * ambiguous with the case of an omitted direction clause; for
-		 * instance, "MOVE n IN c" will fail if n is a variable, because the
-		 * preceding else-arm will trigger.  Perhaps this can be improved
-		 * someday, but it hardly seems worth a lot of work.
-		 */
+		/* no direction clause at all; tok is the cursor name */
 		plmysql_push_back_token(tok);
-		fetch->expr = read_sql_expression2(K_FROM, K_IN,
-										   "FROM or IN",
-										   NULL);
-		fetch->returns_multiple_rows = true;
-		check_FROM = false;
-	}
-
-	/* check FROM or IN keyword after direction's specification */
-	if (check_FROM)
-	{
-		tok = yylex();
-		if (tok != K_FROM && tok != K_IN)
-			yyerror("expected FROM or IN");
 	}
 
 	return fetch;
 }
-
-/*
- * Process remainder of FETCH/MOVE direction after FORWARD or BACKWARD.
- * Allows these cases:
- *   FORWARD expr,  FORWARD ALL,  FORWARD
- *   BACKWARD expr, BACKWARD ALL, BACKWARD
- */
-static void
-complete_direction(PLMySQL_stmt_fetch *fetch,  bool *check_FROM)
-{
-	int			tok;
-
-	tok = yylex();
-	if (tok == 0)
-		yyerror("unexpected end of function definition");
-
-	if (tok == K_FROM || tok == K_IN)
-	{
-		*check_FROM = false;
-		return;
-	}
-
-	if (tok == K_ALL)
-	{
-		fetch->how_many = FETCH_ALL;
-		fetch->returns_multiple_rows = true;
-		*check_FROM = true;
-		return;
-	}
-
-	plmysql_push_back_token(tok);
-	fetch->expr = read_sql_expression2(K_FROM, K_IN,
-									   "FROM or IN",
-									   NULL);
-	fetch->returns_multiple_rows = true;
-	*check_FROM = false;
-}
-
 
 static PLMySQL_stmt *
 make_return_stmt(int location)
@@ -3904,38 +3211,6 @@ read_into_scalar_list(char *initial_name,
 		row->fieldnames[nfields] = fieldnames[nfields];
 		row->varnos[nfields] = varnos[nfields];
 	}
-
-	plmysql_adddatum((PLMySQL_datum *)row);
-
-	return row;
-}
-
-/*
- * Convert a single scalar into a "row" list.  This is exactly
- * like read_into_scalar_list except we never consume any input.
- *
- * Note: lineno could be computed from location, but since callers
- * have it at hand already, we may as well pass it in.
- */
-static PLMySQL_row *
-make_scalar_list1(char *initial_name,
-				  PLMySQL_datum *initial_datum,
-				  int lineno, int location)
-{
-	PLMySQL_row		*row;
-
-	check_assignable(initial_datum, location);
-
-	row = palloc0(sizeof(PLMySQL_row));
-	row->dtype = PLMYSQL_DTYPE_ROW;
-	row->refname = "(unnamed row)";
-	row->lineno = lineno;
-	row->rowtupdesc = NULL;
-	row->nfields = 1;
-	row->fieldnames = palloc(sizeof(char *));
-	row->varnos = palloc(sizeof(int));
-	row->fieldnames[0] = initial_name;
-	row->varnos[0] = initial_datum->dno;
 
 	plmysql_adddatum((PLMySQL_datum *)row);
 
@@ -4668,13 +3943,9 @@ mysql_check_getdiag_items(PLMySQL_stmt_getdiag *stmt, int location)
 							 parser_errposition(location)));
 				break;
 			/* these fields are disallowed in current case */
-			case PLMYSQL_GETDIAG_ERROR_CONTEXT:
-			case PLMYSQL_GETDIAG_ERROR_DETAIL:
-			case PLMYSQL_GETDIAG_ERROR_HINT:
 			case PLMYSQL_GETDIAG_RETURNED_SQLSTATE:
 			case PLMYSQL_GETDIAG_COLUMN_NAME:
 			case PLMYSQL_GETDIAG_CONSTRAINT_NAME:
-			case PLMYSQL_GETDIAG_DATATYPE_NAME:
 			case PLMYSQL_GETDIAG_MESSAGE_TEXT:
 			case PLMYSQL_GETDIAG_TABLE_NAME:
 			case PLMYSQL_GETDIAG_SCHEMA_NAME:
@@ -4685,9 +3956,6 @@ mysql_check_getdiag_items(PLMySQL_stmt_getdiag *stmt, int location)
 							 errmsg("diagnostics item %s is not allowed in GET CURRENT DIAGNOSTICS",
 									plmysql_getdiag_kindname(ditem->kind)),
 							 parser_errposition(location)));
-				break;
-			/* these fields are allowed in either case */
-			case PLMYSQL_GETDIAG_CONTEXT:
 				break;
 		}
 	}

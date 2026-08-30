@@ -109,10 +109,6 @@ typedef enum PLMySQL_stmt_type
 	PLMYSQL_STMT_CASE,
 	PLMYSQL_STMT_LOOP,
 	PLMYSQL_STMT_WHILE,
-	PLMYSQL_STMT_FORI,
-	PLMYSQL_STMT_FORS,
-	PLMYSQL_STMT_FORC,
-	PLMYSQL_STMT_FOREACH_A,
 	PLMYSQL_STMT_EXIT,
 	PLMYSQL_STMT_RETURN,
 	PLMYSQL_STMT_RETURN_NEXT,
@@ -122,7 +118,6 @@ typedef enum PLMySQL_stmt_type
 	PLMYSQL_STMT_ASSERT,
 	PLMYSQL_STMT_EXECSQL,
 	PLMYSQL_STMT_DYNEXECUTE,
-	PLMYSQL_STMT_DYNFORS,
 	PLMYSQL_STMT_GETDIAG,
 	PLMYSQL_STMT_OPEN,
 	PLMYSQL_STMT_FETCH,
@@ -150,14 +145,9 @@ enum
 typedef enum PLMySQL_getdiag_kind
 {
 	PLMYSQL_GETDIAG_ROW_COUNT,
-	PLMYSQL_GETDIAG_CONTEXT,
-	PLMYSQL_GETDIAG_ERROR_CONTEXT,
-	PLMYSQL_GETDIAG_ERROR_DETAIL,
-	PLMYSQL_GETDIAG_ERROR_HINT,
 	PLMYSQL_GETDIAG_RETURNED_SQLSTATE,
 	PLMYSQL_GETDIAG_COLUMN_NAME,
 	PLMYSQL_GETDIAG_CONSTRAINT_NAME,
-	PLMYSQL_GETDIAG_DATATYPE_NAME,
 	PLMYSQL_GETDIAG_MESSAGE_TEXT,
 	PLMYSQL_GETDIAG_TABLE_NAME,
 	PLMYSQL_GETDIAG_SCHEMA_NAME,
@@ -710,100 +700,6 @@ typedef struct PLMySQL_stmt_while
 	PLMySQL_expr *cond;
 	List	   *body;			/* List of statements */
 } PLMySQL_stmt_while;
-
-/*
- * FOR statement with integer loopvar
- */
-typedef struct PLMySQL_stmt_fori
-{
-	PLMySQL_stmt_type cmd_type;
-	int			lineno;
-	unsigned int stmtid;
-	char	   *label;
-	PLMySQL_var *var;
-	PLMySQL_expr *lower;
-	PLMySQL_expr *upper;
-	PLMySQL_expr *step;			/* NULL means default (ie, BY 1) */
-	int			reverse;
-	List	   *body;			/* List of statements */
-} PLMySQL_stmt_fori;
-
-/*
- * PLMySQL_stmt_forq represents a FOR statement running over a SQL query.
- * It is the common supertype of PLMySQL_stmt_fors, PLMySQL_stmt_forc
- * and PLMySQL_stmt_dynfors.
- */
-typedef struct PLMySQL_stmt_forq
-{
-	PLMySQL_stmt_type cmd_type;
-	int			lineno;
-	unsigned int stmtid;
-	char	   *label;
-	PLMySQL_variable *var;		/* Loop variable (record or row) */
-	List	   *body;			/* List of statements */
-} PLMySQL_stmt_forq;
-
-/*
- * FOR statement running over SELECT
- */
-typedef struct PLMySQL_stmt_fors
-{
-	PLMySQL_stmt_type cmd_type;
-	int			lineno;
-	unsigned int stmtid;
-	char	   *label;
-	PLMySQL_variable *var;		/* Loop variable (record or row) */
-	List	   *body;			/* List of statements */
-	/* end of fields that must match PLMySQL_stmt_forq */
-	PLMySQL_expr *query;
-} PLMySQL_stmt_fors;
-
-/*
- * FOR statement running over cursor
- */
-typedef struct PLMySQL_stmt_forc
-{
-	PLMySQL_stmt_type cmd_type;
-	int			lineno;
-	unsigned int stmtid;
-	char	   *label;
-	PLMySQL_variable *var;		/* Loop variable (record or row) */
-	List	   *body;			/* List of statements */
-	/* end of fields that must match PLMySQL_stmt_forq */
-	int			curvar;
-	PLMySQL_expr *argquery;		/* cursor arguments if any */
-} PLMySQL_stmt_forc;
-
-/*
- * FOR statement running over EXECUTE
- */
-typedef struct PLMySQL_stmt_dynfors
-{
-	PLMySQL_stmt_type cmd_type;
-	int			lineno;
-	unsigned int stmtid;
-	char	   *label;
-	PLMySQL_variable *var;		/* Loop variable (record or row) */
-	List	   *body;			/* List of statements */
-	/* end of fields that must match PLMySQL_stmt_forq */
-	PLMySQL_expr *query;
-	List	   *params;			/* USING expressions */
-} PLMySQL_stmt_dynfors;
-
-/*
- * FOREACH item in array loop
- */
-typedef struct PLMySQL_stmt_foreach_a
-{
-	PLMySQL_stmt_type cmd_type;
-	int			lineno;
-	unsigned int stmtid;
-	char	   *label;
-	int			varno;			/* loop target variable */
-	int			slice;			/* slice dimension, or 0 */
-	PLMySQL_expr *expr;			/* array expression */
-	List	   *body;			/* List of statements */
-} PLMySQL_stmt_foreach_a;
 
 /*
  * OPEN a curvar
@@ -1367,7 +1263,6 @@ extern PLMySQL_recfield *plmysql_build_recfield(PLMySQL_rec *rec,
 												const char *fldname);
 extern int	plmysql_recognize_err_condition(const char *condname,
 											bool allow_sqlstate);
-extern PLMySQL_condition *plmysql_parse_err_condition(char *condname);
 extern void plmysql_adddatum(PLMySQL_datum *newdatum);
 extern int	plmysql_add_initdatums(int **varnos);
 extern void plmysql_HashTableInit(void);

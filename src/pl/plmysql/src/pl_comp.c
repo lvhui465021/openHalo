@@ -2257,60 +2257,6 @@ plmysql_recognize_err_condition(const char *condname, bool allow_sqlstate)
 	return 0;					/* keep compiler quiet */
 }
 
-/*
- * plmysql_parse_err_condition
- *		Generate PLMySQL_condition entry(s) for an exception condition name
- *
- * This has to be able to return a list because there are some duplicate
- * names in the table of error code names.
- */
-PLMySQL_condition *
-plmysql_parse_err_condition(char *condname)
-{
-	int			i;
-	PLMySQL_condition *new;
-	PLMySQL_condition *prev;
-
-	/*
-	 * XXX Eventually we will want to look for user-defined exception names
-	 * here.
-	 */
-
-	/*
-	 * OTHERS is represented as code 0 (which would map to '00000', but we
-	 * have no need to represent that as an exception condition).
-	 */
-	if (strcmp(condname, "others") == 0)
-	{
-		new = palloc(sizeof(PLMySQL_condition));
-		new->sqlerrstate = 0;
-		new->condname = condname;
-		new->next = NULL;
-		return new;
-	}
-
-	prev = NULL;
-	for (i = 0; exception_label_map[i].label != NULL; i++)
-	{
-		if (strcmp(condname, exception_label_map[i].label) == 0)
-		{
-			new = palloc(sizeof(PLMySQL_condition));
-			new->sqlerrstate = exception_label_map[i].sqlerrstate;
-			new->condname = condname;
-			new->next = prev;
-			prev = new;
-		}
-	}
-
-	if (!prev)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("unrecognized exception condition \"%s\"",
-						condname)));
-
-	return prev;
-}
-
 /* ----------
  * plmysql_start_datums			Initialize datum list at compile startup.
  * ----------

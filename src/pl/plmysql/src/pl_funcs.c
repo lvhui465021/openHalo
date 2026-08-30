@@ -246,14 +246,6 @@ plmysql_stmt_typename(PLMySQL_stmt *stmt)
 			return "LOOP";
 		case PLMYSQL_STMT_WHILE:
 			return "WHILE";
-		case PLMYSQL_STMT_FORI:
-			return _("FOR with integer loop variable");
-		case PLMYSQL_STMT_FORS:
-			return _("FOR over SELECT rows");
-		case PLMYSQL_STMT_FORC:
-			return _("FOR over cursor");
-		case PLMYSQL_STMT_FOREACH_A:
-			return _("FOREACH over array");
 		case PLMYSQL_STMT_EXIT:
 			return ((PLMySQL_stmt_exit *) stmt)->is_exit ? "EXIT" : "CONTINUE";
 		case PLMYSQL_STMT_RETURN:
@@ -272,8 +264,6 @@ plmysql_stmt_typename(PLMySQL_stmt *stmt)
 			return _("SQL statement");
 		case PLMYSQL_STMT_DYNEXECUTE:
 			return "EXECUTE";
-		case PLMYSQL_STMT_DYNFORS:
-			return _("FOR over EXECUTE statement");
 		case PLMYSQL_STMT_GETDIAG:
 			return ((PLMySQL_stmt_getdiag *) stmt)->is_stacked ?
 				"GET STACKED DIAGNOSTICS" : "GET DIAGNOSTICS";
@@ -306,22 +296,12 @@ plmysql_getdiag_kindname(PLMySQL_getdiag_kind kind)
 	{
 		case PLMYSQL_GETDIAG_ROW_COUNT:
 			return "ROW_COUNT";
-		case PLMYSQL_GETDIAG_CONTEXT:
-			return "PG_CONTEXT";
-		case PLMYSQL_GETDIAG_ERROR_CONTEXT:
-			return "PG_EXCEPTION_CONTEXT";
-		case PLMYSQL_GETDIAG_ERROR_DETAIL:
-			return "PG_EXCEPTION_DETAIL";
-		case PLMYSQL_GETDIAG_ERROR_HINT:
-			return "PG_EXCEPTION_HINT";
 		case PLMYSQL_GETDIAG_RETURNED_SQLSTATE:
 			return "RETURNED_SQLSTATE";
 		case PLMYSQL_GETDIAG_COLUMN_NAME:
 			return "COLUMN_NAME";
 		case PLMYSQL_GETDIAG_CONSTRAINT_NAME:
 			return "CONSTRAINT_NAME";
-		case PLMYSQL_GETDIAG_DATATYPE_NAME:
-			return "PG_DATATYPE_NAME";
 		case PLMYSQL_GETDIAG_MESSAGE_TEXT:
 			return "MESSAGE_TEXT";
 		case PLMYSQL_GETDIAG_TABLE_NAME:
@@ -352,10 +332,6 @@ static void free_if(PLMySQL_stmt_if *stmt);
 static void free_case(PLMySQL_stmt_case *stmt);
 static void free_loop(PLMySQL_stmt_loop *stmt);
 static void free_while(PLMySQL_stmt_while *stmt);
-static void free_fori(PLMySQL_stmt_fori *stmt);
-static void free_fors(PLMySQL_stmt_fors *stmt);
-static void free_forc(PLMySQL_stmt_forc *stmt);
-static void free_foreach_a(PLMySQL_stmt_foreach_a *stmt);
 static void free_exit(PLMySQL_stmt_exit *stmt);
 static void free_return(PLMySQL_stmt_return *stmt);
 static void free_return_next(PLMySQL_stmt_return_next *stmt);
@@ -364,7 +340,6 @@ static void free_raise(PLMySQL_stmt_raise *stmt);
 static void free_assert(PLMySQL_stmt_assert *stmt);
 static void free_execsql(PLMySQL_stmt_execsql *stmt);
 static void free_dynexecute(PLMySQL_stmt_dynexecute *stmt);
-static void free_dynfors(PLMySQL_stmt_dynfors *stmt);
 static void free_getdiag(PLMySQL_stmt_getdiag *stmt);
 static void free_open(PLMySQL_stmt_open *stmt);
 static void free_fetch(PLMySQL_stmt_fetch *stmt);
@@ -399,18 +374,6 @@ free_stmt(PLMySQL_stmt *stmt)
 		case PLMYSQL_STMT_WHILE:
 			free_while((PLMySQL_stmt_while *) stmt);
 			break;
-		case PLMYSQL_STMT_FORI:
-			free_fori((PLMySQL_stmt_fori *) stmt);
-			break;
-		case PLMYSQL_STMT_FORS:
-			free_fors((PLMySQL_stmt_fors *) stmt);
-			break;
-		case PLMYSQL_STMT_FORC:
-			free_forc((PLMySQL_stmt_forc *) stmt);
-			break;
-		case PLMYSQL_STMT_FOREACH_A:
-			free_foreach_a((PLMySQL_stmt_foreach_a *) stmt);
-			break;
 		case PLMYSQL_STMT_EXIT:
 			free_exit((PLMySQL_stmt_exit *) stmt);
 			break;
@@ -437,9 +400,6 @@ free_stmt(PLMySQL_stmt *stmt)
 			break;
 		case PLMYSQL_STMT_DYNEXECUTE:
 			free_dynexecute((PLMySQL_stmt_dynexecute *) stmt);
-			break;
-		case PLMYSQL_STMT_DYNFORS:
-			free_dynfors((PLMySQL_stmt_dynfors *) stmt);
 			break;
 		case PLMYSQL_STMT_GETDIAG:
 			free_getdiag((PLMySQL_stmt_getdiag *) stmt);
@@ -548,36 +508,6 @@ static void
 free_while(PLMySQL_stmt_while *stmt)
 {
 	free_expr(stmt->cond);
-	free_stmts(stmt->body);
-}
-
-static void
-free_fori(PLMySQL_stmt_fori *stmt)
-{
-	free_expr(stmt->lower);
-	free_expr(stmt->upper);
-	free_expr(stmt->step);
-	free_stmts(stmt->body);
-}
-
-static void
-free_fors(PLMySQL_stmt_fors *stmt)
-{
-	free_stmts(stmt->body);
-	free_expr(stmt->query);
-}
-
-static void
-free_forc(PLMySQL_stmt_forc *stmt)
-{
-	free_stmts(stmt->body);
-	free_expr(stmt->argquery);
-}
-
-static void
-free_foreach_a(PLMySQL_stmt_foreach_a *stmt)
-{
-	free_expr(stmt->expr);
 	free_stmts(stmt->body);
 }
 
@@ -702,19 +632,6 @@ free_dynexecute(PLMySQL_stmt_dynexecute *stmt)
 }
 
 static void
-free_dynfors(PLMySQL_stmt_dynfors *stmt)
-{
-	ListCell   *lc;
-
-	free_stmts(stmt->body);
-	free_expr(stmt->query);
-	foreach(lc, stmt->params)
-	{
-		free_expr((PLMySQL_expr *) lfirst(lc));
-	}
-}
-
-static void
 free_getdiag(PLMySQL_stmt_getdiag *stmt)
 {
 }
@@ -799,10 +716,6 @@ static void dump_if(PLMySQL_stmt_if *stmt);
 static void dump_case(PLMySQL_stmt_case *stmt);
 static void dump_loop(PLMySQL_stmt_loop *stmt);
 static void dump_while(PLMySQL_stmt_while *stmt);
-static void dump_fori(PLMySQL_stmt_fori *stmt);
-static void dump_fors(PLMySQL_stmt_fors *stmt);
-static void dump_forc(PLMySQL_stmt_forc *stmt);
-static void dump_foreach_a(PLMySQL_stmt_foreach_a *stmt);
 static void dump_exit(PLMySQL_stmt_exit *stmt);
 static void dump_return(PLMySQL_stmt_return *stmt);
 static void dump_return_next(PLMySQL_stmt_return_next *stmt);
@@ -812,7 +725,6 @@ static void dump_signal(PLMySQL_stmt_signal *stmt);
 static void dump_assert(PLMySQL_stmt_assert *stmt);
 static void dump_execsql(PLMySQL_stmt_execsql *stmt);
 static void dump_dynexecute(PLMySQL_stmt_dynexecute *stmt);
-static void dump_dynfors(PLMySQL_stmt_dynfors *stmt);
 static void dump_getdiag(PLMySQL_stmt_getdiag *stmt);
 static void dump_open(PLMySQL_stmt_open *stmt);
 static void dump_fetch(PLMySQL_stmt_fetch *stmt);
@@ -858,18 +770,6 @@ dump_stmt(PLMySQL_stmt *stmt)
 		case PLMYSQL_STMT_WHILE:
 			dump_while((PLMySQL_stmt_while *) stmt);
 			break;
-		case PLMYSQL_STMT_FORI:
-			dump_fori((PLMySQL_stmt_fori *) stmt);
-			break;
-		case PLMYSQL_STMT_FORS:
-			dump_fors((PLMySQL_stmt_fors *) stmt);
-			break;
-		case PLMYSQL_STMT_FORC:
-			dump_forc((PLMySQL_stmt_forc *) stmt);
-			break;
-		case PLMYSQL_STMT_FOREACH_A:
-			dump_foreach_a((PLMySQL_stmt_foreach_a *) stmt);
-			break;
 		case PLMYSQL_STMT_EXIT:
 			dump_exit((PLMySQL_stmt_exit *) stmt);
 			break;
@@ -896,9 +796,6 @@ dump_stmt(PLMySQL_stmt *stmt)
 			break;
 		case PLMYSQL_STMT_DYNEXECUTE:
 			dump_dynexecute((PLMySQL_stmt_dynexecute *) stmt);
-			break;
-		case PLMYSQL_STMT_DYNFORS:
-			dump_dynfors((PLMySQL_stmt_dynfors *) stmt);
 			break;
 		case PLMYSQL_STMT_GETDIAG:
 			dump_getdiag((PLMySQL_stmt_getdiag *) stmt);
@@ -1083,90 +980,6 @@ dump_while(PLMySQL_stmt_while *stmt)
 
 	dump_ind();
 	printf("    ENDWHILE\n");
-}
-
-static void
-dump_fori(PLMySQL_stmt_fori *stmt)
-{
-	dump_ind();
-	printf("FORI %s %s\n", stmt->var->refname, (stmt->reverse) ? "REVERSE" : "NORMAL");
-
-	dump_indent += 2;
-	dump_ind();
-	printf("    lower = ");
-	dump_expr(stmt->lower);
-	printf("\n");
-	dump_ind();
-	printf("    upper = ");
-	dump_expr(stmt->upper);
-	printf("\n");
-	if (stmt->step)
-	{
-		dump_ind();
-		printf("    step = ");
-		dump_expr(stmt->step);
-		printf("\n");
-	}
-	dump_indent -= 2;
-
-	dump_stmts(stmt->body);
-
-	dump_ind();
-	printf("    ENDFORI\n");
-}
-
-static void
-dump_fors(PLMySQL_stmt_fors *stmt)
-{
-	dump_ind();
-	printf("FORS %s ", stmt->var->refname);
-	dump_expr(stmt->query);
-	printf("\n");
-
-	dump_stmts(stmt->body);
-
-	dump_ind();
-	printf("    ENDFORS\n");
-}
-
-static void
-dump_forc(PLMySQL_stmt_forc *stmt)
-{
-	dump_ind();
-	printf("FORC %s ", stmt->var->refname);
-	printf("curvar=%d\n", stmt->curvar);
-
-	dump_indent += 2;
-	if (stmt->argquery != NULL)
-	{
-		dump_ind();
-		printf("  arguments = ");
-		dump_expr(stmt->argquery);
-		printf("\n");
-	}
-	dump_indent -= 2;
-
-	dump_stmts(stmt->body);
-
-	dump_ind();
-	printf("    ENDFORC\n");
-}
-
-static void
-dump_foreach_a(PLMySQL_stmt_foreach_a *stmt)
-{
-	dump_ind();
-	printf("FOREACHA var %d ", stmt->varno);
-	if (stmt->slice != 0)
-		printf("SLICE %d ", stmt->slice);
-	printf("IN ");
-	dump_expr(stmt->expr);
-	printf("\n");
-
-	dump_stmts(stmt->body);
-
-	dump_ind();
-	printf("    ENDFOREACHA");
 }
 
 static void
@@ -1556,37 +1369,6 @@ dump_dynexecute(PLMySQL_stmt_dynexecute *stmt)
 		dump_indent -= 2;
 	}
 	dump_indent -= 2;
-}
-
-static void
-dump_dynfors(PLMySQL_stmt_dynfors *stmt)
-{
-	dump_ind();
-	printf("FORS %s EXECUTE ", stmt->var->refname);
-	dump_expr(stmt->query);
-	printf("\n");
-	if (stmt->params != NIL)
-	{
-		ListCell   *lc;
-		int			i;
-
-		dump_indent += 2;
-		dump_ind();
-		printf("    USING\n");
-		dump_indent += 2;
-		i = 1;
-		foreach(lc, stmt->params)
-		{
-			dump_ind();
-			printf("    parameter $%d: ", i++);
-			dump_expr((PLMySQL_expr *) lfirst(lc));
-			printf("\n");
-		}
-		dump_indent -= 4;
-	}
-	dump_stmts(stmt->body);
-	dump_ind();
-	printf("    ENDFORS\n");
 }
 
 static void

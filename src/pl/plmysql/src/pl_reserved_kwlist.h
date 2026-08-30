@@ -27,9 +27,7 @@
  */
 
 /* name, value */
-PG_KEYWORD("all", K_ALL)
 PG_KEYWORD("begin", K_BEGIN)
-PG_KEYWORD("by", K_BY)
 PG_KEYWORD("case", K_CASE)
 PG_KEYWORD("condition", K_CONDITION)
 PG_KEYWORD("declare", K_DECLARE)
@@ -47,6 +45,7 @@ PG_KEYWORD("into", K_INTO)
 PG_KEYWORD("iterate", K_ITERATE)
 PG_KEYWORD("leave", K_LEAVE)
 PG_KEYWORD("loop", K_LOOP)
+PG_KEYWORD("move", K_MOVE)
 PG_KEYWORD("not", K_NOT)
 PG_KEYWORD("null", K_NULL)
 PG_KEYWORD("or", K_OR)

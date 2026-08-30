@@ -244,21 +244,26 @@ def _block_entry_initialization(cluster):
          END
          """, "SELECT t003_deforder()", 30)
 
-    # 语句（这里是 FOR 循环）造出来的 datum 不能被算进内层块的 initvarnos：
-    # 内层块入口的重置就是干这个的
+    # 早先这里用 FOR 循环的隐式循环变量验证：语句造出的 datum 不能被算进内层块的
+    # initvarnos。FOR/FOREACH 已随存储过程 MySQL 兼容性清理从 plmysql 语法里整体
+    # 拿掉（不是 MySQL 语法，见 mys_gram.y 的原文捕获层测试）——清理之后 plmysql
+    # 里已经没有任何语句会隐式创建 datum，一切变量都必须走显式 DECLARE，原场景
+    # 已经不可能复现。这里改为验证两个紧邻的同级嵌套块互不可见对方声明的变量，
+    # 钉的还是同一条不变式：每个 pl_block 入口的 initvarnos 重置。
     _func(cluster, "t003_datumscope", "", "INT", """
          BEGIN
              DECLARE a INT DEFAULT 5;
-             FOR i IN 1..3 LOOP
+             BEGIN
+                 DECLARE i INT DEFAULT 3;
                  SET a = a + i;
-             END LOOP;
+             END;
              BEGIN
                  DECLARE b INT DEFAULT 100;
                  SET a = a + b;
              END;
              RETURN a;
          END
-         """, "SELECT t003_datumscope()", 111)
+         """, "SELECT t003_datumscope()", 108)
 
 
 def _nested_blocks_and_scoping(cluster):
