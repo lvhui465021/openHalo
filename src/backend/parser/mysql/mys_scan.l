@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "common/string.h"
+#include "adapter/mysql/systemVar.h"
 #include "parser/parser.h"		/* only needed for GUC variables */
 #include "parser/mysql/mys_gramparse.h"
 #include "parser/mysql/mys_parser.h"
@@ -218,6 +219,8 @@ extern void core_yyset_column(int column_no, yyscan_t yyscanner);
 %x xdqs
 %x xe
 %x xde
+/* ANSI_QUOTES: "..." as a delimited identifier instead of a string literal */
+%x xd
 %x xdolq
 
 /*
@@ -319,6 +322,10 @@ xqinside		[^']+
 xdqstart		{dquote}
 xdqdouble		{dquote}{dquote}
 xdqinside		[^"]+
+/* ANSI_QUOTES delimited identifier: same lexemes as xdq, different meaning */
+xdstop			{dquote}
+xddouble		{dquote}{dquote}
+xdinside		[^"]+
 
 /* $foo$ style quotes ("dollar quoting")
  * The quoted string starts with $foo$ where "foo" is an optional string
@@ -666,11 +673,18 @@ other			.
 					yyextra->warn_on_first_escape = false;
 					yyextra->saw_non_ascii = false;
 					SET_YYLLOC();
-					// if (yyextra->standard_conforming_strings)
-					// 	BEGIN(xq);
-					// else
-					// 	BEGIN(xe);
-                    BEGIN(xe);
+					/*
+					 * NO_BACKSLASH_ESCAPES: '\' is a plain character inside
+					 * a string literal, not an escape introducer.  xq is
+					 * the escape-free counterpart of xe -- both already
+					 * share the closing-quote/doubled-quote/EOF rules
+					 * below, xq just never reaches the xe-only xeescape
+					 * rule that interprets a backslash specially.
+					 */
+					if (mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES)
+						BEGIN(xq);
+					else
+						BEGIN(xe);
 					startlit();
 				}
 
@@ -778,16 +792,48 @@ other			.
 <xq,xe><<EOF>>		{ yyerror("unterminated quoted string"); }
 
 {xdqstart}		{
-					yyextra->warn_on_first_escape = false;
-					yyextra->saw_non_ascii = false;
 					SET_YYLLOC();
-					// if (yyextra->standard_conforming_strings)
-					// 	BEGIN(xdq);
-					// else
-					// 	BEGIN(xde);
-                    BEGIN(xde);
-					startlit();
+					if (mys_sqlMode & MYS_MODE_ANSI_QUOTES)
+					{
+						/*
+						 * ANSI_QUOTES: '"' delimits an identifier, the same
+						 * role backtick normally plays in MySQL, not a
+						 * string literal.
+						 */
+						BEGIN(xd);
+						startlit();
+					}
+					else
+					{
+						yyextra->warn_on_first_escape = false;
+						yyextra->saw_non_ascii = false;
+						/* NO_BACKSLASH_ESCAPES, see the xqstart rule above */
+						if (mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES)
+							BEGIN(xdq);
+						else
+							BEGIN(xde);
+						startlit();
+					}
 				}
+
+<xd>{xdstop}    {
+					char	   *ident;
+
+					MYS_END_LITERAL();
+					if (yyextra->literallen == 0)
+						yyerror("zero-length delimited identifier");
+
+					ident = downcase_truncate_identifier(yyextra->literalbuf, yyextra->literallen, true);
+					yylval->str = ident;
+					return IDENT;
+				}
+<xd>{xddouble}    {
+					addlitchar('"', yyscanner);
+				}
+<xd>{xdinside}    {
+					addlit(yytext, yyleng, yyscanner);
+				}
+<xd><<EOF>>    { yyerror("unterminated delimited identifier"); }
 
 <xdq,xde>{dquote} {
 					/*

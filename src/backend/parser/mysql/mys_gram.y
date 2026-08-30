@@ -182,6 +182,7 @@ static Node *makeStringConst(char *str, int location);
 static Node *makeStringConstCast(char *str, int location, TypeName *typename);
 static DefElem *mys_make_routine_meta_item(const char *name, const char *value,
 										   int location);
+static List *mys_apply_default_sql_security(List *options);
 static Node *makeIntConst(int val, int location);
 static Node *makeFloatConst(char *str, int location);
 static Node *makeBitStringConst(char *str, int location);
@@ -11256,6 +11257,7 @@ CreateFunctionStmt:
 						n->options = lappend(n->options,
 							mys_make_routine_meta_item("plmysql.definer", $3, @3));
 					n->sql_body = NULL;
+					n->options = mys_apply_default_sql_security(n->options);
 					$$ = (Node *)n;
 				}
 			| CREATE opt_or_replace opt_definer PROCEDURE func_name func_args_with_defaults
@@ -11279,6 +11281,7 @@ CreateFunctionStmt:
 						n->options = lappend(n->options,
 							mys_make_routine_meta_item("plmysql.definer", $3, @3));
 					n->sql_body = NULL;
+					n->options = mys_apply_default_sql_security(n->options);
 					$$ = (Node *)n;
 				}
 			| CREATE opt_or_replace opt_definer FUNCTION func_name func_args_with_defaults
@@ -11324,6 +11327,7 @@ CreateFunctionStmt:
 						n->sql_body = $10;
 					}
 					mys_return_body_text = NULL;
+					n->options = mys_apply_default_sql_security(n->options);
 					$$ = (Node *)n;
 				}
 			| CREATE opt_or_replace opt_definer FUNCTION func_name func_args_with_defaults
@@ -11336,7 +11340,7 @@ CreateFunctionStmt:
 					n->parameters = mergeTableFuncParameters($6, $10);
 					n->returnType = TableFuncTypeName($10);
 					n->returnType->location = @8;
-					n->options = $12;
+					n->options = mys_apply_default_sql_security($12);
 					n->sql_body = $13;
 					$$ = (Node *)n;
 				}
@@ -11350,6 +11354,7 @@ CreateFunctionStmt:
 					n->parameters = $6;
 					n->returnType = NULL;
 					n->options = $7;
+					n->options = mys_apply_default_sql_security(n->options);
 					n->sql_body = $8;
 					$$ = (Node *)n;
 				}
@@ -11363,6 +11368,7 @@ CreateFunctionStmt:
 					n->parameters = $6;
 					n->returnType = NULL;
 					n->options = $7;
+					n->options = mys_apply_default_sql_security(n->options);
 					n->sql_body = $8;
 					$$ = (Node *)n;
 				}
@@ -19406,9 +19412,59 @@ a_expr:		c_expr									{ $$ = $1; }
 			| a_expr qual_Op a_expr				%prec Op
 				{ $$ = (Node *) makeA_Expr(AEXPR_OP, $2, $1, $3, @2); }
             | a_expr Op_And a_expr
-				{ $$ = (Node *) makeA_Expr(AEXPR_OP, list_make1(makeString("&&")), $1, $3, @2); }
+				{
+					/*
+					 * MySQL: "&&" is always a synonym for AND, regardless of
+					 * sql_mode.  Unlike a plain boolean AND, MySQL's "&&"
+					 * coerces either side to a truth value and returns an
+					 * integer 0/1 (or NULL) rather than a real boolean, and
+					 * aux_mysql's mysql.&&(...) operator family (bigint,
+					 * text, bool, ... in every combination) already
+					 * implements exactly that coercion -- resolving through
+					 * it, as this unqualified "&&" name always has, is
+					 * correct and is intentionally left unchanged.
+					 */
+					$$ = (Node *) makeA_Expr(AEXPR_OP, list_make1(makeString("&&")), $1, $3, @2);
+				}
 			| a_expr Op_Or a_expr
-				{ $$ = (Node *) makeA_Expr(AEXPR_OP, list_make1(makeString("||")), $1, $3, @2); }
+				{
+					/*
+					 * MySQL: "||" means OR by default (aux_mysql's
+					 * mysql.||(...) operator family, same coercion story as
+					 * mysql.&& above -- left unchanged), and means string
+					 * concatenation only when sql_mode has PIPES_AS_CONCAT.
+					 * The concatenation case must resolve to PostgreSQL's
+					 * own pg_catalog.|| rather than the bare unqualified
+					 * name: mysql.||'s anynonarray overloads are wide
+					 * enough to also match two text operands, so leaving
+					 * the operator name unqualified would keep silently
+					 * routing into the OR-coercion family (which rejects
+					 * non-numeric text) even once PIPES_AS_CONCAT asks for
+					 * concatenation instead.
+					 */
+					if (mys_sqlMode & MYS_MODE_PIPES_AS_CONCAT)
+					{
+						/*
+						 * MySQL's CONCAT-flavored "||" stringifies either
+						 * side regardless of its type (numbers, dates, ...),
+						 * unlike pg_catalog.|| which only has overloads for
+						 * text-compatible/array/jsonb operands; cast both
+						 * sides to text explicitly so e.g. 1 || 2 behaves
+						 * like MySQL's '12' instead of "operator does not
+						 * exist".  This does not change NULL propagation:
+						 * pg_catalog.|| already returns NULL if either side
+						 * is NULL, matching MySQL's CONCAT/"||".
+						 */
+						Node *lhs = makeTypeCast($1, SystemTypeName("text"), @2);
+						Node *rhs = makeTypeCast($3, SystemTypeName("text"), @2);
+
+						$$ = (Node *) makeA_Expr(AEXPR_OP,
+												 list_make2(makeString("pg_catalog"), makeString("||")),
+												 lhs, rhs, @2);
+					}
+					else
+						$$ = (Node *) makeA_Expr(AEXPR_OP, list_make1(makeString("||")), $1, $3, @2);
+				}
 			| qual_Op a_expr					%prec Op
 				{ $$ = (Node *) makeA_Expr(AEXPR_OP, $1, NULL, $2, @1); }
 			| a_expr REGEXP BINARY_LA a_expr       %prec Op
@@ -23557,6 +23613,34 @@ mys_make_routine_meta_item(const char *name, const char *value, int location)
 	v->args = list_make1(makeStringConst((char *) value, location));
 
 	return makeDefElem("set", (Node *) v, location);
+}
+
+/*
+ * MySQL 5.7's CREATE FUNCTION/PROCEDURE defaults to SQL SECURITY DEFINER
+ * when the clause is omitted (see the SQL SECURITY Characteristic in the
+ * MySQL 5.7 Reference Manual, 13.1.16); PostgreSQL's own CreateFunctionStmt
+ * defaults an absent "security" option to SECURITY INVOKER (prosecdef =
+ * false).  Every one of this grammar's createfunc_opt_list-based CREATE
+ * FUNCTION/PROCEDURE alternatives funnels its option list through here so
+ * the two defaults are reconciled without duplicating the scan in each
+ * alternative; an option list that already carries an explicit "security"
+ * item (SQL SECURITY DEFINER/INVOKER was written out) is left untouched.
+ */
+static List *
+mys_apply_default_sql_security(List *options)
+{
+	ListCell   *lc;
+
+	foreach(lc, options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "security") == 0)
+			return options;
+	}
+
+	return lappend(options,
+				   makeDefElem("security", (Node *) makeInteger(true), -1));
 }
 
 static CreateTrigStmt *
