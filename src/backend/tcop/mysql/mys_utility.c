@@ -52,8 +52,13 @@
  * 该.c文件被src/backend/tcop/utility.c包含
  *
  */
+
+#include <ctype.h>
+
 #include "commands/mysql/mys_uservar.h"
+#include "catalog/pg_trigger.h"
 #include "executor/tstoreReceiver.h"
+#include "nodes/makefuncs.h"
 #include "nodes/mysql/mys_parsenodes.h"
 #include "rewrite/rewriteHandler.h"
 #include "utils/snapmgr.h"
@@ -148,6 +153,102 @@ mys_plmysql_inject_alter_meta(AlterFunctionStmt *stmt)
 	stmt->actions = lappend(stmt->actions,
 							mys_plmysql_meta_item("plmysql.last_altered",
 												 mys_plmysql_timestamp_text()));
+}
+
+/*
+ * MySQL CREATE TRIGGER is parsed as a native CreateTrigStmt marked with the
+ * original body in transitionRels.  Before CreateTrigger() sees it, create a
+ * private plmysql trigger function, then discard the marker so the native PG
+ * path only receives standard trigger fields.
+ */
+static const char *
+mys_mysql_trigger_marker(CreateTrigStmt *stmt, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmt->transitionRels)
+	{
+		Node	   *node = lfirst(lc);
+
+		if (IsA(node, DefElem))
+		{
+			DefElem    *item = (DefElem *) node;
+
+			if (strcmp(item->defname, name) == 0 && IsA(item->arg, String))
+				return strVal(item->arg);
+		}
+	}
+	return NULL;
+}
+
+static bool
+mys_is_mysql_trigger_stmt(CreateTrigStmt *stmt)
+{
+	return mys_mysql_trigger_marker(stmt, "mysql_trigger_body") != NULL;
+}
+
+static char *
+mys_mysql_trigger_function_body(CreateTrigStmt *stmt, const char *body)
+{
+	const char *return_expr;
+	const char *begin;
+	const char *end;
+
+	if (stmt->timing == TRIGGER_TYPE_BEFORE)
+		return_expr = (stmt->events & TRIGGER_TYPE_DELETE) ? "OLD" : "NEW";
+	else
+		return_expr = "NULL";
+
+	begin = body;
+	while (isspace((unsigned char) *begin))
+		begin++;
+	end = body + strlen(body);
+	while (end > begin && isspace((unsigned char) end[-1]))
+		end--;
+
+	if (end - begin >= 8 && pg_strncasecmp(begin, "begin", 5) == 0 &&
+		isspace((unsigned char) begin[5]) &&
+		pg_strncasecmp(end - 3, "end", 3) == 0)
+		return psprintf("%.*s\nRETURN %s;\nEND",
+						(int) ((end - 3) - body), body, return_expr);
+
+	return psprintf("BEGIN\n%.*s;\nRETURN %s;\nEND",
+					(int) (end - begin), begin, return_expr);
+}
+
+static CreateFunctionStmt *
+mys_make_mysql_trigger_function(CreateTrigStmt *stmt)
+{
+	CreateFunctionStmt *func = makeNode(CreateFunctionStmt);
+	const char *body = mys_mysql_trigger_marker(stmt, "mysql_trigger_body");
+	const char *definer = mys_mysql_trigger_marker(stmt, "mysql_trigger_definer");
+	char	   *wrapped_body = mys_mysql_trigger_function_body(stmt, body);
+
+	func->is_procedure = false;
+	/*
+	 * A native trigger owns a dependency on this private function, not vice
+	 * versa.  Dropping the table therefore removes the trigger but leaves the
+	 * function behind.  Replacing only this reserved internal name lets a
+	 * later same-name MySQL trigger recreate cleanly; if the trigger itself
+	 * still exists, the following CreateTrigger() error rolls the replacement
+	 * back with the DDL statement.
+	 */
+	func->replace = true;
+	func->funcname = copyObject(stmt->funcname);
+	func->parameters = NIL;
+	func->returnType = makeTypeName(pstrdup("trigger"));
+	func->options = list_make2(
+		makeDefElem("language", (Node *) makeString(pstrdup("plmysql")), -1),
+		makeDefElem("as", (Node *) list_make1(makeString(wrapped_body)), -1));
+	func->options = lappend(func->options,
+		mys_plmysql_meta_item("plmysql.trigger_body", body));
+	func->options = lappend(func->options,
+		mys_plmysql_meta_item("plmysql.trigger_name", stmt->trigname));
+	if (definer != NULL)
+		func->options = lappend(func->options,
+			mys_plmysql_meta_item("plmysql.definer", definer));
+	func->sql_body = NULL;
+	return func;
 }
 
 static void mys_ProcessUtilitySlow(ParseState *pstate,
@@ -1342,6 +1443,23 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateTrigStmt:
+				if (mys_is_mysql_trigger_stmt((CreateTrigStmt *) parsetree))
+				{
+					PlannedStmt *wrapper = makeNode(PlannedStmt);
+
+					wrapper->commandType = CMD_UTILITY;
+					wrapper->canSetTag = false;
+					wrapper->utilityStmt = (Node *)
+						mys_make_mysql_trigger_function((CreateTrigStmt *) parsetree);
+					wrapper->stmt_location = pstmt->stmt_location;
+					wrapper->stmt_len = pstmt->stmt_len;
+					ProcessUtility(wrapper, queryString, false,
+								   PROCESS_UTILITY_SUBCOMMAND, params, NULL,
+								   None_Receiver, NULL);
+
+					/* The marker is parser-private, never a native transition rel. */
+					((CreateTrigStmt *) parsetree)->transitionRels = NIL;
+				}
 				address = CreateTrigger((CreateTrigStmt *) parsetree,
 										queryString, InvalidOid, InvalidOid,
 										InvalidOid, InvalidOid, InvalidOid,

@@ -237,9 +237,24 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 
 /* routine-body capture helpers (defined in the trailing C section) */
 static char *mys_capture_return_stmt_text(core_yyscan_t yyscanner,
-										  int return_loc,
-										  int lookahead_token,
-										  int lookahead_loc);
+									  int return_loc,
+									  int lookahead_token,
+									  int lookahead_loc);
+static char *mys_capture_trigger_body(core_yyscan_t yyscanner,
+								  int lookahead_token,
+								  int lookahead_loc,
+								  int *leftover_token,
+								  YYSTYPE *leftover_lval,
+								  YYLTYPE *leftover_loc);
+static CreateTrigStmt *mys_make_pg_trigger_tail(RangeVar *relation,
+											 List *transition_rels, bool row,
+											 Node *when_clause, List *funcname,
+											 List *args);
+static CreateTrigStmt *mys_make_mysql_trigger_tail(RangeVar *relation,
+												char *body, int location);
+static CreateTrigStmt *mys_finish_trigger_stmt(bool replace, char *definer,
+												 char *trigname, int timing, List *events,
+												 CreateTrigStmt *stmt);
 static bool mys_optlist_pins_foreign_language(List *options);
 static char *mys_return_body_text;
 
@@ -395,6 +410,7 @@ static char *mys_return_body_text;
 %type <boolean> TriggerForSpec TriggerForType
 %type <ival>	TriggerActionTime
 %type <list>	TriggerEvents TriggerOneEvent
+%type <node>	mysql_trigger_tail mysql_trigger_each_row_tail
 %type <value>	TriggerFuncArg
 %type <node>	TriggerWhen
 %type <str>		TransitionRelName
@@ -424,6 +440,7 @@ static char *mys_return_body_text;
 %type <list>	RowSecurityDefaultToRole RowSecurityOptionalToRole
 
 %type <str>		iso_level opt_encoding opt_definer user
+				mysql_trigger_body
 %type <rolespec> grantee
 %type <list>	grantee_list
 %type <accesspriv> privilege
@@ -468,7 +485,7 @@ static char *mys_return_body_text;
 				create_generic_options alter_generic_options
 				relation_expr_list dostmt_opt_list
 				transform_element_list
-				TriggerTransitions TriggerReferencing
+				TriggerTransitions
 				vacuum_relation_list opt_vacuum_relation_list
 				drop_option_list
 
@@ -8728,27 +8745,24 @@ am_type:
  *****************************************************************************/
 
 CreateTrigStmt:
-			CREATE opt_or_replace TRIGGER name TriggerActionTime TriggerEvents ON
-			qualified_name TriggerReferencing TriggerForSpec TriggerWhen
-			EXECUTE FUNCTION_or_PROCEDURE func_name '(' TriggerFuncArgs ')'
+			CREATE opt_or_replace opt_definer TRIGGER name TriggerActionTime TriggerOneEvent ON
+			mysql_trigger_tail
 				{
-					CreateTrigStmt *n = makeNode(CreateTrigStmt);
-					n->replace = $2;
-					n->isconstraint = false;
-					n->trigname = $4;
-					n->relation = $8;
-					n->funcname = $14;
-					n->args = $16;
-					n->row = $10;
-					n->timing = $5;
-					n->events = intVal(linitial($6));
-					n->columns = (List *) lsecond($6);
-					n->whenClause = $11;
-					n->transitionRels = $9;
-					n->deferrable = false;
-					n->initdeferred = false;
-					n->constrrel = NULL;
-					$$ = (Node *)n;
+					$$ = (Node *) mys_finish_trigger_stmt($2, $3, $5, $6, $7,
+															(CreateTrigStmt *) $9);
+				}
+		  | CREATE opt_or_replace opt_definer TRIGGER name TriggerActionTime TriggerOneEvent OR
+			TriggerEvents ON mysql_trigger_tail
+				{
+					List	   *events;
+
+					if (intVal(linitial($7)) & intVal(linitial($9)))
+						parser_yyerror("duplicate trigger events specified");
+					events = list_make2(
+						makeInteger(intVal(linitial($7)) | intVal(linitial($9))),
+						list_concat((List *) lsecond($7), (List *) lsecond($9)));
+					$$ = (Node *) mys_finish_trigger_stmt($2, $3, $5, $6, events,
+															(CreateTrigStmt *) $11);
 				}
 		  | CREATE opt_or_replace CONSTRAINT TRIGGER name AFTER TriggerEvents ON
 			qualified_name OptConstrFromTable ConstraintAttributeSpec
@@ -8777,6 +8791,87 @@ CreateTrigStmt:
 								   NULL, yyscanner);
 					n->constrrel = $10;
 					$$ = (Node *)n;
+				}
+		;
+
+/*
+ * A MySQL trigger body is either one statement or a BEGIN ... END compound
+ * statement.  Capture it verbatim and let plmysql parse it after the native
+ * trigger has been lowered to its generated plmysql function.
+ */
+mysql_trigger_body:
+			{
+				int			lookahead = YYEMPTY;
+				int			lookahead_loc = 0;
+				int			leftover = YYEMPTY;
+
+				if (yychar != YYEMPTY)
+				{
+					lookahead = yychar;
+					lookahead_loc = yylloc;
+				}
+				$$ = mys_capture_trigger_body(yyscanner, lookahead, lookahead_loc,
+											  &leftover, &yylval, &yylloc);
+				yychar = leftover;
+			}
+		;
+
+/*
+ * PostgreSQL's trigger tail and MySQL's FOR EACH ROW body share enough
+ * syntax that treating each as an independent CreateTrigStmt production
+ * makes a single-event trigger ambiguous at ON.  Parse their common prefix
+ * once and return a partially-filled CreateTrigStmt; CreateTrigStmt above
+ * supplies the name, timing and event mask once the tail is known.
+ */
+mysql_trigger_tail:
+			qualified_name REFERENCING TriggerTransitions TriggerForSpec TriggerWhen
+			EXECUTE FUNCTION_or_PROCEDURE func_name '(' TriggerFuncArgs ')'
+				{
+					$$ = (Node *) mys_make_pg_trigger_tail($1, $3, $4, $5, $8, $10);
+				}
+			| qualified_name FOR ROW TriggerWhen EXECUTE FUNCTION_or_PROCEDURE
+			  func_name '(' TriggerFuncArgs ')'
+				{
+					$$ = (Node *) mys_make_pg_trigger_tail($1, NIL, true, $4, $7, $9);
+				}
+			| qualified_name FOR STATEMENT TriggerWhen EXECUTE FUNCTION_or_PROCEDURE
+			  func_name '(' TriggerFuncArgs ')'
+				{
+					$$ = (Node *) mys_make_pg_trigger_tail($1, NIL, false, $4, $7, $9);
+				}
+			| qualified_name FOR EACH STATEMENT TriggerWhen EXECUTE FUNCTION_or_PROCEDURE
+			  func_name '(' TriggerFuncArgs ')'
+				{
+					$$ = (Node *) mys_make_pg_trigger_tail($1, NIL, false, $5, $8, $10);
+				}
+			| qualified_name FOR EACH ROW mysql_trigger_each_row_tail
+				{
+					CreateTrigStmt *n = (CreateTrigStmt *) $5;
+
+					n->relation = $1;
+					$$ = (Node *) n;
+				}
+			| qualified_name TriggerWhen EXECUTE FUNCTION_or_PROCEDURE func_name
+			  '(' TriggerFuncArgs ')'
+				{
+					$$ = (Node *) mys_make_pg_trigger_tail($1, NIL, false, $2, $5, $7);
+				}
+		;
+
+/* PG row triggers end in WHEN/EXECUTE; all other body starters are MySQL. */
+mysql_trigger_each_row_tail:
+			WHEN '(' a_expr ')' EXECUTE FUNCTION_or_PROCEDURE func_name
+			  '(' TriggerFuncArgs ')'
+				{
+					$$ = (Node *) mys_make_pg_trigger_tail(NULL, NIL, true, $3, $7, $9);
+				}
+			| EXECUTE FUNCTION_or_PROCEDURE func_name '(' TriggerFuncArgs ')'
+				{
+					$$ = (Node *) mys_make_pg_trigger_tail(NULL, NIL, true, NULL, $3, $5);
+				}
+			| mysql_trigger_body
+				{
+					$$ = (Node *) mys_make_mysql_trigger_tail(NULL, $1, @1);
 				}
 		;
 
@@ -8821,11 +8916,6 @@ TriggerOneEvent:
 				{ $$ = list_make2(makeInteger(TRIGGER_TYPE_UPDATE), $3); }
 			| TRUNCATE
 				{ $$ = list_make2(makeInteger(TRIGGER_TYPE_TRUNCATE), NIL); }
-		;
-
-TriggerReferencing:
-			REFERENCING TriggerTransitions			{ $$ = $2; }
-			| /*EMPTY*/								{ $$ = NIL; }
 		;
 
 TriggerTransitions:
@@ -23379,6 +23469,100 @@ mys_make_routine_meta_item(const char *name, const char *value, int location)
 	return makeDefElem("set", (Node *) v, location);
 }
 
+static CreateTrigStmt *
+mys_make_pg_trigger_tail(RangeVar *relation, List *transition_rels, bool row,
+						 Node *when_clause, List *funcname, List *args)
+{
+	CreateTrigStmt *n = makeNode(CreateTrigStmt);
+
+	n->replace = false;
+	n->isconstraint = false;
+	n->trigname = NULL;
+	n->relation = relation;
+	n->funcname = funcname;
+	n->args = args;
+	n->row = row;
+	n->timing = 0;
+	n->events = 0;
+	n->columns = NIL;
+	n->whenClause = when_clause;
+	n->transitionRels = transition_rels;
+	n->deferrable = false;
+	n->initdeferred = false;
+	n->constrrel = NULL;
+	return n;
+}
+
+static CreateTrigStmt *
+mys_make_mysql_trigger_tail(RangeVar *relation, char *body, int location)
+{
+	CreateTrigStmt *n = makeNode(CreateTrigStmt);
+
+	n->replace = false;
+	n->isconstraint = false;
+	n->trigname = NULL;
+	n->relation = relation;
+	n->funcname = NULL;
+	n->args = NIL;
+	n->row = true;
+	n->timing = 0;
+	n->events = 0;
+	n->columns = NIL;
+	n->whenClause = NULL;
+	n->transitionRels = list_make1(
+		makeDefElem("mysql_trigger_body", (Node *) makeString(body), location));
+	n->deferrable = false;
+	n->initdeferred = false;
+	n->constrrel = NULL;
+	return n;
+}
+
+static CreateTrigStmt *
+mys_finish_trigger_stmt(bool replace, char *definer, char *trigname,
+						int timing, List *events,
+						CreateTrigStmt *stmt)
+{
+	int			event_mask = intVal(linitial(events));
+	bool		is_mysql = (stmt->funcname == NULL);
+
+	if (is_mysql)
+	{
+		if (replace)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("CREATE OR REPLACE TRIGGER is not supported by MySQL")));
+		if (timing != TRIGGER_TYPE_BEFORE && timing != TRIGGER_TYPE_AFTER)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("INSTEAD OF triggers are not supported by MySQL")));
+		if ((event_mask & TRIGGER_TYPE_TRUNCATE) != 0 ||
+			(event_mask & (event_mask - 1)) != 0 ||
+			lsecond(events) != NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("MySQL triggers support one INSERT, UPDATE, or DELETE event")));
+		stmt->funcname = (stmt->relation->schemaname == NULL) ?
+			list_make1(makeString(psprintf("__mysql_trigger_%s", trigname))) :
+			list_make2(makeString(pstrdup(stmt->relation->schemaname)),
+					   makeString(psprintf("__mysql_trigger_%s", trigname)));
+		if (definer != NULL)
+			stmt->transitionRels = lappend(stmt->transitionRels,
+				makeDefElem("mysql_trigger_definer",
+							(Node *) makeString(definer), -1));
+	}
+	else if (definer != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("DEFINER is only supported for MySQL CREATE TRIGGER syntax")));
+
+	stmt->replace = replace;
+	stmt->trigname = trigname;
+	stmt->timing = timing;
+	stmt->events = event_mask;
+	stmt->columns = is_mysql ? NIL : (List *) lsecond(events);
+	return stmt;
+}
+
 static Node *
 makeIntConst(int val, int location)
 {
@@ -24748,5 +24932,69 @@ done:
 		*leftover_loc = pending_loc;
 	}
 
+	return body;
+}
+
+/*
+ * Capture the body after MySQL's mandatory FOR EACH ROW clause.  Compound
+ * bodies reuse the routine-body capture machinery; a single statement ends
+ * at the top-level statement terminator (or end of input).  A terminator is
+ * handed back to bison so it remains the terminator of CREATE TRIGGER.
+ */
+static char *
+mys_capture_trigger_body(core_yyscan_t yyscanner, int lookahead_token,
+						 int lookahead_loc, int *leftover_token,
+						 YYSTYPE *leftover_lval, YYLTYPE *leftover_loc)
+{
+	mys_yy_extra_type *yyextra = mys_yyget_extra(yyscanner);
+	YYSTYPE		lval;
+	YYLTYPE		lloc = lookahead_loc;
+	int			tok = lookahead_token;
+	int			body_start_loc;
+	int			body_end_loc;
+	char	   *buf = yyextra->core_yy_extra.scanbuf;
+	char	   *body;
+
+	if (tok == YYEMPTY)
+		tok = mys_yylex(&lval, &lloc, yyscanner);
+	if (tok == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("CREATE TRIGGER requires a trigger body")));
+
+	body_start_loc = lloc;
+	if (tok == BEGIN_P)
+	{
+		int			next;
+		YYSTYPE		next_lval;
+		YYLTYPE		next_loc;
+
+		next = mys_yylex(&next_lval, &next_loc, yyscanner);
+		return mys_capture_routine_body(yyscanner, body_start_loc,
+								next, next_loc, leftover_token,
+								leftover_lval, leftover_loc);
+	}
+
+	for (;;)
+	{
+		tok = mys_yylex(&lval, &lloc, yyscanner);
+		if (tok == 0)
+		{
+			body_end_loc = strlen(buf);
+			break;
+		}
+		if (tok == ';')
+		{
+			body_end_loc = lloc;
+			break;
+		}
+	}
+
+	body = palloc(body_end_loc - body_start_loc + 1);
+	memcpy(body, buf + body_start_loc, body_end_loc - body_start_loc);
+	body[body_end_loc - body_start_loc] = '\0';
+	*leftover_token = tok;
+	*leftover_lval = lval;
+	*leftover_loc = lloc;
 	return body;
 }

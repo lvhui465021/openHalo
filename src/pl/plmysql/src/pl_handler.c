@@ -85,6 +85,8 @@ char	   *plmysql_definer_string = NULL;
 char	   *plmysql_sql_mode_string = NULL;
 char	   *plmysql_created_string = NULL;
 char	   *plmysql_last_altered_string = NULL;
+char	   *plmysql_trigger_body_string = NULL;
+char	   *plmysql_trigger_name_string = NULL;
 
 /* Hook for plugins */
 PLMySQL_plugin **plmysql_plugin_ptr = NULL;
@@ -264,6 +266,20 @@ _PG_init(void)
 							   gettext_noop("Routine last-alter time, ISO text."),
 							   NULL,
 							   &plmysql_last_altered_string,
+							   "",
+							   PGC_USERSET, 0,
+							   NULL, NULL, NULL);
+	DefineCustomStringVariable("plmysql.trigger_body",
+							   gettext_noop("Original MySQL trigger body stored for metadata display."),
+							   NULL,
+							   &plmysql_trigger_body_string,
+							   "",
+							   PGC_USERSET, 0,
+							   NULL, NULL, NULL);
+	DefineCustomStringVariable("plmysql.trigger_name",
+							   gettext_noop("Original MySQL trigger name stored for metadata display."),
+							   NULL,
+							   &plmysql_trigger_name_string,
 							   "",
 							   PGC_USERSET, 0,
 							   NULL, NULL, NULL);
