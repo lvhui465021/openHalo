@@ -197,7 +197,7 @@ MySQL 游标是只读、不可滚动、仅例程内可用——PG 游标的真�
 | `DECLARE` 顺序约束 | 变量/条件 → 游标 → 处理程序 | ✅ 本次会话修复（见 §E） |
 
 **本次会话另修复的运行时缺陷**（均不改变本节的语法覆盖范围，但影响正确性）：
-- `SIGNAL SQLSTATE 'xxxxx'`（自定义、未在错误码表中登记的 SQLSTATE）之前在发包时被硬编码替换为 `"HY000"`，客户端拿不到真实 SQLSTATE；`adapter.c` 的 `sendErrorMessage()` 改为发送 `unpack_sql_state(edata->sqlerrcode)`。§4.8 提到的"错误码→MySQL 规范 SQLSTATE"反向映射也已补齐（2026-08-30）：`errorConvertor.c` 新增 17 条 PG SQLSTATE→MySQL 规范 SQLSTATE 键值（`mysCanonicalizeSqlState()`，与 `pl_exec_ext.c` 的 28 条 errno 三元组人工审核口径一致），`sendErrPacket()` 发包时把命中的 PG 状态改写为 MySQL 规范值（如 `42P01→42S02`、`23505→23000`）；`SIGNAL`/`RESIGNAL` 选择的自定义状态（`45000`、`A0001` 等）不是键，仍原样回传。
+- `SIGNAL SQLSTATE 'xxxxx'`（自定义、未在错误码表中登记的 SQLSTATE）之前在发包时被硬编码替换为 `"HY000"`，客户端拿不到真实 SQLSTATE；`adapter.c` 的 `sendErrorMessage()` 改为发送 `unpack_sql_state(edata->sqlerrcode)`。§4.8 提到的"错误码→MySQL 规范 SQLSTATE"反向映射也已补齐（2026-08-30）：`errorConvertor.c` 新增 17 条 PG SQLSTATE→MySQL 规范 SQLSTATE 键值（`mysCanonicalizeSqlState()`，与 `pl_exec_ext.c` 的 27 条 errno 三元组人工审核口径一致），`sendErrPacket()` 发包时把命中的 PG 状态改写为 MySQL 规范值（如 `42P01→42S02`、`23505→23000`）；`SIGNAL`/`RESIGNAL` 选择的自定义状态（`45000`、`A0001` 等）不是键，仍原样回传。
 
 ---
 
@@ -418,7 +418,7 @@ Babelfish（AWS 的 SQL Server 兼容层）验证了"clone plpgsql 建新 PL"是
 | M1 | 语法层过程体捕获（§4.2）+ `src/pl/plmysql/` 骨架（克隆改名，`DECLARE`/赋值/`IF`/`RETURN` 可跑） | ✅ 完成 |
 | M2 | 完整流程控制（`LOOP`/`WHILE`/`REPEAT`/`LEAVE`/`ITERATE`/`CASE`）+ 局部变量完整语义 | ✅ 完成 |
 | M3 | 游标（`DECLARE CURSOR`/`OPEN`/`FETCH`/`CLOSE`）+ EXIT HANDLER（复用 plpgsql EXCEPTION） | ✅ 完成 |
-| M4 | CONTINUE HANDLER（§4.5，含游标 NOT FOUND 联动）+ `SIGNAL`/`RESIGNAL`（§4.8）+ `GET DIAGNOSTICS` | ✅ 完成；错误码体系（§4.8）三项均已落地：正向表已扩至 44 条（含存储过程/DDL 常用 errno，`errorConvertor.c`），errno→SQLSTATE 双向/规范性反向映射在 `pl_exec_ext.c` 的 `mysql_errno_sqlstate_map`（28 条三元组：errno/PG SQLSTATE/MySQL 规范 SQLSTATE） |
+| M4 | CONTINUE HANDLER（§4.5，含游标 NOT FOUND 联动）+ `SIGNAL`/`RESIGNAL`（§4.8）+ `GET DIAGNOSTICS` | ✅ 完成；错误码体系（§4.8）三项均已落地：正向表已扩至 53 条生效条目（`errorConvertor.c`：11 条 openHalo 专有编码 + 20 条存储过程常用 `ERRCODE_*` + 22 条更广 DDL/DML/routine 映射；另有 15 条历史失效条目已注释保留、不计入生效范围），errno→SQLSTATE 双向/规范性反向映射在 `pl_exec_ext.c` 的 `mysql_errno_sqlstate_map`（27 条三元组：errno/PG SQLSTATE/MySQL 规范 SQLSTATE） |
 | M5 | CALL 链路 OUT/INOUT 回写（§4.6）+ 多结果集协议打通（§4.7） | ✅ 完成（多结果集协议打通是 2026-08-29 补的：编译期 `is_select`/`n_resultsets` 标记早就有，执行期一直没接上，`CALL` 内裸 `SELECT`/`EXECUTE` 预处理语句会报 "no destination for result data"；另外例程体内 `SET @uservar = expr` 与 MySQL 形态的 `EXECUTE stmtname [USING ...]` 当时也还不能用，一并修了） |
 | M6 | 元数据视图修正（§4.9）+ `DEFINER`/`COMMENT` 语法补全 + 触发器预留验证（§4.10，不实现触发器本身） | ✅ 完成：`DEFINER` 的 `user@host` 原文、创建时 `sql_mode` 快照、SQL data-access 特性、`created`/`last_altered` 时间戳以函数级 GUC 形式写入 `pg_proc.proconfig`（`plmysql.definer`/`plmysql.sql_mode`/`plmysql.sql_data_access`/`plmysql.created`/`plmysql.last_altered`，由 plmysql 扩展定义并随 dump/restore 自动携带），`mysql.proc`/`mys_informa_schema.routines/procedures/functions` 视图与 `SHOW CREATE` 全部改读真实值（SQL data access 缺省时回退为 `CONTAINS SQL`）；触发器入口预留已验证：三态枚举、编译器 switch、`plmysql_exec_trigger`/`plmysql_exec_event_trigger` 执行器、调用分派与语法 guard（如 1336 动态 SQL 拒绝）均就位 |
 | M7 | MySQL `CREATE TRIGGER` 行级 DML 子集 + 原始体元数据/`SHOW CREATE TRIGGER` | ✅ 完成（2026-08-30）：单语句与 `BEGIN...END` 体降级到私有 `plmysql RETURNS trigger` 包装函数；支持 DEFINER、`NEW`/`OLD`、BEFORE/AFTER 单事件，以及删表后的同名重建；MySQL 专用 `DROP TRIGGER [IF EXISTS] [schema.]name` 同日补齐（见 §4.10）；aux_mysql 升至 1.9 |
@@ -437,7 +437,7 @@ Babelfish（AWS 的 SQL Server 兼容层）验证了"clone plpgsql 建新 PL"是
 1. **CONTINUE HANDLER 性能代价**：逐语句 savepoint 有开销，需要实测大循环内 CONTINUE HANDLER 的性能表现，评估是否需要"仅对可能触发对应条件的语句包裹"的静态分析优化（Babelfish 论文/注释提到过这个方向但未确认其是否真正实现，需要在 M4 阶段针对 openHalo 场景单独验证）。
 2. **`SET` 语句歧义**：MySQL 模式下 `SET` 已被系统变量/用户变量语法占用，例程内 `SET localvar = expr` 需要与现有 `MysVariableSetStmt` 语法在 `plmysql` 编译器内部（不是主语法）做区分，具体消歧规则需要在 M1 实现时敲定。
 3. **原生 `label:` 拼写**：✅ 已支持（2026-08-29 晚）。实现要点：plmysql 语句以 `T_WORD` 开头时（`SELECT` 等经 `stmt_execsql` 的 T_WORD 分支捕获整句），不能在 bison 里用 `T_WORD ':'` 双 token 产生式区分 label——bison 需要两 token 前瞻，而 pl_scanner 的动作内 `yylex()` 与 bison 的 lookahead 缓冲错位，会导致所有 T_WORD 开头的语句解析错乱（`SELECT CASE WHEN...` 报 `missing "WHEN"`）。正确做法是把 `标识符 + ':'` 在 scanner 层合并为单一 `T_WORD_COLON` token（`pl_scanner.c`），与 `A.B`/`A:=`/`A[B]` 的既有组合机制同构；label 只接受普通标识符（`T_WORD`），不接受关键字/引号标识符，符合 MySQL 语义。
-4. **反向错误码表的规范化选择**：非单射的反向映射（如多个 SQLSTATE 对应同一 MySQL errno）需要逐条人工选定规范源，M4 阶段需要一份人工审核的映射表，不能全自动生成。✅ 已按 MySQL 5.7 手册附录逐条人工选定（`pl_exec_ext.c` 的 28 条三元组）。
+4. **反向错误码表的规范化选择**：非单射的反向映射（如多个 SQLSTATE 对应同一 MySQL errno）需要逐条人工选定规范源，M4 阶段需要一份人工审核的映射表，不能全自动生成。✅ 已按 MySQL 5.7 手册附录逐条人工选定（`pl_exec_ext.c` 的 27 条三元组）。
 5. **`sql_mode` 快照的实际使用范围**：快照已落地存储（`plmysql.sql_mode` proconfig GUC），并在例程进入时映射到适配器的运行时 mode 位；空字符串也是有效快照，嵌套例程和 ERROR 展开均恢复调用者状态。现有 `STRICT_TRANS_TABLES`/`STRICT_ALL_TABLES` 数值转换路径已由该状态驱动。
 
    **扫描/解析期 mode（2026-08-30 追加）**：`ANSI_QUOTES`、`NO_BACKSLASH_ESCAPES`、`PIPES_AS_CONCAT` 三项已在 `mys_scan.l`/`mys_gram.y` 接入 `mys_sqlMode` 位，覆盖 `test_022_sql_mode_scan_parse.py`：
