@@ -17,6 +17,7 @@
 #include "postgres.h"
 
 #include "adapter/mysql/errorConvertor.h"
+#include "adapter/mysql/systemVar.h"
 
 #include "catalog/namespace.h"
 #include "catalog/pg_proc.h"
@@ -1103,10 +1104,16 @@ stmt_assign		: T_DATUM
  * "SET @uservar = expr;", so the existing user-variable machinery runs it
  * unchanged.
  *
- * "SET <system-var> = expr" (no "@") is not covered by this: that spelling
- * is indistinguishable at this point from "SET <bad-local-var-name> = expr",
- * which the T_WORD/T_CWORD alternatives below deliberately reject with a
- * friendlier error instead of guessing. Left for a future pass.
+ * "SET <system-var> = expr" (no "@") is spelled identically to "SET
+ * <bad-local-var-name> = expr" up to this point -- both reach here as
+ * K_SET T_WORD, since a bare word that isn't a declared plmysql datum
+ * always lexes as T_WORD regardless of what it names.  isSystemVariable()
+ * (the same registry the top-level MySQL SET statement consults) is used
+ * to tell them apart: a known system variable name is handed to SPI
+ * verbatim exactly like the "@uservar" case above, so it runs through the
+ * same "SET SQL_MODE = ..." machinery a top-level SET already uses; a name
+ * that isn't a known system variable falls through to the pre-existing
+ * "not a known variable" error.
  */
 stmt_set		: K_SET set_assign_list
 					{
@@ -1120,9 +1127,18 @@ stmt_set		: K_SET set_assign_list
 					}
 				| K_SET T_WORD
 					{
-						/* just to give a better message than "syntax error" */
-						word_is_not_variable(&($2), @2);
-						$$ = NIL;
+						/* "SET <system-var> = expr;" -- see the comment above */
+						if (isSystemVariable($2.ident))
+						{
+							plmysql_push_back_token(T_WORD);
+							$$ = list_make1(make_execsql_stmt(K_SET, @1, NULL));
+						}
+						else
+						{
+							/* just to give a better message than "syntax error" */
+							word_is_not_variable(&($2), @2);
+							$$ = NIL;
+						}
 					}
 				| K_SET T_CWORD
 					{
