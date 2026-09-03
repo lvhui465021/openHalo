@@ -91,7 +91,7 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 | # | 缺口 | 证据 | 方案 |
 |---|---|---|---|
 | **C1** | **`CALL` 多结果集协议帧错乱** | 过程体含裸 `SELECT`（返回结果集）的 `CALL`，在 pymysql 上稳定触发 “Packet sequence number wrong”，随后连接不可用。这正是 §1 里必须用一次性连接隔离的原因 | 高优先级：核对 MySQL 协议下 CALL 结果集的 `SERVER_MORE_RESULTS_EXISTS` 标志与包序号（sequence id）。疑似适配层在多结果集之间的收尾 OK 包/序号处理有误。**需先用官方 `mysql` CLI 复核**是否 pymysql 特有，再定位 `src/backend/adapter/mysql/` 的结果集发包路径 |
-| **C2** | **过程内 `COMMIT`/`ROLLBACK` 运行期 1105** | 已知（设计文档 §7 风险 6）：`exec_stmt_commit` 调 `SPI_commit()`，但 MySQL 协议的 CALL 分发不构造 `atomic=false` 的 `CallContext`，`fcinfo->context` 恒 NULL → PG 报 1105 “invalid transaction termination”。sp_trans.test 的多条失败即源于此 | 让 MySQL 协议的 CALL 分发构造带 `atomic=false` 的 `CallContext`（对齐 PG 标准 `CallStmt` 执行路径），使 `SPI_commit/rollback` 合法 |
+| **C2** | **过程内 `COMMIT`/`ROLLBACK` 运行期 1105** | **根因已重新定位（2026-09-04 复测更正）**：MySQL 协议的 CALL 分发其实已经正确构造了 `atomic=false` 的 `CallContext`（`mys_utility.c`/`utility.c` 的 `T_CallStmt` 分支与标准 PG 路径一致，实测 `isAtomicContext=0`）。真正原因是 `ExecuteCallStmt()`（`functioncmds.c`）里一条更早、更宽的 PG 原生规则：只要目标过程的 `pg_proc.proconfig` 非空就无条件把 `atomic` 强制改回 `true`（注释：GUC 栈在事务边界弹不出去）。而 plmysql **每一个**例程都会把 `sql_mode`/`created`/`last_altered`/`definer` 等元数据以 `SET`-style DefElem 写进 `proconfig`（见 `mys_make_routine_meta_item`），所以这条限制对所有 MySQL 例程恒为真——与 SQL SECURITY DEFINER/INVOKER 无关（两种都试过，一样报错）。即 M9 之前设计文档 §7 风险 6 的描述已过时，实际是元数据存储机制与 PG 事务控制语句的结构性冲突，不是简单的“少传一个标志位” | 三选一，均有代价：**(a)** 把这些元数据挪出 `proconfig`（例如专用 catalog 表或 `COMMENT ON FUNCTION`），恢复 `proconfig` 为空——改动面大，牵涉 SHOW CREATE PROCEDURE/information_schema.ROUTINES/mysqldump 导出等已完成里程碑（test_012/016/019 都依赖当前存储方式），需要专项评审；**(b)** 仅对“确实含有 COMMIT/ROLLBACK”的例程尝试绕过该限制（例如探测请求时临时清空/搬移 proconfig）——本质是绕开 PG 官方为 GUC 栈安全设的保护，风险高，不建议；**(c)** 维持现状，作为已知限制记录（MySQL 例程可以合法使用显式事务控制，但目前会报 1105）。建议与用户确认取舍后再排期，不要在未评审下直接改 |
 
 ### D. 错误码与严格性缺口（负向，`MISSING_ERR`=openHalo 过于宽松）
 
@@ -116,21 +116,32 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 
 以“投入产出比”排序：
 
-### M9 — 编译期语法收尾（**首选，收益最大，风险低**）
-- **A1 单语句过程体**（~1–2 天）：例程体捕获支持非 `BEGIN` 首 token 的单语句。**单项即把
-  `CREATE PROCEDURE` 通过率 57%→~88%。**
-- **A2 过程特性属性过滤**（~0.5 天）：`is_procedure` 时剔除 volatility 类 DefElem。→~94%。
-- **A4 体内 `SET` 系统变量消歧**（~1 天）。
-- 回归：把 `sp.test` 里的单语句体/特性用例固化进 `src/test/mysql/`。
+### M9 — 编译期语法收尾（**首选，收益最大，风险低**）✅ 已完成（2026-09-04）
+- **A1 单语句过程体**：例程体捕获支持非 `BEGIN` 首 token 的单语句。
+- **A2 过程特性属性过滤**：`is_procedure` 时剔除 volatility 类 DefElem。
+- **A3 体内双引号字符串**：根因不是 sql_mode 接入不到位，而是 plmysql 自己的词法层
+  （`pl_scanner.c`）从未使用过 MySQL 风格的核心扫描器（`mys_core_yylex`/`mys_scan.l`），
+  一直在用 PG 原生的 `core_yylex`/`scan.l`——例程体内的任何字面量都按 PG 词法规则而非
+  MySQL 规则解析。改用 `mys_core_yylex` 后顺带暴露了 `pl_gram.y` 与 `mys_gram.y` 的“核心
+  token”声明顺序早已不同步（`MysqlUserVariableName`/`MysSysVarName` 插入在 mys_gram.y 里、
+  未同步进 pl_gram.y），导致 `ICONST` 及之后所有 token 编号错位——一并修正。
+- **A4 体内 `SET` 系统变量消歧**：复用 `isSystemVariable()`（与顶层 SET 语句同一套注册表）
+  区分“系统变量”与“未声明局部变量”。
+- 回归：`src/test/mysql/t/test_024`–`test_027`（单语句体、DETERMINISTIC、词法修复、SET 系统
+  变量消歧）。
+- 实测（`sp.test`，最大受益文件）：`create_procedure` 编译通过率 57%→79%（三文件合计
+  57%→76%，204/358→272/358）；`create_function`/`create_trigger` 持平，无回归。
 
 ### M10 — 运行期/协议正确性（**用户可感知的高优先级**）
 - **C1 CALL 多结果集帧错乱**（~2–4 天，需先复核）：这是任何用 CALL + 结果集的真实客户端都会
   撞到的问题，优先级应高。
-- **C2 CALL 非原子执行 + 事务语句**（~2–3 天）：构造 `CallContext(atomic=false)`，打通过程内
-  `COMMIT`/`ROLLBACK`；顺带补 A/D 里的 1422 隐式提交拦截。
+- **C2 CALL 非原子执行 + 事务语句**：**根因已重新定位**（见 §3 表格更新）——不是缺一个
+  `atomic=false` 标志位，而是 plmysql 例程元数据的存储方式（`pg_proc.proconfig`）与 PG 原生
+  对“含 proconfig 的过程恒强制 atomic=true”的保护规则结构性冲突。修复需要挪动元数据存储位置，
+  改动面覆盖 test_012/016/019 已验证的 dump/metadata 路径，建议单独立项评审，不纳入本轮
+  快速修复范围。
 
 ### M11 — 类型系统
-- **A3 体内双引号字符串**（~1 天，随 sql_mode 接入 plmysql 表达式解析）。
 - **B2 `BINARY`/`CHARSET` 类型特性**（~1 天，接受并忽略或给 1235）。
 - **B1 ENUM/SET 类型**（~1–2 周，独立特性）：投入大，建议独立立项，非 SP 专属。
 
