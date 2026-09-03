@@ -18,6 +18,7 @@
 
 #include "mb/pg_wchar.h"
 #include "parser/scanner.h"
+#include "parser/mysql/mys_scanner.h"
 
 #include "plmysql.h"
 #include "pl_gram.h"			/* must be after parser/scanner.h */
@@ -350,6 +351,15 @@ plmysql_token_length(void)
  * a token pushback stack.  We also make a couple of trivial single-token
  * translations from what the core lexer does to what we want, in particular
  * interfacing from the core_YYSTYPE to YYSTYPE union.
+ *
+ * We use the MySQL-flavored core lexer (mys_core_yylex, from mys_scan.l)
+ * rather than PostgreSQL's own core_yylex, so that literals inside a
+ * PL/MySQL routine body follow MySQL lexical rules (sql_mode-dependent
+ * double-quote strings, backtick-quoted identifiers, etc.) instead of
+ * PostgreSQL's.  plmysql's own reserved/unreserved PL keyword lists are
+ * still used for keyword recognition, unaffected by this choice of core
+ * scanner -- only the core token classification (IDENT/SCONST/Op/...) for
+ * non-keyword lexemes changes.
  */
 static int
 internal_yylex(TokenAuxData *auxdata)
@@ -365,7 +375,7 @@ internal_yylex(TokenAuxData *auxdata)
 	}
 	else
 	{
-		token = core_yylex(&auxdata->lval.core_yystype,
+		token = mys_core_yylex(&auxdata->lval.core_yystype,
 						   &auxdata->lloc,
 						   yyscanner);
 
@@ -632,8 +642,8 @@ plmysql_latest_lineno(void)
 void
 plmysql_scanner_init(const char *str)
 {
-	/* Start up the core scanner */
-	yyscanner = scanner_init(str, &core_yy,
+	/* Start up the MySQL-flavored core scanner */
+	yyscanner = mys_scanner_init(str, &core_yy,
 							 &ReservedPLMySQLKeywords, ReservedPLKeywordTokens);
 
 	/*
@@ -660,7 +670,7 @@ void
 plmysql_scanner_finish(void)
 {
 	/* release storage */
-	scanner_finish(yyscanner);
+	mys_scanner_finish(yyscanner);
 	/* avoid leaving any dangling pointers */
 	yyscanner = NULL;
 	scanorig = NULL;

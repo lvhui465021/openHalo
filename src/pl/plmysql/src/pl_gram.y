@@ -255,20 +255,27 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 
 /*
  * Basic non-keyword token types.  These are hard-wired into the core lexer.
- * They must be listed first so that their numeric codes do not depend on
- * the set of keywords.  Keep this list in sync with backend/parser/gram.y!
+ * They must be listed first, in the same order, so that their numeric codes
+ * line up across grammars that share a core-lexer-compatible scanner.  Keep
+ * this list in sync with backend/parser/mysql/mys_gram.y: pl_scanner.c reads
+ * tokens via mys_core_yylex() (the MySQL-flavored core lexer), so any
+ * mismatch here silently misinterprets tokens rather than erroring.
  *
  * Some of these are not directly referenced in this file, but they must be
  * here anyway.
  */
-%token <str>	IDENT UIDENT FCONST SCONST USCONST BCONST XCONST Op
+%token <str>	IDENT UIDENT FCONST SCONST USCONST BCONST XCONST Op MysqlUserVariableName MysSysVarName
 %token <ival>	ICONST PARAM
-%token <str>		TYPECAST DOT_DOT COLON_EQUALS EQUALS_GREATER T_WORD_COLON
+%token			TYPECAST DOT_DOT COLON_EQUALS EQUALS_GREATER
 %token			LESS_EQUALS GREATER_EQUALS NOT_EQUALS
+%token			UNDERSCORE_BINARY MysParam Op_And Op_Or
 
 /*
  * Other tokens recognized by plmysql's lexer interface layer (pl_scanner.c).
+ * These are plmysql-internal; their numeric codes don't need to match any
+ * other grammar, but they must come after the shared core-lexer block above.
  */
+%token <str>		T_WORD_COLON
 %token <word>		T_WORD		/* unrecognized simple identifier */
 %token <cword>		T_CWORD		/* unrecognized composite identifier */
 %token <wdatum>		T_DATUM		/* a VAR, ROW, REC, or RECFIELD variable */
@@ -1085,16 +1092,16 @@ stmt_assign		: T_DATUM
  * this mirrors what getdiag_target does.
  *
  * MySQL also allows "SET @uservar = expr;": a session-level user variable,
- * not a plmysql local datum.  The scanner has no notion of "@identifier" as
- * one token (core scan.l returns a lone "@" as a generic Op, since it isn't
- * one of the core scanner's multi-char operators), so "SET @x = 1" reaches
- * this production as K_SET Op("@") rather than K_SET T_DATUM.  Rather than
- * teach this grammar what a user variable is, the whole statement is handed
- * to SPI verbatim, exactly like a generic passthrough SQL statement
- * (stmt_execsql's make_execsql_stmt): under the MySQL protocol session that
- * every plmysql routine runs in, SPI parses it with the very same grammar
- * that already handles a top-level "SET @uservar = expr;", so the existing
- * user-variable machinery runs it unchanged.
+ * not a plmysql local datum.  The MySQL-flavored core lexer returns a whole
+ * "@identifier" as one MysqlUserVariableName token (see mys_scan.l), so
+ * "SET @x = 1" reaches this production as K_SET MysqlUserVariableName rather
+ * than K_SET T_DATUM.  Rather than teach this grammar what a user variable
+ * is, the whole statement is handed to SPI verbatim, exactly like a generic
+ * passthrough SQL statement (stmt_execsql's make_execsql_stmt): under the
+ * MySQL protocol session that every plmysql routine runs in, SPI parses it
+ * with the very same grammar that already handles a top-level
+ * "SET @uservar = expr;", so the existing user-variable machinery runs it
+ * unchanged.
  *
  * "SET <system-var> = expr" (no "@") is not covered by this: that spelling
  * is indistinguishable at this point from "SET <bad-local-var-name> = expr",
@@ -1105,12 +1112,10 @@ stmt_set		: K_SET set_assign_list
 					{
 						$$ = $2;
 					}
-				| K_SET Op
+				| K_SET MysqlUserVariableName
 					{
 						/* "SET @uservar = expr;" -- see the comment above */
-						if (strcmp($2, "@") != 0)
-							yyerror("syntax error");
-						plmysql_push_back_token(Op);
+						plmysql_push_back_token(MysqlUserVariableName);
 						$$ = list_make1(make_execsql_stmt(K_SET, @1, NULL));
 					}
 				| K_SET T_WORD
