@@ -183,6 +183,7 @@ static Node *makeStringConstCast(char *str, int location, TypeName *typename);
 static DefElem *mys_make_routine_meta_item(const char *name, const char *value,
 										   int location);
 static List *mys_apply_default_sql_security(List *options);
+static List *mys_drop_procedure_volatility_opt(List *options, bool is_procedure);
 static Node *makeIntConst(int val, int location);
 static Node *makeFloatConst(char *str, int location);
 static Node *makeBitStringConst(char *str, int location);
@@ -241,7 +242,7 @@ static char *mys_capture_return_stmt_text(core_yyscan_t yyscanner,
 									  int return_loc,
 									  int lookahead_token,
 									  int lookahead_loc);
-static char *mys_capture_trigger_body(core_yyscan_t yyscanner,
+static char *mys_capture_body_or_single_stmt(core_yyscan_t yyscanner,
 								  int lookahead_token,
 								  int lookahead_loc,
 								  int *leftover_token,
@@ -498,6 +499,7 @@ static char *mys_return_body_text;
 
 %type <node>    opt_routine_body
 %type <str>     mysql_routine_body
+%type <keyword> mysql_single_stmt_body_leader
 %type <groupclause> group_clause
 %type <node>	opt_publication_for_tables publication_for_tables
 
@@ -8815,7 +8817,7 @@ mysql_trigger_body:
 					lookahead = yychar;
 					lookahead_loc = yylloc;
 				}
-				$$ = mys_capture_trigger_body(yyscanner, lookahead, lookahead_loc,
+				$$ = mys_capture_body_or_single_stmt(yyscanner, lookahead, lookahead_loc,
 											  &leftover, &yylval, &yylloc);
 				yychar = leftover;
 			}
@@ -11257,6 +11259,7 @@ CreateFunctionStmt:
 						n->options = lappend(n->options,
 							mys_make_routine_meta_item("plmysql.definer", $3, @3));
 					n->sql_body = NULL;
+					n->options = mys_drop_procedure_volatility_opt(n->options, n->is_procedure);
 					n->options = mys_apply_default_sql_security(n->options);
 					$$ = (Node *)n;
 				}
@@ -11281,6 +11284,7 @@ CreateFunctionStmt:
 						n->options = lappend(n->options,
 							mys_make_routine_meta_item("plmysql.definer", $3, @3));
 					n->sql_body = NULL;
+					n->options = mys_drop_procedure_volatility_opt(n->options, n->is_procedure);
 					n->options = mys_apply_default_sql_security(n->options);
 					$$ = (Node *)n;
 				}
@@ -11327,6 +11331,7 @@ CreateFunctionStmt:
 						n->sql_body = $10;
 					}
 					mys_return_body_text = NULL;
+					n->options = mys_drop_procedure_volatility_opt(n->options, n->is_procedure);
 					n->options = mys_apply_default_sql_security(n->options);
 					$$ = (Node *)n;
 				}
@@ -11340,7 +11345,7 @@ CreateFunctionStmt:
 					n->parameters = mergeTableFuncParameters($6, $10);
 					n->returnType = TableFuncTypeName($10);
 					n->returnType->location = @8;
-					n->options = mys_apply_default_sql_security($12);
+					n->options = mys_apply_default_sql_security(mys_drop_procedure_volatility_opt($12, n->is_procedure));
 					n->sql_body = $13;
 					$$ = (Node *)n;
 				}
@@ -11354,6 +11359,7 @@ CreateFunctionStmt:
 					n->parameters = $6;
 					n->returnType = NULL;
 					n->options = $7;
+					n->options = mys_drop_procedure_volatility_opt(n->options, n->is_procedure);
 					n->options = mys_apply_default_sql_security(n->options);
 					n->sql_body = $8;
 					$$ = (Node *)n;
@@ -11368,6 +11374,7 @@ CreateFunctionStmt:
 					n->parameters = $6;
 					n->returnType = NULL;
 					n->options = $7;
+					n->options = mys_drop_procedure_volatility_opt(n->options, n->is_procedure);
 					n->options = mys_apply_default_sql_security(n->options);
 					n->sql_body = $8;
 					$$ = (Node *)n;
@@ -11872,11 +11879,28 @@ ReturnStmt:	RETURN a_expr
 		;
 
 /*
- * A MySQL routine body: a bare BEGIN ... END block, swallowed as raw text.
+ * A MySQL routine body is either a bare BEGIN ... END block, or -- when the
+ * routine has no compound statements -- one ordinary SQL statement with no
+ * BEGIN/END at all, e.g. "CREATE PROCEDURE p() INSERT INTO t VALUES (1)".
+ * Both shapes are swallowed as raw text (mys_capture_body_or_single_stmt(),
+ * shared with CREATE TRIGGER's body), so none of MySQL's SQL/PSM syntax has
+ * to be modelled here.
  *
- * Only the opening BEGIN is a grammar symbol; everything up to and including
- * the matching END is consumed by mys_capture_routine_body() straight off the
- * scanner, so none of MySQL's SQL/PSM syntax has to be modelled here.
+ * The single-statement alternatives below list specific leading keywords
+ * (SELECT/INSERT/... ) rather than dispatching generically off an empty
+ * production the way CREATE TRIGGER's body does: this nonterminal shares a
+ * prefix with opt_routine_body's own possibly-empty PG-native body (used by
+ * the plpgsql/AS-clause CREATE FUNCTION/PROCEDURE forms), and an empty-headed
+ * alternative here reduce/reduce-conflicts with that empty alternative,
+ * since bison cannot tell which of the two productions' empty case a bare
+ * lookahead like ';' belongs to.  Requiring a real leading keyword avoids the
+ * conflict: mys_yylex is a normal LALR terminal at that point, not a
+ * lookahead this production merely inspects.
+ *
+ * The list is deliberately the realistic set of statements MySQL permits as
+ * a routine's single-statement body (DECLARE/HANDLER/flow control require a
+ * BEGIN block, so they are intentionally not included), not an exhaustive
+ * enumeration of every statement kind stmt itself accepts.
  */
 mysql_routine_body:
 			BEGIN_P
@@ -11912,6 +11936,56 @@ mysql_routine_body:
 					 */
 					yychar = leftover;
 				}
+			| mysql_single_stmt_body_leader
+				{
+					int			leftover = YYEMPTY;
+					char	   *stmt_text;
+
+					/*
+					 * mysql_single_stmt_body_leader's one real token has
+					 * already been shifted by bison, so all
+					 * mys_capture_body_or_single_stmt() needs from it is @1,
+					 * the start of the body; the token value it takes is
+					 * only ever compared against BEGIN_P to pick its
+					 * BEGIN...END path over its scan-to-terminator path, so
+					 * any non-BEGIN_P placeholder does equally well here.
+					 * From @1 the capture loop, not bison, owns the token
+					 * stream until the closing ';' or end of input.
+					 */
+					stmt_text = mys_capture_body_or_single_stmt(yyscanner, SELECT, @1,
+																&leftover, &yylval,
+																&yylloc);
+
+					/*
+					 * Unlike the BEGIN_P branch above, whose capture already
+					 * includes BEGIN/END, plmysql's own compiler (pl_gram.y)
+					 * requires every routine body to be a pl_block, i.e. to
+					 * be wrapped in BEGIN...END; a bare single statement is
+					 * not by itself a valid plmysql routine body.  Wrap it
+					 * here, the same way the "RETURN expr" one-liner form
+					 * does for opt_routine_body's ReturnStmt.
+					 */
+					$$ = psprintf("BEGIN %s; END", stmt_text);
+
+					yychar = leftover;
+				}
+		;
+
+/*
+ * DO is deliberately not included here: this grammar's DO token is claimed
+ * by PostgreSQL's own DoStmt (an anonymous "DO $$ ... $$ [LANGUAGE lang]"
+ * code block), not MySQL's "DO expr [, expr] ..." (evaluate and discard).
+ * Adding MySQL's DO would need its own dedicated production, not a leading
+ * keyword raw-captured like the others here.
+ */
+mysql_single_stmt_body_leader:
+			  SELECT
+			| INSERT
+			| UPDATE
+			| DELETE_P
+			| REPLACE
+			| CALL
+			| SET
 		;
 
 opt_routine_body:
@@ -23643,6 +23717,45 @@ mys_apply_default_sql_security(List *options)
 				   makeDefElem("security", (Node *) makeInteger(true), -1));
 }
 
+/*
+ * MySQL 5.7's [NOT] DETERMINISTIC routine characteristic is valid on both
+ * CREATE PROCEDURE and CREATE FUNCTION (13.1.16), and is purely advisory
+ * either way: MySQL never checks it against the routine body, and for a
+ * PROCEDURE specifically it has no runtime effect at all (only a FUNCTION's
+ * result can be cached/reused based on it).  The "volatility" DefElem it is
+ * translated to above (see the DETERMINISTIC/NOT DETERMINISTIC
+ * common_func_opt_item actions) models PostgreSQL's STABLE/VOLATILE, which
+ * compute_common_attribute() in functioncmds.c unconditionally rejects for
+ * procedures ("invalid attribute in procedure definition", 1105) since a
+ * genuine PostgreSQL procedure has no such concept.  Silently dropping it
+ * for procedures only (functions keep the real STABLE/VOLATILE mapping) is
+ * the closest available match to MySQL's own "accepted but inert" handling;
+ * unlike DEFINER/COMMENT/SQL_DATA_ACCESS, this repo does not yet have a
+ * plmysql.* GUC to echo the characteristic back through SHOW CREATE
+ * PROCEDURE/information_schema, so that display-fidelity gap remains open.
+ */
+static List *
+mys_drop_procedure_volatility_opt(List *options, bool is_procedure)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	if (!is_procedure)
+		return options;
+
+	foreach(lc, options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "volatility") == 0)
+			continue;
+
+		result = lappend(result, def);
+	}
+
+	return result;
+}
+
 static CreateTrigStmt *
 mys_make_pg_trigger_tail(RangeVar *relation, List *transition_rels, bool row,
 						 Node *when_clause, List *funcname, List *args)
@@ -25110,13 +25223,17 @@ done:
 }
 
 /*
- * Capture the body after MySQL's mandatory FOR EACH ROW clause.  Compound
- * bodies reuse the routine-body capture machinery; a single statement ends
+ * Capture a MySQL routine/trigger body that may be spelled either as a
+ * compound BEGIN...END block or as one bare statement -- both CREATE
+ * TRIGGER's mandatory FOR EACH ROW clause and CREATE FUNCTION/PROCEDURE
+ * accept either shape.  A compound body delegates to the BEGIN...END-only
+ * capture machinery (mys_capture_routine_body()); a single statement ends
  * at the top-level statement terminator (or end of input).  A terminator is
- * handed back to bison so it remains the terminator of CREATE TRIGGER.
+ * handed back to bison so it remains the terminator of the enclosing CREATE
+ * statement.
  */
 static char *
-mys_capture_trigger_body(core_yyscan_t yyscanner, int lookahead_token,
+mys_capture_body_or_single_stmt(core_yyscan_t yyscanner, int lookahead_token,
 						 int lookahead_loc, int *leftover_token,
 						 YYSTYPE *leftover_lval, YYLTYPE *leftover_loc)
 {
