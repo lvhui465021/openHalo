@@ -11971,6 +11971,53 @@ mysql_routine_body:
 
 					yychar = leftover;
 				}
+			/*
+			 * "label: <stmt>" as the routine's entire body.  MySQL puts
+			 * labels on BEGIN/LOOP/REPEAT/WHILE only, and the closer may
+			 * echo the label ("END WHILE lbl"); plmysql's own grammar
+			 * already accepts both (opt_loop_label/opt_label), so the raw
+			 * text just has to survive capture intact -- which is why these
+			 * start the captured substring at the label ($1's location),
+			 * not at the leader keyword.  IDENT only: a label is a plain
+			 * identifier, and letting keywords lead would collide with the
+			 * leader list itself.
+			 */
+			| IDENT ':' mysql_single_stmt_body_leader
+				{
+					int			leftover = YYEMPTY;
+					char	   *stmt_text;
+
+					stmt_text = mys_capture_body_or_single_stmt(yyscanner, $3, @1,
+																&leftover, &yylval,
+																&yylloc);
+
+					$$ = psprintf("BEGIN %s; END", stmt_text);
+
+					yychar = leftover;
+				}
+			| IDENT ':' BEGIN_P
+				{
+					int			first_token = -1;
+					int			first_token_loc = 0;
+					int			leftover = YYEMPTY;
+
+					/*
+					 * Same shape as the bare BEGIN_P alternative above: the
+					 * lookahead past BEGIN decides BEGIN ATOMIC vs. a MySQL
+					 * body, and belongs to the capture from here on.
+					 */
+					if (yychar != YYEMPTY)
+					{
+						first_token = yychar;
+						first_token_loc = yylloc;
+					}
+
+					$$ = mys_capture_routine_body(yyscanner, @1,
+												  first_token, first_token_loc, -1,
+												  &leftover, &yylval, &yylloc);
+
+					yychar = leftover;
+				}
 		;
 
 /*
@@ -25258,6 +25305,30 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 							seen[depth * MYS_UNCOUNTED_KINDS + next_kind] == 0)
 						{
 							end_loc = yyextra->core_yy_extra.last_token_end - 3;
+
+							/*
+							 * The closer of a labeled LOOP/REPEAT/WHILE may
+							 * echo the label ("END WHILE lbl"); IF takes no
+							 * echo.  When the whole body is one such loop,
+							 * that echo is part of the body text, not the
+							 * start of whatever follows the routine -- and
+							 * anything the capture reads past the body it
+							 * must hand back as the parser's lookahead.
+							 */
+							if (next_kind != 0)
+							{
+								int			after = mys_yylex(&lval, &lloc, yyscanner);
+
+								if (after == IDENT)
+									end_loc =
+										yyextra->core_yy_extra.last_token_end - 3;
+								else if (after > 0)
+								{
+									pending = after;
+									pending_lval = lval;
+									pending_loc = lloc;
+								}
+							}
 							goto done;
 						}
 						break;
@@ -25325,7 +25396,30 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 							next == CASE)
 							end_loc = yyextra->core_yy_extra.last_token_end - 3;
 						else
+						{
 							end_loc = this_end_loc;
+
+							/*
+							 * A labeled BEGIN block may echo its label after
+							 * the closer ("lbl: BEGIN ... END lbl").  Straight
+							 * after the outermost bare END an identifier can
+							 * only be that echo -- the statement terminator is
+							 * ';' or end of input -- so extend the captured
+							 * body over it and hand back what follows it.
+							 */
+							if (pending == IDENT)
+							{
+								int			after;
+								int			echo_end =
+									yyextra->core_yy_extra.last_token_end;
+
+								after = mys_yylex(&lval, &lloc, yyscanner);
+								end_loc = echo_end - 3;
+								pending = after;
+								pending_lval = lval;
+								pending_loc = lloc;
+							}
+						}
 						goto done;
 					}
 					break;
