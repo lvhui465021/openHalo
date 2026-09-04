@@ -1,11 +1,23 @@
 """M6 metadata: DEFINER account, sql_mode snapshot and timestamps recorded at
 CREATE time; MySQL-native `label:` prefixes; new error-code mappings.
 
-Before this milestone the DEFINER clause was accepted and dropped, and the
-mysql.proc / mys_informa_schema / SHOW CREATE surfaces returned a hard-coded
-definer (owner@%), a fixed sql_mode string and fixed dates.  plmysql now
-records plmysql.definer / sql_mode / created / last_altered as function-local
-GUC settings in pg_proc.proconfig, and the metadata views read them.
+Before M6 the DEFINER clause was accepted and dropped, and the mysql.proc /
+mys_informa_schema / SHOW CREATE surfaces returned a hard-coded definer
+(owner@%), a fixed sql_mode string and fixed dates.  plmysql records
+plmysql.definer / sql_mode / created / last_altered as routine metadata and
+the metadata views read them back through mysql.get_plmysql_config().
+
+That metadata is attached to the routine's OID as a "plmysql" security label
+(SECURITY LABEL FOR plmysql ON FUNCTION/PROCEDURE ...) rather than in
+pg_proc.proconfig: proconfig being non-empty makes PostgreSQL's
+ExecuteCallStmt() force any CALL of the routine into an atomic execution
+context, unconditionally blocking COMMIT/ROLLBACK in its body regardless of
+SQL SECURITY -- this was the actual root cause of the compat report's C2 gap.
+A MySQL trigger's own private underlying function is the one exception that
+still uses proconfig (see mys_make_mysql_trigger_function(), mys_utility.c):
+a trigger is never dispatched through CALL's atomic/non-atomic machinery, so
+proconfig's side effect never applied to it, and test_017 asserts on that
+storage directly.
 """
 
 import pymysql
@@ -39,16 +51,26 @@ def run(cluster):
          """CREATE DEFINER=`halo`@`localhost` PROCEDURE t016_def()
          BEGIN SET @t016 = 1; END""")
     out = cluster.psql(
-        "SELECT proconfig FROM pg_proc WHERE proname = 't016_def';")
+        "SELECT label FROM pg_seclabel sl, pg_proc p "
+        "WHERE sl.objoid = p.oid AND sl.classoid = 'pg_proc'::regclass "
+        "AND sl.provider = 'plmysql' AND p.proname = 't016_def';")
     assert "plmysql.definer=halo@localhost" in out, \
-        "DEFINER not recorded in proconfig: %r" % out
+        "DEFINER not recorded in the plmysql security label: %r" % out
     assert "plmysql.sql_mode=" in out, \
         "sql_mode snapshot not recorded: %r" % out
     assert "plmysql.created=" in out and "plmysql.last_altered=" in out, \
         "timestamps not recorded: %r" % out
+    # Nothing of this must have leaked into proconfig -- that's the whole
+    # point (see the module docstring): a non-empty proconfig would force
+    # every CALL of this routine into PostgreSQL's atomic execution context.
+    out = cluster.psql(
+        "SELECT proconfig FROM pg_proc WHERE proname = 't016_def';")
+    assert out.strip() == "", \
+        "regular routine metadata must not use proconfig any more: %r" % out
 
-    # The GUCs must be live: executing the routine proves fmgr can apply the
-    # proconfig settings (an unregistered GUC would fail every call).
+    # sql_mode must still be live: executing the routine proves plmysql's
+    # own handler correctly applies the label snapshot around the call
+    # (plmysql_get_sql_mode_snapshot(), pl_handler.c).
     _call(cluster, "CALL t016_def()")
 
     row = cluster.psql(
@@ -90,7 +112,9 @@ def run(cluster):
          "RETURNS INT RETURN 3")
     assert _scalar(cluster, "SELECT t016_deffn()") == (3,)
     out = cluster.psql(
-        "SELECT proconfig FROM pg_proc WHERE proname = 't016_deffn';")
+        "SELECT label FROM pg_seclabel sl, pg_proc p "
+        "WHERE sl.objoid = p.oid AND sl.classoid = 'pg_proc'::regclass "
+        "AND sl.provider = 'plmysql' AND p.proname = 't016_deffn';")
     assert "plmysql.definer=halo@%" in out, "got %r" % out
 
     # Without DEFINER the views fall back to owner@%.

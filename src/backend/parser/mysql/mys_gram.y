@@ -23682,22 +23682,28 @@ makeStringConstCast(char *str, int location, TypeName *typename)
 }
 
 /*
- * Build a "set" DefElem for CREATE/ALTER FUNCTION options that records one
- * plmysql.* routine metadata value (definer, sql_mode snapshot, timestamps).
- * The native CreateFunction()/AlterFunction() path stores the wrapped
- * VariableSetStmt into pg_proc.proconfig; the GUCs themselves are defined by
- * the plmysql extension.  Passing NULL value yields no item.
+ * Build a marker DefElem for CREATE/ALTER FUNCTION options that records one
+ * plmysql.* routine metadata value (definer, sql_mode snapshot, timestamps,
+ * sql_data_access).  This is NOT one of PostgreSQL's recognized function
+ * options -- compute_common_attribute() would reject an unknown "set"-kind
+ * item, and a real "set" DefElem would land in pg_proc.proconfig, which
+ * PostgreSQL's own ExecuteCallStmt() treats as reason enough to force a CALL
+ * of this routine into an atomic execution context (no COMMIT/ROLLBACK
+ * allowed in the body -- see the C2 gap in the compat report).  The "plmysql_
+ * meta" defname is therefore a private marker: mys_utility.c strips every
+ * item with this name out of the option list before it ever reaches
+ * CreateFunction()/AlterFunction(), and instead records it as a MySQL-
+ * flavored security label (SECURITY LABEL FOR plmysql ON FUNCTION ...) once
+ * the routine's OID is known -- attached metadata that still travels through
+ * pg_dump/pg_restore like proconfig did, but leaves proconfig itself empty.
+ * Callers only invoke this once they already know value is non-NULL.
  */
 static DefElem *
 mys_make_routine_meta_item(const char *name, const char *value, int location)
 {
-	VariableSetStmt *v = makeNode(VariableSetStmt);
-
-	v->kind = VAR_SET_VALUE;
-	v->name = pstrdup(name);
-	v->args = list_make1(makeStringConst((char *) value, location));
-
-	return makeDefElem("set", (Node *) v, location);
+	return makeDefElem("plmysql_meta",
+					   (Node *) makeString(psprintf("%s=%s", name, value)),
+					   location);
 }
 
 /*

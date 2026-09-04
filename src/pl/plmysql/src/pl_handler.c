@@ -21,6 +21,7 @@
 #include "adapter/mysql/systemVar.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "commands/seclabel.h"
 #include "funcapi.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
@@ -49,7 +50,8 @@ typedef struct PLMySQL_sql_mode_scope
 
 static void plmysql_restore_sql_mode(PLMySQL_sql_mode_scope *scope);
 static void plmysql_sql_mode_error_cleanup(int code, Datum arg);
-static bool plmysql_has_sql_mode_snapshot(Oid fn_oid);
+static bool plmysql_get_sql_mode_snapshot(Oid fn_oid, char **sql_mode_out);
+static void plmysql_seclabel_check(const ObjectAddress *object, const char *seclabel);
 
 /*
  * This is deliberately a backend-local stack.  A PL handler invocation
@@ -94,12 +96,8 @@ char	   *plmysql_extra_errors_string = NULL;
 int			plmysql_extra_warnings;
 int			plmysql_extra_errors;
 
-/* Routine metadata carried in pg_proc.proconfig (see _PG_init). */
+/* Trigger metadata carried in pg_proc.proconfig (see _PG_init). */
 char	   *plmysql_definer_string = NULL;
-char	   *plmysql_sql_mode_string = NULL;
-char	   *plmysql_sql_data_access_string = NULL;
-char	   *plmysql_created_string = NULL;
-char	   *plmysql_last_altered_string = NULL;
 char	   *plmysql_trigger_body_string = NULL;
 char	   *plmysql_trigger_name_string = NULL;
 
@@ -211,53 +209,60 @@ plmysql_sql_mode_error_cleanup(int code, Datum arg)
 }
 
 /*
- * An empty sql_mode is a real MySQL snapshot, not the absence of one.  The
- * registered GUC alone cannot distinguish it from an old plmysql routine
- * that has no plmysql.sql_mode item in proconfig, so inspect the catalog
- * entry before deciding whether to override the caller's adapter state.
+ * check_object_relabel_type hook for the "plmysql" security-label provider
+ * (registered in _PG_init()).  Accepts any label unconditionally: the only
+ * writer is plmysql itself (mys_plmysql_set_meta_label(), mys_utility.c),
+ * calling SetSecurityLabel() directly rather than through the SQL statement
+ * this hook guards, so this only ever runs for pg_restore replaying a
+ * previously dumped SECURITY LABEL FOR plmysql ON FUNCTION/PROCEDURE ...
+ * statement -- content this same process generated on the dump side.
+ */
+static void
+plmysql_seclabel_check(const ObjectAddress *object, const char *seclabel)
+{
+	(void) object;
+	(void) seclabel;
+}
+
+/*
+ * An empty sql_mode is a real MySQL snapshot, not the absence of one, so the
+ * caller needs a real found/not-found signal rather than just an empty
+ * string.  The snapshot itself now lives in the routine's "plmysql" security
+ * label rather than pg_proc.proconfig (see mys_plmysql_meta_marker() in
+ * mys_utility.c for why: proconfig forces PostgreSQL's ExecuteCallStmt() to
+ * treat any CALL of the routine as atomic, blocking COMMIT/ROLLBACK in its
+ * body -- the C2 gap in the compat report). Returns false, leaving
+ * *sql_mode_out untouched, for a routine with no plmysql.sql_mode entry in
+ * its label (predates this mechanism, or was never a plmysql routine).
  */
 static bool
-plmysql_has_sql_mode_snapshot(Oid fn_oid)
+plmysql_get_sql_mode_snapshot(Oid fn_oid, char **sql_mode_out)
 {
 	static const char setting[] = "plmysql.sql_mode=";
-	HeapTuple	tuple;
-	Datum		datum;
-	bool		isnull;
-	ArrayType  *config;
-	Datum	   *values;
-	bool	   *nulls;
-	int			nelems;
-	int			i;
-	bool		found = false;
+	const size_t setting_len = sizeof(setting) - 1;
+	ObjectAddress address;
+	char	   *label;
+	char	   *cursor;
 
-	tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn_oid));
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "cache lookup failed for function %u", fn_oid);
+	ObjectAddressSet(address, ProcedureRelationId, fn_oid);
+	label = GetSecurityLabel(&address, "plmysql");
+	if (label == NULL)
+		return false;
 
-	datum = SysCacheGetAttr(PROCOID, tuple, Anum_pg_proc_proconfig, &isnull);
-	if (!isnull)
+	for (cursor = label; cursor != NULL && *cursor != '\0'; )
 	{
-		config = DatumGetArrayTypeP(datum);
-		deconstruct_array(config, TEXTOID, -1, false, TYPALIGN_INT,
-						  &values, &nulls, &nelems);
-		for (i = 0; i < nelems; i++)
+		char	   *nl = strchr(cursor, '\n');
+		size_t		linelen = nl ? (size_t) (nl - cursor) : strlen(cursor);
+
+		if (linelen >= setting_len &&
+			strncmp(cursor, setting, setting_len) == 0)
 		{
-			text	   *value;
-
-			if (nulls[i])
-				continue;
-			value = DatumGetTextPP(values[i]);
-			if (VARSIZE_ANY_EXHDR(value) >= sizeof(setting) - 1 &&
-				memcmp(VARDATA_ANY(value), setting, sizeof(setting) - 1) == 0)
-			{
-				found = true;
-				break;
-			}
+			*sql_mode_out = pnstrdup(cursor + setting_len, linelen - setting_len);
+			return true;
 		}
+		cursor = nl ? nl + 1 : NULL;
 	}
-	ReleaseSysCache(tuple);
-
-	return found;
+	return false;
 }
 
 
@@ -323,45 +328,30 @@ _PG_init(void)
 							   NULL);
 
 	/*
-	 * Routine metadata that pg_proc cannot carry, stored as function-local
-	 * GUC settings (proconfig).  Writing them through proconfig rather than a
-	 * companion catalog keeps them attached to the routine across
-	 * pg_dump/pg_restore and logical replication, and makes them visible to
-	 * the executor as ordinary session GUCs during a call, which is how
-	 * CREATE-time sql_mode semantics will be applied.
+	 * Trigger metadata that pg_proc cannot carry, stored as function-local
+	 * GUC settings (proconfig) on a MySQL trigger's private underlying
+	 * function (mys_make_mysql_trigger_function(), mys_utility.c).  Writing
+	 * them through proconfig rather than a companion catalog keeps them
+	 * attached to the routine across pg_dump/pg_restore and logical
+	 * replication.  A regular (non-trigger) CREATE/ALTER FUNCTION or
+	 * PROCEDURE's own equivalent metadata -- definer, sql_mode snapshot,
+	 * created, last_altered, sql_data_access -- deliberately does NOT use
+	 * proconfig any more (see mys_plmysql_meta_marker() in mys_utility.c):
+	 * proconfig forces PostgreSQL's ExecuteCallStmt() to treat any CALL of
+	 * the routine as atomic, blocking COMMIT/ROLLBACK in its body, so those
+	 * items are carried as a "plmysql" security label instead, read back via
+	 * GetSecurityLabel() (see plmysql_get_sql_mode_snapshot() below) or, for
+	 * the display-only ones, by aux_mysql's mysql.get_plmysql_config() SQL
+	 * function.  A trigger is never dispatched through CALL's atomic/non-
+	 * atomic machinery, so proconfig's side effect doesn't apply to it, and
+	 * plmysql.definer is needed as a real GUC here regardless since a
+	 * trigger's private function still records it through this same
+	 * proconfig mechanism.
 	 */
 	DefineCustomStringVariable("plmysql.definer",
 							   gettext_noop("Definer account recorded at routine creation, as user@host."),
 							   NULL,
 							   &plmysql_definer_string,
-							   "",
-							   PGC_USERSET, 0,
-							   NULL, NULL, NULL);
-	DefineCustomStringVariable("plmysql.sql_mode",
-							   gettext_noop("sql_mode snapshot recorded at routine creation."),
-							   NULL,
-							   &plmysql_sql_mode_string,
-							   "",
-							   PGC_USERSET, 0,
-							   NULL, NULL, NULL);
-	DefineCustomStringVariable("plmysql.sql_data_access",
-							   gettext_noop("MySQL SQL-data-access routine characteristic."),
-							   NULL,
-							   &plmysql_sql_data_access_string,
-							   "",
-							   PGC_USERSET, 0,
-							   NULL, NULL, NULL);
-	DefineCustomStringVariable("plmysql.created",
-							   gettext_noop("Routine creation time, ISO text."),
-							   NULL,
-							   &plmysql_created_string,
-							   "",
-							   PGC_USERSET, 0,
-							   NULL, NULL, NULL);
-	DefineCustomStringVariable("plmysql.last_altered",
-							   gettext_noop("Routine last-alter time, ISO text."),
-							   NULL,
-							   &plmysql_last_altered_string,
 							   "",
 							   PGC_USERSET, 0,
 							   NULL, NULL, NULL);
@@ -381,6 +371,18 @@ _PG_init(void)
 							   NULL, NULL, NULL);
 
 	EmitWarningsOnPlaceholders("plmysql");
+
+	/*
+	 * Register the "plmysql" security-label provider so that a dumped
+	 * SECURITY LABEL FOR plmysql ON FUNCTION/PROCEDURE ... statement (see
+	 * mys_plmysql_set_meta_label(), mys_utility.c) can be replayed by
+	 * pg_restore: PostgreSQL's SECURITY LABEL statement path refuses to
+	 * write a label for an unregistered provider.  plmysql itself only ever
+	 * writes these labels directly via SetSecurityLabel(), which does not
+	 * go through this check, so the hook just needs to exist, not validate
+	 * anything -- there is no untrusted input to police here.
+	 */
+	register_label_provider("plmysql", plmysql_seclabel_check);
 
 	plmysql_HashTableInit();
 	RegisterXactCallback(plmysql_xact_cb, NULL);
@@ -531,10 +533,12 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 	PG_ENSURE_ERROR_CLEANUP(plmysql_sql_mode_error_cleanup,
 							PointerGetDatum(&sql_mode_scope));
 	{
-		if (plmysql_has_sql_mode_snapshot(fcinfo->flinfo->fn_oid))
+		char	   *sql_mode_snapshot;
+
+		if (plmysql_get_sql_mode_snapshot(fcinfo->flinfo->fn_oid, &sql_mode_snapshot))
 		{
 			sql_mode_scope.active = true;
-			mysApplySqlMode(plmysql_sql_mode_string, false);
+			mysApplySqlMode(sql_mode_snapshot, false);
 		}
 
 	/*

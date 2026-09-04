@@ -72,17 +72,29 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "adapter/mysql/systemVar.h"
+#include "commands/seclabel.h"
 #include "utils/timestamp.h"
 
 /*
  * Routine metadata for the plmysql engine, carried in pg_proc.proconfig as
  * function-local GUC settings (plmysql.definer / sql_mode / created /
- * last_altered, defined by the plmysql extension).  The grammar records the
- * DEFINER account; the utility path here adds the CREATE-time session
- * sql_mode snapshot and the timestamps right before the native DDL path
- * stores proconfig, so pg_dump/pg_restore carry the values along with
- * prosrc.  The GUCs are inert strings, so a routine restored from a dump
- * without them simply falls back to the views' default display.
+ * last_altered / trigger_body / trigger_name, defined by the plmysql
+ * extension).  The grammar records the DEFINER account; the utility path
+ * here adds the CREATE-time session sql_mode snapshot and the timestamps
+ * right before the native DDL path stores proconfig, so pg_dump/pg_restore
+ * carry the values along with prosrc.  The GUCs are inert strings, so a
+ * routine restored from a dump without them simply falls back to the views'
+ * default display.
+ *
+ * This is now used ONLY by mys_make_mysql_trigger_function(): a MySQL
+ * trigger's private underlying function still needs its original body text
+ * and DEFINER recorded exactly this way (test_017 asserts on them straight
+ * out of pg_proc.proconfig), and unlike a CALL, a trigger is never dispatched
+ * through ExecuteCallStmt's atomic/non-atomic machinery, so proconfig's
+ * "forces the call atomic" side effect (see mys_plmysql_meta_marker() below)
+ * simply doesn't apply to it.  A regular CREATE FUNCTION/PROCEDURE's own
+ * metadata (definer, sql_mode, created, last_altered, sql_data_access) uses
+ * mys_plmysql_meta_marker() instead, for exactly that reason.
  */
 static DefElem *
 mys_plmysql_meta_item(const char *name, const char *value)
@@ -98,6 +110,149 @@ mys_plmysql_meta_item(const char *name, const char *value)
 	v->args = list_make1(c);
 
 	return makeDefElem("set", (Node *) v, -1);
+}
+
+/*
+ * Routine metadata for a regular (non-trigger) CREATE/ALTER FUNCTION or
+ * PROCEDURE (plmysql.definer / sql_mode / created / last_altered /
+ * sql_data_access), attached as a private "plmysql_meta" marker DefElem
+ * instead of the proconfig-based mys_plmysql_meta_item() above: proconfig,
+ * the previous storage, makes PostgreSQL's ExecuteCallStmt() treat any CALL
+ * of the routine as atomic, blocking COMMIT/ROLLBACK in its body -- the C2
+ * gap in the compat report.  mys_plmysql_extract_meta() below strips every
+ * such marker back out of the option list before the native DDL path ever
+ * sees it; mys_plmysql_set_meta_label()/mys_plmysql_merge_meta_label() then
+ * attach the extracted values to the routine's OID as a MySQL-flavored
+ * security label instead, once CreateFunction()/AlterFunction() has returned
+ * it.  A security label still travels through pg_dump/pg_restore like
+ * proconfig did (dumped as a SECURITY LABEL FOR plmysql ON FUNCTION/
+ * PROCEDURE ... statement), so a routine restored without one simply falls
+ * back to the views' default display, same as before.
+ */
+static DefElem *
+mys_plmysql_meta_marker(const char *name, const char *value)
+{
+	return makeDefElem("plmysql_meta",
+					   (Node *) makeString(psprintf("%s=%s", name, value)),
+					   -1);
+}
+
+/*
+ * Pull every "plmysql_meta" marker DefElem out of *options, in list order,
+ * returning their "key=value" payload strings.  Neither CreateFunction() nor
+ * AlterFunction() recognizes this marker name, so it must never reach them.
+ */
+static List *
+mys_plmysql_extract_meta(List **options)
+{
+	List	   *meta = NIL;
+	List	   *kept = NIL;
+	ListCell   *lc;
+
+	foreach(lc, *options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "plmysql_meta") == 0)
+			meta = lappend(meta, strVal(def->arg));
+		else
+			kept = lappend(kept, def);
+	}
+	*options = kept;
+	return meta;
+}
+
+/*
+ * Attach a list of "key=value" strings (as returned by
+ * mys_plmysql_extract_meta()) to routineOid as a single newline-joined
+ * "plmysql" security label -- the format mysql.get_plmysql_config()
+ * (aux_mysql) parses.  A no-op for a routine with no plmysql metadata at all
+ * (a plain, non-MySQL-protocol CREATE FUNCTION).
+ */
+static void
+mys_plmysql_set_meta_label(Oid routineOid, List *meta)
+{
+	ObjectAddress address;
+	StringInfoData buf;
+	ListCell   *lc;
+
+	if (meta == NIL)
+		return;
+
+	initStringInfo(&buf);
+	foreach(lc, meta)
+	{
+		if (buf.len > 0)
+			appendStringInfoChar(&buf, '\n');
+		appendStringInfoString(&buf, (char *) lfirst(lc));
+	}
+
+	ObjectAddressSet(address, ProcedureRelationId, routineOid);
+	SetSecurityLabel(&address, "plmysql", buf.data);
+}
+
+/*
+ * ALTER FUNCTION/PROCEDURE only ever refreshes plmysql.last_altered (see
+ * mys_plmysql_inject_alter_meta()); the rest of the routine's original
+ * plmysql.* metadata -- definer, sql_mode snapshot, created, sql_data_access
+ * -- must survive untouched.  Read the routine's existing label, replace (or
+ * append) each key newMeta carries, and write the merged result back.  A
+ * routine with no existing label (predates this metadata mechanism, or was
+ * never a plmysql routine) just gets newMeta verbatim.
+ */
+static void
+mys_plmysql_merge_meta_label(Oid routineOid, List *newMeta)
+{
+	ObjectAddress address;
+	char	   *existing;
+	List	   *merged = NIL;
+	ListCell   *lc;
+
+	if (newMeta == NIL)
+		return;
+
+	ObjectAddressSet(address, ProcedureRelationId, routineOid);
+	existing = GetSecurityLabel(&address, "plmysql");
+
+	if (existing != NULL)
+	{
+		char	   *cursor = pstrdup(existing);
+
+		while (cursor != NULL)
+		{
+			char	   *nl = strchr(cursor, '\n');
+			char	   *line = cursor;
+			bool		replaced = false;
+
+			if (nl != NULL)
+			{
+				*nl = '\0';
+				cursor = nl + 1;
+			}
+			else
+				cursor = NULL;
+
+			foreach(lc, newMeta)
+			{
+				char	   *nv = (char *) lfirst(lc);
+				char	   *eq = strchr(nv, '=');
+				size_t		keylen = eq ? (size_t) (eq - nv) : strlen(nv);
+
+				if (strncmp(line, nv, keylen) == 0 && line[keylen] == '=')
+				{
+					replaced = true;
+					break;
+				}
+			}
+			if (!replaced && line[0] != '\0')
+				merged = lappend(merged, pstrdup(line));
+		}
+	}
+
+	foreach(lc, newMeta)
+		merged = lappend(merged, lfirst(lc));
+
+	mys_plmysql_set_meta_label(routineOid, merged);
 }
 
 static bool
@@ -146,13 +301,13 @@ mys_plmysql_inject_create_meta(CreateFunctionStmt *stmt)
 		return;
 
 	stmt->options = lappend(stmt->options,
-							mys_plmysql_meta_item("plmysql.sql_mode",
+							mys_plmysql_meta_marker("plmysql.sql_mode",
 												 mysGetSqlModeText()));
 	stmt->options = lappend(stmt->options,
-							mys_plmysql_meta_item("plmysql.created",
+							mys_plmysql_meta_marker("plmysql.created",
 												 mys_plmysql_timestamp_text()));
 	stmt->options = lappend(stmt->options,
-							mys_plmysql_meta_item("plmysql.last_altered",
+							mys_plmysql_meta_marker("plmysql.last_altered",
 												 mys_plmysql_timestamp_text()));
 }
 
@@ -160,7 +315,7 @@ static void
 mys_plmysql_inject_alter_meta(AlterFunctionStmt *stmt)
 {
 	stmt->actions = lappend(stmt->actions,
-							mys_plmysql_meta_item("plmysql.last_altered",
+							mys_plmysql_meta_marker("plmysql.last_altered",
 												 mys_plmysql_timestamp_text()));
 }
 
@@ -1632,13 +1787,27 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateFunctionStmt:	/* CREATE FUNCTION */
-				mys_plmysql_inject_create_meta((CreateFunctionStmt *) parsetree);
-				address = CreateFunction(pstate, (CreateFunctionStmt *) parsetree);
+				{
+					CreateFunctionStmt *cfstmt = (CreateFunctionStmt *) parsetree;
+					List	   *plmysql_meta;
+
+					mys_plmysql_inject_create_meta(cfstmt);
+					plmysql_meta = mys_plmysql_extract_meta(&cfstmt->options);
+					address = CreateFunction(pstate, cfstmt);
+					mys_plmysql_set_meta_label(address.objectId, plmysql_meta);
+				}
 				break;
 
 			case T_AlterFunctionStmt:	/* ALTER FUNCTION */
-				mys_plmysql_inject_alter_meta((AlterFunctionStmt *) parsetree);
-				address = AlterFunction(pstate, (AlterFunctionStmt *) parsetree);
+				{
+					AlterFunctionStmt *afstmt = (AlterFunctionStmt *) parsetree;
+					List	   *plmysql_meta;
+
+					mys_plmysql_inject_alter_meta(afstmt);
+					plmysql_meta = mys_plmysql_extract_meta(&afstmt->actions);
+					address = AlterFunction(pstate, afstmt);
+					mys_plmysql_merge_meta_label(address.objectId, plmysql_meta);
+				}
 				break;
 
 			case T_RuleStmt:	/* CREATE RULE */

@@ -131,8 +131,14 @@ def run(cluster):
          "CREATE FUNCTION t006_reads_fn() RETURNS INT READS SQL DATA RETURN 42")
     assert _scalar(cluster, "SELECT t006_reads_fn()") == (42,)
 
+    # sql_data_access is regular routine metadata (see mys_plmysql_meta_marker(),
+    # mys_utility.c): it lives in a "plmysql" security label, not
+    # pg_proc.proconfig, so that proconfig stays empty and CALL of the
+    # routine can run non-atomically (COMMIT/ROLLBACK in the body -- C2).
     out = cluster.psql(
-        "SELECT proconfig FROM pg_proc WHERE proname = 't006_no_sql';")
+        "SELECT label FROM pg_seclabel sl, pg_proc p "
+        "WHERE sl.objoid = p.oid AND sl.classoid = 'pg_proc'::regclass "
+        "AND sl.provider = 'plmysql' AND p.proname = 't006_no_sql';")
     assert "plmysql.sql_data_access=NO SQL" in out, \
         "explicit NO SQL characteristic was not stored: %r" % out
 
