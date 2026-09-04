@@ -202,8 +202,25 @@ plmysql_push_execsql_resultset(PLMySQL_execstate *estate,
 	uint64		i;
 
 	estate->resultsets_sent++;
-	moreResultsFlag = (estate->resultsets_sent < estate->func->n_resultsets)
-		? HALO_SVR_MORE_RESULTS_EXISTS : estate->outer_more_results_flag;
+
+	/*
+	 * The packet this call is about to send (via end_command() below) is
+	 * never the last packet of the enclosing CALL's own response: a CALL
+	 * always has its own trailing completion packet sent afterward (see
+	 * CMDTAG_CALL in adapter.c's endCommand(), unconditional sendOKPacket()
+	 * for every CALL), whether or not there are more of this routine's own
+	 * result sets still to come.  So the flag on *this* packet must always
+	 * claim more results exist, regardless of estate->resultsets_sent vs.
+	 * estate->func->n_resultsets -- otherwise the client sees this result
+	 * set's own "no more results" and considers the whole CALL finished
+	 * before that trailing packet (which it doesn't know to expect) has
+	 * even been sent, corrupting its read of whatever the connection sends
+	 * next.  Only after this packet has been sent do we restore
+	 * moreResultsFlag to outer_more_results_flag -- the correct true final
+	 * value -- so that trailing CALL completion (sent later, once this
+	 * invocation returns) carries it instead.
+	 */
+	moreResultsFlag = HALO_SVR_MORE_RESULTS_EXISTS;
 
 	dest = CreateDestReceiver(DestRemote);
 	tstate = begin_tup_output_tupdesc(dest, tuptab->tupdesc, &TTSOpsHeapTuple);
@@ -219,6 +236,9 @@ plmysql_push_execsql_resultset(PLMySQL_execstate *estate,
 	SetQueryCompletion(&qc, CMDTAG_SELECT, ntuples);
 	if (MyProcPort)
 		MyProcPort->protocol_handler->end_command(&qc, DestRemote);
+
+	if (estate->resultsets_sent >= estate->func->n_resultsets)
+		moreResultsFlag = estate->outer_more_results_flag;
 
 	SPI_freetuptable(tuptab);
 }
