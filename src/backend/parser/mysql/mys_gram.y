@@ -499,7 +499,7 @@ static char *mys_return_body_text;
 
 %type <node>    opt_routine_body
 %type <str>     mysql_routine_body
-%type <keyword> mysql_single_stmt_body_leader
+%type <ival>	mysql_single_stmt_body_leader
 %type <groupclause> group_clause
 %type <node>	opt_publication_for_tables publication_for_tables
 
@@ -11925,7 +11925,7 @@ mysql_routine_body:
 					}
 
 					$$ = mys_capture_routine_body(yyscanner, @1,
-												  first_token, first_token_loc,
+												  first_token, first_token_loc, -1,
 												  &leftover, &yylval, &yylloc);
 
 					/*
@@ -11943,16 +11943,18 @@ mysql_routine_body:
 
 					/*
 					 * mysql_single_stmt_body_leader's one real token has
-					 * already been shifted by bison, so all
-					 * mys_capture_body_or_single_stmt() needs from it is @1,
-					 * the start of the body; the token value it takes is
-					 * only ever compared against BEGIN_P to pick its
-					 * BEGIN...END path over its scan-to-terminator path, so
-					 * any non-BEGIN_P placeholder does equally well here.
-					 * From @1 the capture loop, not bison, owns the token
-					 * stream until the closing ';' or end of input.
+					 * already been shifted by bison and reduced into $1 (its
+					 * own code, per its %type <ival> action -- see that
+					 * production); pass it through rather than a placeholder,
+					 * since mys_capture_body_or_single_stmt() now needs to
+					 * tell a bare IF/LOOP/WHILE/REPEAT/CASE leader (which
+					 * needs its own nesting-aware capture through a matching
+					 * END, not just a scan to the next top-level ';') apart
+					 * from the simple statement kinds that don't.  From @1
+					 * the capture loop, not bison, owns the token stream
+					 * until the closing ';' or end of input.
 					 */
-					stmt_text = mys_capture_body_or_single_stmt(yyscanner, SELECT, @1,
+					stmt_text = mys_capture_body_or_single_stmt(yyscanner, $1, @1,
 																&leftover, &yylval,
 																&yylloc);
 
@@ -11977,15 +11979,35 @@ mysql_routine_body:
  * code block), not MySQL's "DO expr [, expr] ..." (evaluate and discard).
  * Adding MySQL's DO would need its own dedicated production, not a leading
  * keyword raw-captured like the others here.
+ *
+ * WHILE/REPEAT/CASE/IF/LOOP: contrary to this production's original
+ * assumption ("flow control requires a BEGIN block"), MySQL's own sp.test
+ * regression suite has several routines whose entire body is one bare flow-
+ * control statement with no enclosing BEGIN...END at all (e.g.
+ * "CREATE PROCEDURE a0(x INT) WHILE x DO ... END WHILE") -- replaying that
+ * corpus is what turned up this gap.  DECLARE and HANDLER are not included:
+ * MySQL's own grammar requires those inside a compound statement, and
+ * nothing in the corpus contradicts that.
+ *
+ * CREATE/DROP: a single DDL statement as a routine's entire body (e.g.
+ * "CREATE PROCEDURE p1(v DATETIME) CREATE TABLE t1 SELECT v") is valid
+ * MySQL syntax the same corpus exercises.
  */
 mysql_single_stmt_body_leader:
-			  SELECT
-			| INSERT
-			| UPDATE
-			| DELETE_P
-			| REPLACE
-			| CALL
-			| SET
+			  SELECT		{ $$ = SELECT; }
+			| INSERT		{ $$ = INSERT; }
+			| UPDATE		{ $$ = UPDATE; }
+			| DELETE_P		{ $$ = DELETE_P; }
+			| REPLACE		{ $$ = REPLACE; }
+			| CALL			{ $$ = CALL; }
+			| SET			{ $$ = SET; }
+			| WHILE			{ $$ = WHILE; }
+			| REPEAT		{ $$ = REPEAT; }
+			| CASE			{ $$ = CASE; }
+			| IF_P			{ $$ = IF_P; }
+			| LOOP			{ $$ = LOOP; }
+			| CREATE		{ $$ = CREATE; }
+			| DROP			{ $$ = DROP; }
 		;
 
 opt_routine_body:
@@ -24961,6 +24983,20 @@ mys_optlist_pins_foreign_language(List *options)
  */
 #define MYS_UNCOUNTED_KINDS 4
 
+/*
+ * Sentinel for mys_capture_routine_body()'s leading_uncounted_kind
+ * parameter: the body is a bare CASE statement/expression with no
+ * enclosing BEGIN (see mys_capture_body_or_single_stmt()).  CASE is
+ * already depth-tracked (case BEGIN_P: case CASE: below), so this does not
+ * need the IF/LOOP/WHILE/REPEAT seeding those get; it only needs the
+ * outermost closer's own "CASE" suffix -- dropped by design when a nested
+ * CASE inside a BEGIN body closes, since that text is mid-substring and
+ * copied verbatim regardless -- kept when this CASE is *itself* the whole
+ * substring's own final boundary, the same way IF/LOOP/WHILE/REPEAT keep
+ * theirs.
+ */
+#define MYS_LEADING_CASE (-2)
+
 static int
 mys_uncounted_block_kind(int tok)
 {
@@ -25035,6 +25071,7 @@ mys_uncounted_block_kind(int tok)
 char *
 mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 						 int first_token, int first_token_loc,
+						 int leading_uncounted_kind,
 						 int *leftover_token, YYSTYPE *leftover_lval,
 						 YYLTYPE *leftover_loc)
 {
@@ -25056,6 +25093,8 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 
 	MemSet(&pending_lval, 0, sizeof(pending_lval));
 	seen = (int *) palloc0(seen_levels * MYS_UNCOUNTED_KINDS * sizeof(int));
+	if (leading_uncounted_kind >= 0)
+		seen[1 * MYS_UNCOUNTED_KINDS + leading_uncounted_kind] = 1;
 
 	/*
 	 * This loop owns the token stream until the matching END, so it can look
@@ -25152,6 +25191,36 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 						 * the keyword and leave the depth alone.
 						 */
 						seen[depth * MYS_UNCOUNTED_KINDS + next_kind]--;
+
+						/*
+						 * Unless this is the seeded top-level count for a bare
+						 * leading IF/LOOP/WHILE/REPEAT (see leading_uncounted_
+						 * kind above) going back to zero: there is no
+						 * enclosing BEGIN whose own bare END would otherwise
+						 * end this capture, so this closer -- the one that
+						 * matches what the caller already consumed as the
+						 * body's first token -- has to be recognized as the
+						 * end of the body right here instead.
+						 *
+						 * Unlike the bare "END" case below (whose done: copy
+						 * deliberately stops right after those 3 letters,
+						 * dropping a trailing CASE that does not belong in the
+						 * plmysql-compatible text this returns), this closer's
+						 * own keyword (IF/LOOP/WHILE/REPEAT) *is* needed --
+						 * nested loops elsewhere in this same function are
+						 * already captured with theirs intact, so plmysql's
+						 * own grammar expects it here too.  done:'s copy always
+						 * adds back 3 bytes for a literal "END", so end_loc is
+						 * set 3 bytes short of the true end (the position right
+						 * after this keyword) to compensate.
+						 */
+						if (leading_uncounted_kind >= 0 && depth == 1 &&
+							next_kind == leading_uncounted_kind &&
+							seen[depth * MYS_UNCOUNTED_KINDS + next_kind] == 0)
+						{
+							end_loc = yyextra->core_yy_extra.last_token_end - 3;
+							goto done;
+						}
 						break;
 					}
 
@@ -25206,7 +25275,18 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 
 					if (depth == 0)
 					{
-						end_loc = this_end_loc;
+						/*
+						 * A bare leading CASE's own "END CASE" needs its
+						 * suffix kept (see MYS_LEADING_CASE above), unlike
+						 * a BEGIN block's plain "END".  next == CASE here
+						 * means this closer's keyword was just consumed as
+						 * "belongs to this closer" above, not pushed back.
+						 */
+						if (leading_uncounted_kind == MYS_LEADING_CASE &&
+							next == CASE)
+							end_loc = yyextra->core_yy_extra.last_token_end - 3;
+						else
+							end_loc = this_end_loc;
 						goto done;
 					}
 					break;
@@ -25271,7 +25351,7 @@ mys_capture_body_or_single_stmt(core_yyscan_t yyscanner, int lookahead_token,
 				 errmsg("CREATE TRIGGER requires a trigger body")));
 
 	body_start_loc = lloc;
-	if (tok == BEGIN_P)
+	if (tok == BEGIN_P || tok == CASE)
 	{
 		int			next;
 		YYSTYPE		next_lval;
@@ -25279,8 +25359,35 @@ mys_capture_body_or_single_stmt(core_yyscan_t yyscanner, int lookahead_token,
 
 		next = mys_yylex(&next_lval, &next_loc, yyscanner);
 		return mys_capture_routine_body(yyscanner, body_start_loc,
-								next, next_loc, leftover_token,
+								next, next_loc,
+								tok == CASE ? MYS_LEADING_CASE : -1,
+								leftover_token,
 								leftover_lval, leftover_loc);
+	}
+
+	/*
+	 * A bare IF/LOOP/WHILE/REPEAT (no enclosing BEGIN) is itself a compound
+	 * construct with its own matching END -- unlike the plain single
+	 * statements this function otherwise captures by scanning to the next
+	 * top-level ';', it may contain any number of semicolon-separated
+	 * statements of its own before that END, so it needs the same
+	 * nesting-aware capture a BEGIN body gets, just seeded to already
+	 * consider one block of this kind open (see mys_capture_routine_body()).
+	 */
+	{
+		int			kind = mys_uncounted_block_kind(tok);
+
+		if (kind >= 0)
+		{
+			int			next;
+			YYSTYPE		next_lval;
+			YYLTYPE		next_loc;
+
+			next = mys_yylex(&next_lval, &next_loc, yyscanner);
+			return mys_capture_routine_body(yyscanner, body_start_loc,
+									next, next_loc, kind, leftover_token,
+									leftover_lval, leftover_loc);
+		}
 	}
 
 	for (;;)

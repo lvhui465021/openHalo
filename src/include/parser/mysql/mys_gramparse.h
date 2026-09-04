@@ -106,11 +106,22 @@ extern void mys_parser_init(mys_yy_extra_type *yyext);
  * it is returned through leftover_token/leftover_lval/leftover_loc so the
  * caller can reinstate it as the parser's lookahead; leftover_token is left
  * untouched when the body ran to the end of the input.
+ *
+ * leading_uncounted_kind is -1 for the ordinary "already past an opening
+ * BEGIN (or CASE)" use above.  Pass mys_uncounted_block_kind()'s result for
+ * IF_P/LOOP/WHILE/REPEAT instead when body_start_loc/first_token instead
+ * mark the start of a *bare* one of those statements with no enclosing
+ * BEGIN at all (MySQL allows e.g. "CREATE PROCEDURE p() WHILE x DO ... END
+ * WHILE" as a routine's entire body): this seeds the nesting tally as if
+ * one block of that kind were already open, and additionally stops at the
+ * point that seeded count returns to zero, rather than only at a bare END
+ * matching an opening BEGIN/CASE that in this case does not exist.
  */
 extern char *mys_capture_routine_body(core_yyscan_t yyscanner,
 									  int body_start_loc,
 									  int first_token,
 									  int first_token_loc,
+									  int leading_uncounted_kind,
 									  int *leftover_token,
 									  YYSTYPE *leftover_lval,
 									  YYLTYPE *leftover_loc);
