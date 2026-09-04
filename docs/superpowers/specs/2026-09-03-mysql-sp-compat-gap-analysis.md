@@ -91,7 +91,7 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 | # | 缺口 | 证据 | 方案 |
 |---|---|---|---|
 | **C1** | **`CALL` 多结果集协议帧错乱** | **已彻底定位并修复（2026-09-04）**，已用官方 `mysql` CLI 与 pymysql（含显式 `CLIENT_MULTI_STATEMENTS`）双重复核。真根因：MySQL 协议下 `CALL` 的响应结构上恒为“例程自身结果集 + 一个额外的收尾 OK 包”（`adapter.c` 的 `endCommand()` 对 `CMDTAG_CALL` 恒调用 `sendOKPacket()`，不管例程体是否有裸 `SELECT`），这两部分共享同一个 `moreResultsFlag` 全局。`plmysql_push_execsql_resultset()`（`pl_exec_ext.c`）之前把“本例程自己的结果集数是否推完”当成了整个 `CALL` 的终点，用完就把标志清零/回退——但那不是终点，后面恒定还有一个收尾 OK 包。客户端看到结果集自身的 EOF 说“没有更多了”，便提前认定整个 `CALL` 已结束，而服务端随后又发出那个客户端没打算再读的收尾包，正好卡在“连接以为已空闲、其实还有未读字节”的位置，砸坏了同一连接上后续任何语句的读取（无论是另一个 `CALL` 还是普通 `SELECT`，也无论是一次性 multi-statement 包还是逐条独立收发）——这正是 pymysql 报 “Packet sequence number wrong”、`mysql` CLI 报 “Lost connection” 或后续语句数据整体丢失的原因 | **已修**：结果集自身完成包的标志恒置“还有更多”（`HALO_SVR_MORE_RESULTS_EXISTS`，因为收尾 OK 包恒定紧随其后），只有在推完本例程自己的全部结果集**之后**才把标志还原为 `outer_more_results_flag`（顶层调度循环快照下来的真实“是否还有更多顶层语句”），留给那个稍后发送的收尾 OK 包携带。单结果集/多结果集、独占连接/后跟其他语句、一次性 multi-statement 包/逐条独立收发均已验证。回归见 `test_028`（`src/test/mysql`） |
-| **C2** | **过程内 `COMMIT`/`ROLLBACK` 运行期 1105** | **已定位并部分修复（2026-09-04）**。根因是 `ExecuteCallStmt()`（`functioncmds.c`）里两条各自独立、任一条都会把 `atomic` 强制改回 `true` 的 PG 原生规则：**规则1** 只要目标过程的 `pg_proc.proconfig` 非空（GUC 栈在事务边界弹不出去）；**规则2** 只要 `prosecdef=true`（SECURITY DEFINER，`StartTransaction()` 要求安全上下文栈必须为空）。MySQL 协议的 CALL 分发本身没问题（`isAtomicContext` 计算和传递都正确）。**规则1 已修复**：plmysql 例程元数据（definer/sql_mode/created/last_altered/sql_data_access）已从 `pg_proc.proconfig` 迁移到一个专用的 `plmysql` security label（`mys_plmysql_meta_marker()`/`mys_plmysql_set_meta_label()`，`mys_utility.c`；仍随 `pg_dump`/`pg_restore` 走，作为 `SECURITY LABEL FOR plmysql ON FUNCTION/PROCEDURE ...` 语句；MySQL 触发器的私有底层函数保持用 proconfig 不变，因为触发器从不走 CALL 的 atomic/non-atomic 判定，本来就不受这条规则影响）；`mysql.get_plmysql_config()`（aux_mysql 1.11）优先读 label，找不到再退回 proconfig，兼容触发器和升级前的旧对象。**规则2 未修复，且不是同一类问题**：MySQL 5.7 不写 `SQL SECURITY` 子句时默认 DEFINER，`mys_apply_default_sql_security()` 据此把 `prosecdef` 默认置 `true`——而真实 MySQL 的 DEFINER 只是权限检查身份、并没有 PG 这种"安全上下文栈"概念，所以这是 PG 与 MySQL 之间一条独立的、更深的语义鸿沟，不因为修好规则1 就消失。**实测结果**：显式 `SQL SECURITY INVOKER` 的例程内 COMMIT/ROLLBACK 现在完全可用（修复前无论 DEFINER/INVOKER 都报错，已用两种模式验证过）；不写 `SQL SECURITY`（MySQL 默认，即 DEFINER）的例程仍报 1105——`test_030` 把这个已知限制显式钉住（断言必须仍是 1105，而非静默假设通过），一旦规则2 被修复会在测试里被发现，不会悄悄过期 | 规则1：已完成，见 `mys_utility.c`/`pl_handler.c`/`aux_mysql--1.10--1.11.sql`，回归见 `test_030`。规则2 需要与用户确认取舍：**(a)** 维持现状（DEFINER 默认 + 已知限制），文档记录；**(b)** 重新设计 DEFINER 语义，不依赖 PG 原生 `prosecdef`/安全上下文栈机制，而是仿照本次 sql_mode 的做法在 `plmysql_call_handler` 里手动切换/恢复有效用户——但这就是本 session 早前已经明确搁置的"DEFINER 用户到 pg_proc 属主映射"那个更大的权限模型话题，工作量和风险都不小；**(c)** 权衡下把 MySQL 例程默认 SQL SECURITY 改回 INVOKER（放弃对默认 DEFINER 语义的精确匹配，换取事务控制默认可用）——会直接影响 `test_023`（本 session 早前实现并测试过的默认值行为），需要重新评估这个取舍是否值得 |
+| **C2** | **过程内 `COMMIT`/`ROLLBACK` 运行期 1105** | **✅ 已彻底修复(2026-09-05,用户拍板方案 b)**。根因是 `ExecuteCallStmt()`(functioncmds.c)里两条各自独立、任一条都会把 `atomic` 强制改回 `true` 的 PG 原生规则。**规则1**(proconfig 非空)已于 2026-09-04 修复:plmysql 例程元数据迁移到专用 `plmysql` security label(aux_mysql 1.11)。**规则2**(prosecdef=true)本轮修复,思路是**让 plmysql 例程彻底不再使用 `pg_proc.prosecdef` 承载 SQL SECURITY**:`mys_plmysql_redirect_sql_security()`(mys_utility.c,CREATE 分发点,文法层不动、无 bison 风险)对 LANGUAGE plmysql 的例程摘掉原生 `security` 选项,把特性改记为 label 条目 `plmysql.sql_security=DEFINER/INVOKER`(prosecdef 恒 false → `ExecuteCallStmt` 不再强制原子;非 plmysql 例程如显式 `LANGUAGE plpgsql` 不受影响,仍走原生 prosecdef);运行期 `plmysql_switch_to_routine_definer()`(pl_handler.c)在 `plmysql_call_handler` 入口按 label(例程)/proconfig(触发器私有函数)里的 definer 元数据 `SetUserIdAndSecContext` 切换有效用户——**不带任何 security-restriction 位**:`StartTransaction()` 的 `Assert(prevSecContext == 0)` 检查的是整字,零位字照常通过,这正是 prosecdef 路径(`fmgr_security_definer` 会 OR 进 `SECURITY_LOCAL_USERID_CHANGE`)做不到的;正常/错误路径都经 `PG_ENSURE_ERROR_CLEANUP` 成对恢复,身份切换熬过 COMMIT、在例程内 SQLEXCEPTION handler 捕获错误后仍保持。配套语义一次补齐:MySQL 账户与 PG 角色 1:1 按名映射(登录即如此,adapter.c),definer 的 user 部分即角色名,缺角色报 MySQL 1449(CALL 期,与 MySQL 一致);**非 superuser 显式指定他人 definer 报 1227**(MySQL 的 SUPER 规则)——此前 definer 只是装饰性元数据、执行身份实为 pg_proc 属主,现在真的按 definer 执行,该检查从可选变为必需的防提权闸;`CURRENT_USER()` 在 DEFINER 例程内报 definer(effective-definer 覆盖栈,adapter/systemVar.c 状态 + mysm/user.c 读取;USER()/SESSION_USER() 仍报登录账户);MySQL 触发器的 definer(存于其私有函数 proconfig)同样生效。**MySQL 语义核对**:INVOKER 例程被 DEFINER 例程嵌套调用时按调用方有效身份(definer)执行,实现(不切换=继承当前 uid)与 MySQL 一致。旧例程(修复前创建、prosecdef=true)保持旧语义(按 proowner 执行、CALL 原子),`CREATE OR REPLACE` 即升级到新行为。遗留小项:aux_mysql 的 Security_type 显示列仍硬编码 'DEFINER'(修复前即如此,显式 INVOKER 例程显示不准),待随 aux_mysql 下一次版本升级一并修 | 全部完成:规则1 见 `aux_mysql--1.10--1.11.sql`;规则2 见 `mys_plmysql_redirect_sql_security()`/`mys_check_definer_privilege()`(mys_utility.c)、`plmysql_switch_to_routine_definer()`(pl_handler.c)、`mysPush/Pop/GetEffectiveDefiner()`(adapter/systemVar.c + mysm/user.c)。回归:`test_030`(默认/INVOKER 的 COMMIT/ROLLBACK,预期翻转)、`test_037`(新增,身份语义全量:CURRENT_USER/USER、COMMIT 存活、handler 捕获后存活、INVOKER、嵌套、触发器、1449)、`test_023`(断言改 label)、`test_034`(COMMIT 单语句体预期翻转) |
 
 ### D. 错误码与严格性缺口（负向，`MISSING_ERR`=openHalo 过于宽松）
 
@@ -138,15 +138,15 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 - **C1 CALL 多结果集帧错乱** ✅ 已完成（2026-09-04）：见 §3 表格更新，根因是收尾 OK 包与结果
   集自身完成包共享同一个“还有更多结果”标志、语义被搞反。已用官方 `mysql` CLI 与 pymysql
   （含 `CLIENT_MULTI_STATEMENTS`）验证不再出现帧错乱/数据丢失/连接失联。回归见 `test_028`。
-- **C2 CALL 非原子执行 + 事务语句** 🟡 **部分完成（2026-09-04）**：见 §3 表格更新。根因是两条
-  独立的 PG 原生规则（proconfig 非空、prosecdef=true），各自都会强制 atomic=true。**已修复**
-  第一条：例程元数据从 `pg_proc.proconfig` 迁移到 `plmysql` security label（`aux_mysql` 升到
-  1.11），`SQL SECURITY INVOKER` 例程内 COMMIT/ROLLBACK 现在完全可用，回归见 `test_030`；
-  `test_006/011/016` 同步更新为读 label 而非 proconfig。**未修复**第二条：MySQL 默认（不写
-  `SQL SECURITY`）映射到的 `prosecdef=true` 本身触发 PG 的“SECURITY DEFINER 过程不能有事务
-  语句”规则，这是 PG 与 MySQL 之间独立于第一条的语义鸿沟，`test_030` 显式钉住这一已知限制
-  （断言仍报 1105，不是静默通过）。是否/如何处理第二条需要用户决定（维持现状 vs. 重新设计
-  DEFINER 语义 vs. 权衡把默认改回 INVOKER），三个选项各自的代价见 §3。
+- **C2 CALL 非原子执行 + 事务语句** ✅ **已完成（2026-09-05）**：规则 1（例程元数据迁
+  security label，aux_mysql 1.11）之后，规则 2 已按用户拍板的方案 (b) 修复——plmysql 例程
+  不再以 `pg_proc.prosecdef` 承载 SQL SECURITY（改存 label 的 `plmysql.sql_security` 条目，
+  `mys_plmysql_redirect_sql_security()`），运行期由 `plmysql_call_handler` 手动切换/恢复
+  definer 有效用户（零 security-restriction 位，`StartTransaction()` 的断言不再触发）。
+  MySQL 默认 DEFINER 例程内的 COMMIT/ROLLBACK 全部可用；同一改动把 1449（definer 缺
+  角色）、1227（非 SUPER 指定他人 definer）、CURRENT_USER() 报 definer、触发器 definer
+  生效四项语义一并补齐。详见 §3 C2 行。回归：`test_030`/`test_037`（新），`test_023`/
+  `test_034` 预期翻转。
 
 ### M11 — 类型系统
 - **B2 `BINARY`/`CHARSET` 类型特性** ✅ 已完成（2026-09-04）：见 §3 表格更新——实际是一个未接线
@@ -194,7 +194,6 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 
 | 项 | 归档原因 |
 |---|---|
-| C2 规则2（默认 SQL SECURITY DEFINER 下事务控制受阻） | 产品/架构取舍问题（§3 三选一），不是纯工程判断，需要显式决策后才能排期 |
 | 1313（RETURN 不允许出现在触发器体内） | 已实测尝试：直接在 plmysql 语法层拦截会连带拦住触发器包装层自动注入的 `RETURN NEW`（PG 原生触发器函数协议要求），需要改成在包装之前扫描原始 MySQL 触发器体文本，工作量与风险高于本轮其余项 |
 | 1442（触发器/函数内更新正被触发语句使用的表） | 需要新增"当前 DML 语句正在修改哪张表"的调用链级运行时追踪，是新基础设施，不是局部检查 |
 | 1691（LIMIT 处变量类型校验） | 需要在 SP 执行路径新增专门的 LIMIT 实参类型检查 |
@@ -239,9 +238,10 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
    （`sp.test` 的 `hndlr1` 过程）里一起发现的。回归：`test_035`。
 4. **ALTER/START TRANSACTION/COMMIT 作为例程整个函数体**：和 CREATE/DROP 一样的模式，
    补进 `mysql_single_stmt_body_leader` 即可，捕获逻辑复用已有的"扫到下一个顶层分号"
-   兜底路径。COMMIT/START TRANSACTION 编译能通过，但调用时仍会撞见 §6 归档的 C2
-   （默认 SQL SECURITY DEFINER 下事务控制受阻）——这是已知、已归档的限制，不在本轮
-   修复范围内，回归测试显式钉住这个边界（编译通过、CALL 按已知方式失败）而不是回避它。
+   兜底路径。COMMIT 单语句体的 CALL 当时仍撞见 C2（默认 DEFINER 下事务控制受阻）并
+   以 1105 钉住；C2 规则 2 已于 2026-09-05 修复（见 §3），`test_034` 的该断言已翻转为
+   COMMIT 成功，START TRANSACTION 仍钉 1235（PG 过程只支持 COMMIT/ROLLBACK，引擎层
+   限制，与 security 模式无关）。
 
 **剩余未达标的约 100 条失败，按体量排序**：
 
