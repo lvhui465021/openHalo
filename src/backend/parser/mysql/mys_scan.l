@@ -381,7 +381,7 @@ xcinside		[^*/]+
 
 /*
  * MySQL executable comment opener: a slash-star followed by an exclamation
- * mark and an optional numeric version gate ("/*!50003").  mysqldump wraps
+ * mark and an optional numeric version gate (e.g. gate 50003).  mysqldump wraps
  * DDL (triggers, routines, SET statements) in these so that servers outside
  * the target version range skip the statement; MySQL servers lex the content
  * as real input when the gate is at or below their own version.  When an
