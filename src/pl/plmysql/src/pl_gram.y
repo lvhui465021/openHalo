@@ -394,6 +394,7 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %token <keyword>	K_USE_COLUMN
 %token <keyword>	K_USE_VARIABLE
 %token <keyword>	K_USING
+%token <keyword>	K_VALUE
 %token <keyword>	K_VARIABLE_CONFLICT
 %token <keyword>	K_WARNING
 %token <keyword>	K_WHEN
@@ -721,6 +722,20 @@ decl_condition_def : K_SQLSTATE SCONST ';'
 						strcpy(cond->sqlstate, $2);
 						$$ = cond;
 					}
+				| K_SQLSTATE K_VALUE SCONST ';'
+					{
+						/*
+						 * MySQL allows an optional VALUE between SQLSTATE
+						 * and the literal ("SQLSTATE VALUE '42S99'"); it
+						 * changes nothing semantically, just accept and
+						 * ignore it the same as the plain SQLSTATE form.
+						 */
+						PLMySQL_cond *cond = palloc0(sizeof(PLMySQL_cond));
+
+						mysql_check_sqlstate_literal($3, @3);
+						strcpy(cond->sqlstate, $3);
+						$$ = cond;
+					}
 				| ICONST ';'
 					{
 						/*
@@ -755,6 +770,16 @@ condition_value	: K_SQLSTATE SCONST
 						mysql_check_sqlstate_literal($2, @2);
 						cond->sqlerrstate = mysql_make_sqlstate($2);
 						cond->condname = psprintf("SQLSTATE '%s'", $2);
+						$$ = cond;
+					}
+				| K_SQLSTATE K_VALUE SCONST
+					{
+						/* see the matching alternative in decl_condition_def */
+						PLMySQL_condition *cond = palloc0(sizeof(PLMySQL_condition));
+
+						mysql_check_sqlstate_literal($3, @3);
+						cond->sqlerrstate = mysql_make_sqlstate($3);
+						cond->condname = psprintf("SQLSTATE '%s'", $3);
 						$$ = cond;
 					}
 				| ICONST

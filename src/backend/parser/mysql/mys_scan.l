@@ -246,7 +246,14 @@ horiz_space		[ \t\f]
 newline			[\n\r]
 non_newline		[^\n\r]
 
-comment			("--"{non_newline}*)
+/*
+ * MySQL also treats a bare "#" as starting a single-line comment running to
+ * the next newline, unlike "--" which (in standard SQL, and in this
+ * scanner's inherited PG behavior) is a comment regardless of what follows
+ * it too -- so this is a straightforward extra alternative, not a variant
+ * with its own following-character rule to replicate.
+ */
+comment			("--"{non_newline}*|"#"{non_newline}*)
 
 whitespace		({space}+|{comment})
 newline2        ({newline}|{space}*)
@@ -1051,14 +1058,16 @@ other			.
 
 {operator}		{
 					/*
-					 * Check for embedded slash-star or dash-dash; those
-					 * are comment starts, so operator must stop there.
-					 * Note that slash-star or dash-dash at the first
-					 * character will match a prior rule, not this one.
+					 * Check for embedded slash-star, dash-dash, or a MySQL
+					 * "#" comment; those are comment starts, so operator
+					 * must stop there.  Note that any of the three at the
+					 * first character will match a prior rule, not this
+					 * one.
 					 */
 					int			nchars = yyleng;
 					char	   *slashstar = strstr(yytext, "/*");
 					char	   *dashdash = strstr(yytext, "--");
+					char	   *hashcomment = strchr(yytext, '#');
 
 					if (slashstar && dashdash)
 					{
@@ -1068,6 +1077,8 @@ other			.
 					}
 					else if (!slashstar)
 						slashstar = dashdash;
+					if (hashcomment && (!slashstar || hashcomment < slashstar))
+						slashstar = hashcomment;
 					if (slashstar)
 						nchars = slashstar - yytext;
 
