@@ -102,7 +102,7 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 | `ER_TABLE_NOT_LOCKED` (1100/1099) | 8 | `LOCK TABLES` 后访问未锁表 | 不强制 LOCK TABLES 语义 |
 | `ER_WRONG_SPVAR_TYPE_IN_LIMIT` (1691) | 6 | `LIMIT` 处用了错误类型的 SP 变量 | 不校验 |
 | `ER_CANT_UPDATE_USED_TABLE_IN_SF_OR_TRG` (1442) | 3 | 触发器/函数修改正被触发语句使用的表 | 不强制 |
-| `ER_SP_NO_RECURSION` (1424) | 3 | 经 `SELECT`/视图的间接函数递归 | 现有守卫只拦直接重入 |
+| `ER_SP_NO_RECURSION` (1424) | 3 | 经 `SELECT`/视图的间接函数递归 | ✅ **复测更正（2026-09-04）：其实早就正确处理间接递归**——`plmysql_check_recursion()`（`pl_handler.c`）遍历的是整条 plmysql 调用栈找同一个 `fn_oid`，不只看直接调用者；A 体内一句 `SELECT b()` 照样会把 B 压上同一条调用栈，B 再经 `SELECT a()` 回调 A 一样会被抓到。报告原先的判断有误，已用 A↔B 互相经 SELECT 调用的用例验证，回归见 `test_015` |
 | `ER_BAD_FIELD_ERROR`/`ER_CANT_REOPEN_TABLE` (1054/1137) | 6 | 字段/表复用检查 | 部分退化为 1064 |
 | `ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG` (1422) | 4 | 函数/触发器内隐式提交（DDL 等），非字面 COMMIT | 本分支只拦了字面 `COMMIT`/`ROLLBACK`，未覆盖隐式提交语句 |
 | `ER_TRG_ON_VIEW_OR_TEMP_TABLE`(1361)、`ER_NO_TRIGGERS_ON_SYSTEM_SCHEMA`(1465) | 各 1–2 | 触发器建在 VIEW/临时表/MySQL 系统 schema 上 | ✅ 已完成（2026-09-04）：VIEW 情形本来就会被 PG 原生 `CreateTrigger()` 拒绝（无存储、没法挂行级触发器），只是错误码通用（1105）；临时表和系统 schema 情形之前完全没拦（PG 原生对两者都无此限制）。`mys_check_mysql_trigger_target()` 在原生路径前统一按 MySQL 错误码/文案拦三种情形，回归见 `test_032` |
@@ -164,7 +164,9 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
   最初的"未强制"判断来自复测方法缺陷（没有真正触发执行），见 §3。
 - 触发器语义（其余）：1313/1435/1442（~2–3 天，逐条按 MySQL 手册加 guard；1313 需要先核实 MySQL
   在 FUNCTION/PROCEDURE/TRIGGER 三种上下文里 RETURN 各自的真实限制，比单纯错误码替换复杂，见 §3）。
-- LOCK TABLES 语义（1100/1099）、间接递归（1424）：投入较大、优先级低，可延后。
+- **1424（间接递归）** ✅ **复测更正（2026-09-04）**：其实早就正确处理，见 §3 表格更新，回归见
+  `test_015`。
+- LOCK TABLES 语义（1100/1099）：投入较大、优先级低，可延后。
 
 ---
 
