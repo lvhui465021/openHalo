@@ -79,3 +79,20 @@ def run(cluster):
         with conn.cursor() as cur:
             _expect_errno(cur, "SELECT t015_func(1)", 1424)
             _expect_errno(cur, "SELECT t015_resultset()", 1415)
+
+    # Indirect recursion (A calls B via a plain "SELECT b()" sub-expression,
+    # B calls A back the same way) must be caught too, not just a function
+    # calling itself directly: plmysql_check_recursion() (pl_handler.c)
+    # walks the whole plmysql call stack for a matching fn_oid, which a
+    # SELECT-embedded call still pushes onto exactly like a direct one.
+    _ddl(cluster,
+         "DROP FUNCTION IF EXISTS t015_indirect_a",
+         "DROP FUNCTION IF EXISTS t015_indirect_b",
+         "CREATE FUNCTION t015_indirect_b() RETURNS INT RETURN 1",
+         "CREATE FUNCTION t015_indirect_a() RETURNS INT "
+         "BEGIN DECLARE v INT; SELECT t015_indirect_b() INTO v; RETURN v; END",
+         "CREATE OR REPLACE FUNCTION t015_indirect_b() RETURNS INT "
+         "BEGIN DECLARE v INT; SELECT t015_indirect_a() INTO v; RETURN v; END")
+    with cluster.mysql(dbname="public") as conn:
+        with conn.cursor() as cur:
+            _expect_errno(cur, "SELECT t015_indirect_a()", 1424)
