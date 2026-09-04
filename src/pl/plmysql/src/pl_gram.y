@@ -114,6 +114,8 @@ static	PLMySQL_stmt	*make_execsql_stmt(int firsttoken, int location,
 static	void			mysql_check_dynamic_sql_context(int firsttoken,
 													  PLword *word, int location);
 static	void			mysql_check_transaction_context(int location);
+static	void			mysql_check_implicit_commit_context(int firsttoken,
+															PLword *word, int location);
 static	PLMySQL_stmt_fetch *read_fetch_direction(void);
 static	PLMySQL_stmt	*make_return_stmt(int location);
 static	PLMySQL_stmt	*make_return_next_stmt(int location);
@@ -219,7 +221,8 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %type <stmt>	stmt_return stmt_execsql
 %type <stmt>	stmt_dynexecute stmt_call stmt_getdiag
 %type <stmt>	stmt_open stmt_fetch stmt_close stmt_null
-%type <stmt>	stmt_commit stmt_rollback
+%type <stmt>	stmt_commit stmt_rollback stmt_start stmt_savepoint
+%type <stmt>	stmt_rollback_to stmt_release
 %type <stmt>	stmt_case
 %type <stmt>	stmt_repeat stmt_leave stmt_iterate set_item
 %type <stmt>	stmt_signal
@@ -372,11 +375,13 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %token <keyword>	K_QUERY
 %token <keyword>	K_REPEAT
 %token <keyword>	K_RESIGNAL
+%token <keyword>	K_RELEASE
 %token <keyword>	K_RETURN
 %token <keyword>	K_RETURNED_SQLSTATE
 %token <keyword>	K_ROLLBACK
 %token <keyword>	K_ROW_COUNT
 %token <keyword>	K_ROWTYPE
+%token <keyword>	K_SAVEPOINT
 %token <keyword>	K_SCHEMA
 %token <keyword>	K_SCHEMA_NAME
 %token <keyword>	K_SET
@@ -384,9 +389,11 @@ static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 %token <keyword>	K_SQLEXCEPTION
 %token <keyword>	K_SQLSTATE
 %token <keyword>	K_SQLWARNING
+%token <keyword>	K_START
 %token <keyword>	K_STACKED
 %token <keyword>	K_TABLE
 %token <keyword>	K_TABLE_NAME
+%token <keyword>	K_TRANSACTION
 %token <keyword>	K_THEN
 %token <keyword>	K_TO
 %token <keyword>	K_TYPE
@@ -1025,6 +1032,14 @@ proc_stmt		: pl_block ';'
 				| stmt_commit
 						{ $$ = $1; }
 				| stmt_rollback
+						{ $$ = $1; }
+				| stmt_start
+						{ $$ = $1; }
+				| stmt_savepoint
+						{ $$ = $1; }
+				| stmt_rollback_to
+						{ $$ = $1; }
+				| stmt_release
 						{ $$ = $1; }
 				;
 
@@ -1889,6 +1904,14 @@ stmt_execsql	: K_IMPORT
 							cword_is_not_variable(&($1), @1);
 						$$ = make_execsql_stmt(T_CWORD, @1, NULL);
 					}
+				| '('
+					{
+						/*
+						 * "(SELECT ...) UNION (SELECT ...)" and friends: MySQL
+						 * allows a parenthesized query expression as a statement.
+						 */
+						$$ = make_execsql_stmt('(', @1, NULL);
+					}
 				;
 
 /*
@@ -2042,6 +2065,93 @@ stmt_rollback	: K_ROLLBACK opt_transaction_chain ';'
 						new->chain = $2;
 
 						$$ = (PLMySQL_stmt *)new;
+					}
+				;
+
+/*
+ * START TRANSACTION inside a routine body: MySQL treats it as an implicit
+ * commit of the current transaction followed by a new one, which is what
+ * COMMIT does in PostgreSQL's nonatomic procedures, so it compiles to the
+ * same runtime action (exec_stmt_start).  Transaction characteristics
+ * (ISOLATION LEVEL / READ WRITE / WITH CONSISTENT SNAPSHOT) are not
+ * accepted yet.
+ */
+stmt_start		: K_START K_TRANSACTION ';'
+					{
+						PLMySQL_stmt_savepoint *new;
+
+						mysql_check_transaction_context(@1);
+
+						new = palloc(sizeof(PLMySQL_stmt_savepoint));
+						new->cmd_type = PLMYSQL_STMT_START;
+						new->lineno = plmysql_location_to_lineno(@1);
+						new->stmtid = ++plmysql_curr_compile->nstatements;
+						new->name = NULL;
+
+						$$ = (PLMySQL_stmt *)new;
+					}
+				;
+
+/*
+ * MySQL's SAVEPOINT / ROLLBACK TO / RELEASE SAVEPOINT over PostgreSQL's
+ * internal subtransaction stack (exec_stmt_savepoint et al.).  As with
+ * COMMIT/ROLLBACK, MySQL forbids them while a stored FUNCTION or TRIGGER
+ * is being compiled.
+ */
+stmt_savepoint	: K_SAVEPOINT any_identifier ';'
+					{
+						PLMySQL_stmt_savepoint *new;
+
+						mysql_check_transaction_context(@1);
+
+						new = palloc(sizeof(PLMySQL_stmt_savepoint));
+						new->cmd_type = PLMYSQL_STMT_SAVEPOINT;
+						new->lineno = plmysql_location_to_lineno(@1);
+						new->stmtid = ++plmysql_curr_compile->nstatements;
+						new->name = $2;
+
+						$$ = (PLMySQL_stmt *)new;
+					}
+				;
+
+stmt_rollback_to: K_ROLLBACK K_TO opt_savepoint_kw any_identifier ';'
+					{
+						PLMySQL_stmt_savepoint *new;
+
+						mysql_check_transaction_context(@1);
+
+						new = palloc(sizeof(PLMySQL_stmt_savepoint));
+						new->cmd_type = PLMYSQL_STMT_ROLLBACK_TO;
+						new->lineno = plmysql_location_to_lineno(@1);
+						new->stmtid = ++plmysql_curr_compile->nstatements;
+						new->name = $4;
+
+						$$ = (PLMySQL_stmt *)new;
+					}
+				;
+
+stmt_release		: K_RELEASE opt_savepoint_kw any_identifier ';'
+					{
+						PLMySQL_stmt_savepoint *new;
+
+						mysql_check_transaction_context(@1);
+
+						new = palloc(sizeof(PLMySQL_stmt_savepoint));
+						new->cmd_type = PLMYSQL_STMT_RELEASE_SAVEPOINT;
+						new->lineno = plmysql_location_to_lineno(@1);
+						new->stmtid = ++plmysql_curr_compile->nstatements;
+						new->name = $3;
+
+						$$ = (PLMySQL_stmt *)new;
+					}
+				;
+
+opt_savepoint_kw: K_SAVEPOINT
+					{
+						/* value unused */
+					}
+				| /*EMPTY*/
+					{
 					}
 				;
 
@@ -2665,6 +2775,9 @@ make_execsql_stmt(int firsttoken, int location, PLword *word)
 	int			paren_depth = 0;
 	int			begin_depth = 0;
 	bool		in_routine_definition = false;
+	bool			leading_paren = (firsttoken == '(');
+	char		   *first_word = (firsttoken == T_WORD && word != NULL &&
+								  !word->quoted) ? word->ident : NULL;
 	int			token_count = 0;
 	char		tokens[4];		/* records the first few tokens */
 
@@ -2673,6 +2786,7 @@ make_execsql_stmt(int firsttoken, int location, PLword *word)
 	memset(tokens, 0, sizeof(tokens));
 
 	mysql_check_dynamic_sql_context(firsttoken, word, location);
+	mysql_check_implicit_commit_context(firsttoken, word, location);
 
 	/* special lookup mode for identifiers within the SQL text */
 	save_IdentifierLookup = plmysql_IdentifierLookup;
@@ -2742,6 +2856,11 @@ make_execsql_stmt(int firsttoken, int location, PLword *word)
 				in_routine_definition = true;
 			token_count++;
 		}
+		/* First word behind any leading parenthesis (for is_select) */
+		if (leading_paren && first_word == NULL &&
+			tok == T_WORD && !yylval.word.quoted &&
+			yylval.word.ident != NULL)
+			first_word = yylval.word.ident;
 		/* Track paren nesting (needed for CREATE RULE syntax) */
 		if (tok == '(')
 			paren_depth++;
@@ -2813,6 +2932,8 @@ make_execsql_stmt(int firsttoken, int location, PLword *word)
 						  ((firsttoken == T_WORD && word != NULL &&
 							!word->quoted && word->ident != NULL &&
 							pg_strcasecmp(word->ident, "select") == 0) ||
+						   (firsttoken == '(' && first_word != NULL &&
+							pg_strcasecmp(first_word, "select") == 0) ||
 						   /*
 							* MySQL's EXECUTE of a previously PREPAREd
 							* statement (captured here too -- see
@@ -2881,6 +3002,64 @@ mysql_check_transaction_context(int location)
 		return;
 
 	mysSetPendingMySQLErrno(1422); /* ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG */
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("Explicit or implicit commit is not allowed in stored function or trigger"),
+			 parser_errposition(location)));
+}
+
+/*
+ * MySQL also rejects the statements that would cause an implicit commit
+ * (13.3.3, "Statements That Cause an Implicit Commit") inside a stored
+ * FUNCTION or trigger, with the same ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG.
+ * The captured-SQL path sees those as bare words, so sniff the statement's
+ * first word at compile time.  CREATE/DROP TEMPORARY TABLE are MySQL's own
+ * documented exceptions and stay allowed.  (This is the compile-time half;
+ * deliberately dynamic SQL -- PREPARE/EXECUTE of DDL text -- is not caught
+ * here.)
+ */
+static void
+mysql_check_implicit_commit_context(int firsttoken, PLword *word, int location)
+{
+	static const char *const implicit_commit_words[] = {
+		"alter", "create", "drop", "flush", "grant", "lock", "optimize",
+		"repair", "revoke", "truncate", "unlock", NULL
+	};
+	const char *w;
+	int			tok;
+	bool		exception = false;
+	int			i;
+
+	if (firsttoken != T_WORD || word == NULL || word->quoted ||
+		word->ident == NULL)
+		return;
+
+	if (plmysql_curr_compile->fn_prokind != PROKIND_FUNCTION &&
+		plmysql_curr_compile->fn_is_trigger == PLMYSQL_NOT_TRIGGER)
+		return;
+
+	w = word->ident;
+	for (i = 0; implicit_commit_words[i] != NULL; i++)
+	{
+		if (pg_strcasecmp(w, implicit_commit_words[i]) == 0)
+			break;
+	}
+	if (implicit_commit_words[i] == NULL)
+		return;
+
+	/* CREATE/DROP TEMPORARY TABLE is explicitly allowed by MySQL. */
+	if (pg_strcasecmp(w, "create") == 0 || pg_strcasecmp(w, "drop") == 0)
+	{
+		tok = yylex();
+		plmysql_push_back_token(tok);
+		if (tok == T_WORD && !yylval.word.quoted &&
+			pg_strcasecmp(yylval.word.ident, "temporary") == 0)
+			exception = true;
+	}
+	if (exception)
+		return;
+
+	mysSetPendingMySQLErrno(1422);
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("Explicit or implicit commit is not allowed in stored function or trigger"),

@@ -719,6 +719,7 @@ Datum
 plmysql_call_handler(PG_FUNCTION_ARGS)
 {
 	bool		nonatomic;
+	bool		is_outermost;
 	PLMySQL_function *func;
 	PLMySQL_execstate *save_cur_estate;
 	ResourceOwner procedure_resowner;
@@ -780,6 +781,7 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 	call_stack_entry.fn_oid = func->fn_oid;
 	call_stack_entry.prev = plmysql_call_stack;
 	plmysql_call_stack = &call_stack_entry;
+	is_outermost = (call_stack_entry.prev == NULL);
 
 	/* Must save and restore prior value of cur_estate */
 	save_cur_estate = func->cur_estate;
@@ -835,6 +837,19 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 		}
 	}
 	PG_END_TRY();
+
+	/*
+	 * MySQL's savepoint level equals the caller's for procedures: savepoints
+	 * created here remain established after return, for the enclosing
+	 * transaction.  But the OUTERMOST invocation runs one top-level
+	 * statement: over the MySQL protocol the enclosing transaction ends
+	 * with the CALL, and an internal subtransaction left open would break
+	 * the adapter's end-of-statement commit.  So the outermost frame
+	 * releases the savepoints it created (keeping their effects) on the way
+	 * out; deeper frames leave theirs for the caller, as in MySQL.
+	 */
+	if (is_outermost)
+		plmysql_release_all_savepoints();
 
 	/*
 	 * Disconnect from SPI manager

@@ -62,6 +62,11 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
+#include "catalog/pg_depend.h"
+#include "catalog/pg_rewrite.h"
+#include "catalog/dependency.h"
+#include "catalog/objectaddress.h"
+#include "utils/fmgroids.h"
 #include "executor/tstoreReceiver.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -545,6 +550,30 @@ mys_check_mysql_trigger_target(CreateTrigStmt *stmt)
 	 * "mysql" (unchanged), "mys_informa_schema" (information_schema) and
 	 * "mys_sys" (sys); there is no performance_schema equivalent to check.
 	 */
+	/*
+	 * mysqldump spells the trigger in qualified form (CREATE TRIGGER
+	 * db.name); MySQL requires that schema to match the table's
+	 * (ER_TRG_IN_WRONG_SCHEMA, 1435).
+	 */
+	if (relid != InvalidOid)
+	{
+		char	   *declSchema =
+			mys_mysql_trigger_marker(stmt, "mysql_trigger_name_schema");
+
+		if (declSchema != NULL)
+		{
+			char	   *tableSchema = get_namespace_name(get_rel_namespace(relid));
+
+			if (tableSchema != NULL && strcmp(declSchema, tableSchema) != 0)
+			{
+				mysSetPendingMySQLErrno(1435);	/* ER_TRG_IN_WRONG_SCHEMA */
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							 errmsg("Trigger in wrong schema")));
+			}
+		}
+	}
+
 	namespaceOid = get_rel_namespace(relid);
 	schemaName = get_namespace_name(namespaceOid);
 	if (schemaName != NULL &&
@@ -588,13 +617,132 @@ mys_mysql_trigger_function_body(CreateTrigStmt *stmt, const char *body)
 					(int) (end - begin), begin, return_expr);
 }
 
+/*
+ * Resolve MySQL's "DEFINER = CURRENT_USER" marker (mys_gram.y's user ->
+ * RoleId -> RoleSpec derivation) to the creating role, in the
+ * "user@host" spelling every other definer consumer expects.  MySQL does
+ * the same at CREATE time: SHOW CREATE PROCEDURE reports the resolved
+ * account, not the CURRENT_USER keyword.
+ */
+static char *
+mys_resolve_definer_marker(const char *definer)
+{
+	if (definer != NULL && strcmp(definer, "@CURRENT_USER@") == 0)
+		return psprintf("%s@%%", GetUserNameFromId(GetUserId(), false));
+	return (char *) definer;
+}
+
+/*
+ * MySQL rejects RETURN in a trigger body with ER_SP_BADRETURN (1313,
+ * "RETURN is only allowed in a FUNCTION").  The check must scan the
+ * ORIGINAL MySQL body text: plmysql's own grammar cannot distinguish a
+ * user-written RETURN from the RETURN NEW/NULL this wrapper injects to
+ * satisfy PostgreSQL's trigger-function protocol (see
+ * mys_mysql_trigger_function_body).  The scan tracks BEGIN...END-style
+ * nesting so RETURNs nested inside flow control stay legal, skipping
+ * string literals, quoted identifiers and comments along the way.
+ */
+static void
+mys_check_trigger_body_return(const char *body)
+{
+	const char *p = body;
+
+	while (*p != '\0')
+	{
+		if (*p == '\'' || *p == '"')
+		{
+			char		quote = *p++;
+
+			while (*p != '\0' && *p != quote)
+			{
+				if (*p == '\\' && p[1] != '\0')
+					p++;
+				else if (*p == quote && p[1] == quote)
+					p++;
+				p++;
+			}
+			if (*p != '\0')
+				p++;
+		}
+		else if (*p == '`')
+		{
+			p++;
+			while (*p != '\0' && *p != '`')
+				p++;
+			if (*p != '\0')
+				p++;
+		}
+		else if (p[0] == '/' && p[1] == '*')
+		{
+			p += 2;
+			while (*p != '\0' && !(p[0] == '*' && p[1] == '/'))
+				p++;
+			if (*p != '\0')
+				p += 2;
+		}
+		else if (p[0] == '-' && p[1] == '-')
+		{
+			while (*p != '\0' && *p != '\n')
+				p++;
+		}
+		else if (*p == '#')
+		{
+			while (*p != '\0' && *p != '\n')
+				p++;
+		}
+		else if (pg_strncasecmp(p, "begin", 5) == 0 && !isalnum((unsigned char) p[5]) && p[5] != '_')
+		{
+			p += 5;
+		}
+		else if ((pg_strncasecmp(p, "loop", 4) == 0 && !isalnum((unsigned char) p[4]) && p[4] != '_') ||
+				 (pg_strncasecmp(p, "case", 4) == 0 && !isalnum((unsigned char) p[4]) && p[4] != '_'))
+		{
+			p += 4;
+		}
+		else if (pg_strncasecmp(p, "while", 5) == 0 && !isalnum((unsigned char) p[5]) && p[5] != '_')
+		{
+			p += 5;
+		}
+		else if (pg_strncasecmp(p, "repeat", 6) == 0 && !isalnum((unsigned char) p[6]) && p[6] != '_')
+		{
+			p += 6;
+		}
+		else if (pg_strncasecmp(p, "return", 6) == 0 && !isalnum((unsigned char) p[6]) && p[6] != '_')
+		{
+			mysSetPendingMySQLErrno(1313);	/* ER_SP_BADRETURN */
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("RETURN is only allowed in a FUNCTION")));
+		}
+		else if (pg_strncasecmp(p, "end", 3) == 0 && !isalnum((unsigned char) p[3]) && p[3] != '_')
+		{
+			p += 3;
+			/*
+			 * Swallow a following closer keyword (END IF / END CASE / END
+			 * WHILE / ...) so it is not mistaken for an opener; an
+			 * optional label echo may also follow END -- words like that
+			 * are harmlessly skipped since they are not openers either.
+			 */
+			while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+				p++;
+			while (isalnum((unsigned char) *p) || *p == '_')
+				p++;
+		}
+		else
+			p++;
+	}
+}
+
 static CreateFunctionStmt *
 mys_make_mysql_trigger_function(CreateTrigStmt *stmt)
 {
 	CreateFunctionStmt *func = makeNode(CreateFunctionStmt);
 	const char *body = mys_mysql_trigger_marker(stmt, "mysql_trigger_body");
-	const char *definer = mys_mysql_trigger_marker(stmt, "mysql_trigger_definer");
+	const char *definer = mys_resolve_definer_marker(
+		mys_mysql_trigger_marker(stmt, "mysql_trigger_definer"));
 	char	   *wrapped_body = mys_mysql_trigger_function_body(stmt, body);
+
+	mys_check_trigger_body_return(body);
 
 	func->is_procedure = false;
 	/*
@@ -619,6 +767,10 @@ mys_make_mysql_trigger_function(CreateTrigStmt *stmt)
 	if (definer != NULL)
 		func->options = lappend(func->options,
 			mys_plmysql_meta_item("plmysql.definer", definer));
+	definer = mys_mysql_trigger_marker(stmt, "mysql_trigger_order");
+	if (definer != NULL)
+		func->options = lappend(func->options,
+			mys_plmysql_meta_item("plmysql.trigger_order", definer));
 	func->sql_body = NULL;
 	return func;
 }
@@ -642,19 +794,48 @@ mys_make_mysql_trigger_function(CreateTrigStmt *stmt)
 #define MYS_MYSQL_DROP_TRIGGER_MARKER	"__mysql_drop_trigger__"
 #define MYS_ERR_TRG_DOES_NOT_EXIST		1360
 
+/*
+ * Does this trigger's private function carry the MySQL trigger name?
+ * Names are either the legacy "__mysql_trigger_<name>" or the
+ * creation-order-encoded "__mysql_trigger_<seq>_<name>".
+ */
+static bool
+mys_trigger_function_name_matches(const char *funcname, const char *trigname)
+{
+	const char *rest;
+	size_t		prefixlen = strlen("__mysql_trigger_");
+	size_t		namelen = strlen(trigname);
+
+	if (funcname == NULL || strncmp(funcname, "__mysql_trigger_", prefixlen) != 0)
+		return false;
+	rest = funcname + prefixlen;
+	if (strcmp(rest, trigname) == 0)
+		return true;
+	if (strlen(rest) > namelen + 1)
+	{
+		const char *tail = rest + strlen(rest) - namelen;
+
+		if (tail[-1] == '_' &&
+			strspn(rest, "0123456789") == (size_t) (tail - rest - 1) &&
+			strcmp(tail, trigname) == 0)
+			return true;
+	}
+	return false;
+}
+
 static bool
 mys_trigger_has_mysql_name(Oid tgfoid, const char *trigname)
 {
 	HeapTuple	protup;
 	Form_pg_proc procform;
 	bool		result;
-	char	   *expect = psprintf("__mysql_trigger_%s", trigname);
 
 	protup = SearchSysCache1(PROCOID, ObjectIdGetDatum(tgfoid));
 	if (!HeapTupleIsValid(protup))
 		return false;
 	procform = (Form_pg_proc) GETSTRUCT(protup);
-	result = strcmp(NameStr(procform->proname), expect) == 0;
+	result = mys_trigger_function_name_matches(NameStr(procform->proname),
+											   trigname);
 	ReleaseSysCache(protup);
 	return result;
 }
@@ -1948,8 +2129,27 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 					CreateFunctionStmt *cfstmt = (CreateFunctionStmt *) parsetree;
 					List	   *plmysql_meta;
 
+					ListCell   *deflc;
+
 					mys_plmysql_inject_create_meta(cfstmt);
 					plmysql_meta = mys_plmysql_extract_meta(&cfstmt->options);
+
+					/* DEFINER=CURRENT_USER resolves to the creating role. */
+					foreach(deflc, plmysql_meta)
+					{
+						if (strncmp(lfirst(deflc), "plmysql.definer=",
+									strlen("plmysql.definer=")) == 0)
+						{
+							char *resolved =
+								mys_resolve_definer_marker(
+									(char *) lfirst(deflc) +
+									strlen("plmysql.definer="));
+
+							lfirst(deflc) =
+								psprintf("plmysql.definer=%s", resolved);
+						}
+					}
+
 					mys_plmysql_redirect_sql_security(&cfstmt->options,
 													  &plmysql_meta);
 					mys_check_definer_privilege(
@@ -2013,16 +2213,61 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 				if (mys_is_mysql_trigger_stmt((CreateTrigStmt *) parsetree))
 				{
 					PlannedStmt *wrapper = makeNode(PlannedStmt);
+					CreateFunctionStmt *tf;
+					Oid			relid;
 
 					mys_check_mysql_trigger_uniqueness((CreateTrigStmt *) parsetree);
 					mys_check_mysql_trigger_target((CreateTrigStmt *) parsetree);
 					mys_check_definer_privilege(
-						mys_mysql_trigger_marker((CreateTrigStmt *) parsetree,
-												 "mysql_trigger_definer"));
+						mys_resolve_definer_marker(
+							mys_mysql_trigger_marker((CreateTrigStmt *) parsetree,
+													 "mysql_trigger_definer")));
+
+					/*
+					 * PostgreSQL fires same-event triggers alphabetically by
+					 * name; MySQL fires them in creation order.  Encode a
+					 * creation-order sequence into the private trigger
+					 * function's name so alphabetical order IS creation
+					 * order (the trigger name itself is unaffected).
+					 */
+					tf = mys_make_mysql_trigger_function((CreateTrigStmt *) parsetree);
+					relid = RangeVarGetRelid(((CreateTrigStmt *) parsetree)->relation,
+											 NoLock, true);
+					if (OidIsValid(relid) && list_length(tf->funcname) >= 1)
+					{
+						Relation	tgrel;
+						SysScanDesc scan;
+						HeapTuple	tuple;
+						int			seq = 1;
+						char	   *trigname = strVal(llast(tf->funcname));
+
+						trigname += strlen("__mysql_trigger_");
+						tgrel = table_open(TriggerRelationId, AccessShareLock);
+						scan = systable_beginscan(tgrel, InvalidOid, false,
+												  NULL, 0, NULL);
+						while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+						{
+							Form_pg_trigger trigform =
+								(Form_pg_trigger) GETSTRUCT(tuple);
+
+							if (trigform->tgrelid == relid &&
+								!trigform->tgisinternal)
+								seq++;
+						}
+						systable_endscan(scan);
+						table_close(tgrel, AccessShareLock);
+
+						/* The trigger must resolve its function by the SAME name. */
+						llast(tf->funcname) =
+							PointerGetDatum(makeString(pstrdup(psprintf("__mysql_trigger_%06d_%s",
+																   seq, trigname))));
+						llast(((CreateTrigStmt *) parsetree)->funcname) =
+							PointerGetDatum(makeString(pstrdup(psprintf("__mysql_trigger_%06d_%s",
+																   seq, trigname))));
+					}
 					wrapper->commandType = CMD_UTILITY;
 					wrapper->canSetTag = false;
-					wrapper->utilityStmt = (Node *)
-						mys_make_mysql_trigger_function((CreateTrigStmt *) parsetree);
+					wrapper->utilityStmt = (Node *) tf;
 					wrapper->stmt_location = pstmt->stmt_location;
 					wrapper->stmt_len = pstmt->stmt_len;
 					ProcessUtility(wrapper, queryString, false,
@@ -2305,11 +2550,98 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 /*
  * Dispatch function for DropStmt
  */
+/*
+ * MySQL drops routines and tables even when a view depends on them; the
+ * dependent view simply becomes invalid and errors on next use (until the
+ * object is recreated).  PostgreSQL instead blocks the drop with
+ * ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST -- and DROP ... CASCADE would
+ * delete the view, which MySQL never does.  To reproduce MySQL's behavior,
+ * delete the view's NORMAL pg_depend rows that point at the object being
+ * dropped (the pg_rewrite rule's references) before the native drop: the
+ * view survives with a dangling reference, and resolving it later fails
+ * with "function ... does not exist" -- 1305 on the MySQL protocol.
+ *
+ * Only pg_rewrite references are pruned.  Every other dependent kind
+ * (defaults, constraints, policies...) keeps blocking, since MySQL has no
+ * syntax to create them against a routine in the first place.  Runs in the
+ * caller's transaction: a later failure rolls the pruning back with it.
+ */
+static void
+mys_prune_mysql_view_dependencies(DropStmt *stmt)
+{
+	Oid			refclassid;
+	ListCell   *lc;
+
+	switch (stmt->removeType)
+	{
+		case OBJECT_FUNCTION:
+		case OBJECT_PROCEDURE:
+			refclassid = ProcedureRelationId;
+			break;
+		case OBJECT_TABLE:
+			refclassid = RelationRelationId;
+			break;
+		default:
+			return;
+	}
+
+	foreach(lc, stmt->objects)
+	{
+		Node	   *object = lfirst(lc);
+		ObjectAddress address;
+		Relation	rel = NULL;
+		Relation	depRel;
+		SysScanDesc scan;
+		ScanKeyData key[2];
+		HeapTuple	tuple;
+
+		address = get_object_address(stmt->removeType, object, &rel,
+									 AccessExclusiveLock, stmt->missing_ok);
+		if (rel != NULL)
+			table_close(rel, NoLock);
+		if (!OidIsValid(address.objectId))
+			continue;				/* IF EXISTS and it is already gone */
+
+		depRel = table_open(DependRelationId, RowExclusiveLock);
+
+		ScanKeyInit(&key[0],
+					Anum_pg_depend_refclassid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(refclassid));
+		ScanKeyInit(&key[1],
+					Anum_pg_depend_refobjid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(address.objectId));
+
+		scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+								  NULL, 2, key);
+		while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+		{
+			Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tuple);
+
+			if (dep->refclassid == refclassid &&
+				dep->refobjid == address.objectId &&
+				dep->classid == RewriteRelationId &&
+				dep->deptype == DEPENDENCY_NORMAL)
+				simple_heap_delete(depRel, &tuple->t_self);
+		}
+		systable_endscan(scan);
+		table_close(depRel, RowExclusiveLock);
+
+		CommandCounterIncrement();
+	}
+}
+
 static void
 mys_ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 {
 	if (stmt->removeType == OBJECT_TRIGGER)
 		mys_preprocess_mysql_drop_trigger(stmt);
+
+	if (stmt->removeType == OBJECT_FUNCTION ||
+		stmt->removeType == OBJECT_PROCEDURE ||
+		stmt->removeType == OBJECT_TABLE)
+		mys_prune_mysql_view_dependencies(stmt);
 
 	switch (stmt->removeType)
 	{

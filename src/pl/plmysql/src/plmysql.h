@@ -125,7 +125,11 @@ typedef enum PLMySQL_stmt_type
 	PLMYSQL_STMT_PERFORM,
 	PLMYSQL_STMT_CALL,
 	PLMYSQL_STMT_COMMIT,
-	PLMYSQL_STMT_ROLLBACK
+	PLMYSQL_STMT_ROLLBACK,
+	PLMYSQL_STMT_START,
+	PLMYSQL_STMT_SAVEPOINT,
+	PLMYSQL_STMT_ROLLBACK_TO,
+	PLMYSQL_STMT_RELEASE_SAVEPOINT
 } PLMySQL_stmt_type;
 
 /*
@@ -594,6 +598,18 @@ typedef struct PLMySQL_stmt_commit
 } PLMySQL_stmt_commit;
 
 /*
+ * MySQL's SAVEPOINT / ROLLBACK TO / RELEASE SAVEPOINT / START TRANSACTION,
+ * all carrying just a savepoint name (START TRANSACTION carries none).
+ */
+typedef struct PLMySQL_stmt_savepoint
+{
+	PLMySQL_stmt_type cmd_type;
+	int			lineno;
+	unsigned int stmtid;
+	char	   *name;
+} PLMySQL_stmt_savepoint;
+
+/*
  * ROLLBACK statement
  */
 typedef struct PLMySQL_stmt_rollback
@@ -1038,6 +1054,18 @@ typedef struct PLMySQL_execstate
 	 */
 	int			ndatums;
 	PLMySQL_datum **datums;
+
+	/*
+	 * Savepoint/transaction support.  in_handler_block marks execution
+	 * inside exec_stmt_block_mysql, where every statement runs in its own
+	 * wrapper subtransaction; a savepoint-family or transaction-control
+	 * statement that must reach past that wrapper pops it itself and sets
+	 * stmt_subxact_released so the block loop skips its release (and knows
+	 * the wrapper is gone).
+	 */
+	bool		in_handler_block;
+	bool		in_stmt_wrapper; /* a per-statement wrapper subxact is current */
+	bool		stmt_subxact_released;
 	/* context containing variable values (same as func's SPI_proc context) */
 	MemoryContext datum_context;
 
@@ -1216,6 +1244,14 @@ extern int	plmysql_caught_mysql_errno;
 
 /* backend-side stash for the adapter's error packet builder (adapter/mysql) */
 extern void mysSetPendingMySQLErrno(int errorCode);
+
+/*
+ * Release (keep effects) every named savepoint established on the
+ * backend's internal-subtransaction stack; used by the outermost routine
+ * invocation so the adapter's end-of-statement commit is not left with an
+ * open subtransaction.
+ */
+extern void plmysql_release_all_savepoints(void);
 
 /*
  * MySQL handler execution support (pl_exec_ext.c)

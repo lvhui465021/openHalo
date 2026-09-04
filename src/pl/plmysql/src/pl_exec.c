@@ -333,6 +333,18 @@ static int	exec_stmt_commit(PLMySQL_execstate *estate,
 static int	exec_stmt_rollback(PLMySQL_execstate *estate,
 							   PLMySQL_stmt_rollback *stmt);
 
+static bool mysql_limit_var_type_walker(Node *node, PLMySQL_execstate *estate);
+static void mysql_check_limit_var_types(PLMySQL_execstate *estate,
+											 SPIPlanPtr plan);
+static int	exec_stmt_start(PLMySQL_execstate *estate,
+							PLMySQL_stmt_savepoint *stmt);
+static int	exec_stmt_savepoint(PLMySQL_execstate *estate,
+								PLMySQL_stmt_savepoint *stmt);
+static int	exec_stmt_rollback_to(PLMySQL_execstate *estate,
+								  PLMySQL_stmt_savepoint *stmt);
+static int	exec_stmt_release(PLMySQL_execstate *estate,
+							  PLMySQL_stmt_savepoint *stmt);
+
 static void plmysql_estate_setup(PLMySQL_execstate *estate,
 								 PLMySQL_function *func,
 								 ReturnSetInfo *rsi,
@@ -498,6 +510,9 @@ plmysql_exec_function(PLMySQL_function *func, FunctionCallInfo fcinfo,
 						 simple_eval_estate, simple_eval_resowner);
 	estate.procedure_resowner = procedure_resowner;
 	estate.atomic = atomic;
+	estate.in_handler_block = false;
+	estate.in_stmt_wrapper = false;
+	estate.stmt_subxact_released = false;
 
 	/*
 	 * Setup error traceback support for ereport()
@@ -1793,6 +1808,7 @@ exec_stmt_block_mysql(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
 {
 	volatile int rc = -1;
 	ListCell   *l;
+	bool		save_in_handler;
 	ErrorData  *save_cur_error = estate->cur_error;
 	MemoryContext oldcontext = CurrentMemoryContext;
 	ResourceOwner oldowner = CurrentResourceOwner;
@@ -1800,6 +1816,17 @@ exec_stmt_block_mysql(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
 	MemoryContext stmt_mcontext;
 
 	plmysql_exec_block_initvars(estate, block);
+
+	/*
+	 * Savepoint bookkeeping: statements in a handler block run inside
+	 * per-statement wrapper subtransactions (begun below), and the
+	 * savepoint-family statements need to know that (in_handler_block) and
+	 * can announce that they consumed the wrapper themselves
+	 * (stmt_subxact_released).  Both are restored on every exit below.
+	 */
+	save_in_handler = estate->in_handler_block;
+	estate->in_handler_block = true;
+	estate->stmt_subxact_released = false;
 
 	estate->err_text = NULL;
 
@@ -1826,6 +1853,7 @@ exec_stmt_block_mysql(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
 		CHECK_FOR_INTERRUPTS();
 
 		BeginInternalSubTransaction(NULL);
+		estate->in_stmt_wrapper = true;
 		/* Want to run statements inside function's memory context */
 		MemoryContextSwitchTo(oldcontext);
 
@@ -1833,9 +1861,24 @@ exec_stmt_block_mysql(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
 		{
 			rc = exec_stmt(estate, stmt);
 
-			/* Commit the inner transaction, return to outer xact context */
-			ReleaseCurrentSubTransaction();
-			MemoryContextSwitchTo(oldcontext);
+			/*
+			 * Commit the statement's wrapper subtransaction -- unless the
+			 * statement was a savepoint-family/transaction-control one that
+			 * already popped it to reach past (exec_stmt_savepoint et al.).
+			 * The next loop iteration begins a fresh wrapper either way.
+			 */
+			if (estate->stmt_subxact_released)
+			{
+				estate->stmt_subxact_released = false;
+				estate->in_stmt_wrapper = false;
+				MemoryContextSwitchTo(oldcontext);
+			}
+			else
+			{
+				ReleaseCurrentSubTransaction();
+				estate->in_stmt_wrapper = false;
+				MemoryContextSwitchTo(oldcontext);
+			}
 			CurrentResourceOwner = oldowner;
 		}
 		PG_CATCH();
@@ -1859,6 +1902,7 @@ exec_stmt_block_mysql(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
 
 			/* Abort the statement's subtransaction */
 			RollbackAndReleaseCurrentSubTransaction();
+			estate->in_stmt_wrapper = false;
 			MemoryContextSwitchTo(oldcontext);
 			CurrentResourceOwner = oldowner;
 
@@ -1928,6 +1972,8 @@ exec_stmt_block_mysql(PLMySQL_execstate *estate, PLMySQL_stmt_block *block)
 	}
 
 block_exit:
+	estate->in_handler_block = save_in_handler;
+	estate->stmt_subxact_released = false;
 	estate->err_text = NULL;
 
 	/*
@@ -2536,6 +2582,22 @@ exec_stmt(PLMySQL_execstate *estate, PLMySQL_stmt *stmt)
 
 			case PLMYSQL_STMT_ROLLBACK:
 				rc = exec_stmt_rollback(estate, (PLMySQL_stmt_rollback *) stmt);
+				break;
+
+			case PLMYSQL_STMT_START:
+				rc = exec_stmt_start(estate, (PLMySQL_stmt_savepoint *) stmt);
+				break;
+
+			case PLMYSQL_STMT_SAVEPOINT:
+				rc = exec_stmt_savepoint(estate, (PLMySQL_stmt_savepoint *) stmt);
+				break;
+
+			case PLMYSQL_STMT_ROLLBACK_TO:
+				rc = exec_stmt_rollback_to(estate, (PLMySQL_stmt_savepoint *) stmt);
+				break;
+
+			case PLMYSQL_STMT_RELEASE_SAVEPOINT:
+				rc = exec_stmt_release(estate, (PLMySQL_stmt_savepoint *) stmt);
 				break;
 
 			default:
@@ -4116,8 +4178,79 @@ exec_prepare_plan(PLMySQL_execstate *estate,
 	SPI_keepplan(plan);
 	expr->plan = plan;
 
+	mysql_check_limit_var_types(estate, plan);
+
 	/* Check to see if it's a simple expression */
 	exec_simple_check_plan(estate, expr);
+}
+
+/*
+ * MySQL rejects a LIMIT/OFFSET whose argument is a routine variable of a
+ * non-integer type with ER_WRONG_SPVAR_TYPE_IN_LIMIT (1691).  plmysql hands
+ * such variables to the core parser as PARAM_EXTERN params typed by the
+ * variable's declared type, so after planning, walk the plan's query trees'
+ * limitCount/limitOffset expressions looking for those params.
+ */
+static bool
+mysql_limit_var_type_walker(Node *node, PLMySQL_execstate *estate)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Param))
+	{
+		Param	   *param = (Param *) node;
+
+		if (param->paramkind == PARAM_EXTERN)
+		{
+			int			dno = param->paramid - 1;
+
+			if (dno >= 0 && dno < estate->ndatums &&
+				estate->datums[dno]->dtype == PLMYSQL_DTYPE_VAR)
+			{
+				PLMySQL_var    *var = (PLMySQL_var *) estate->datums[dno];
+				Oid			typoid = var->datatype->typoid;
+
+				if (typoid != INT2OID && typoid != INT4OID &&
+					typoid != INT8OID && typoid != BITOID)
+				{
+					mysSetPendingMySQLErrno(1691);	/* ER_WRONG_SPVAR_TYPE_IN_LIMIT */
+					ereport(ERROR,
+							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							 errmsg("Incorrect type for argument \"%s\" in LIMIT clause",
+									var->refname)));
+				}
+			}
+		}
+		return false;
+	}
+
+	return expression_tree_walker(node, mysql_limit_var_type_walker,
+								  (void *) estate);
+}
+
+static void
+mysql_check_limit_var_types(PLMySQL_execstate *estate, SPIPlanPtr plan)
+{
+	List	   *sources = SPI_plan_get_plan_sources(plan);
+	ListCell   *lc;
+
+	foreach(lc, sources)
+	{
+		CachedPlanSource *plansource = (CachedPlanSource *) lfirst(lc);
+		ListCell   *qlc;
+
+		foreach(qlc, plansource->query_list)
+		{
+			Query	   *query = (Query *) lfirst(qlc);
+
+			if (!IsA(query, Query))
+				continue;
+
+			mysql_limit_var_type_walker(query->limitCount, estate);
+			mysql_limit_var_type_walker(query->limitOffset, estate);
+		}
+	}
 }
 
 
@@ -4858,13 +4991,112 @@ exec_stmt_close(PLMySQL_execstate *estate, PLMySQL_stmt_close *stmt)
 }
 
 /*
+ * MySQL named savepoints, mapped onto PostgreSQL's internal subtransaction
+ * stack.  The stack is backend-local and global across the routine-call
+ * nesting: a savepoint a procedure establishes stays established after it
+ * returns (MySQL keeps the caller's savepoint level for procedures), until
+ * a COMMIT/ROLLBACK/START TRANSACTION releases everything or the enclosing
+ * transaction ends.
+ *
+ * The one structural complication is exec_stmt_block_mysql's per-statement
+ * wrapper subtransactions: a savepoint must OUTLIVE the statement that
+ * created it, so the creating/rolling/releasing statement first pops its
+ * own wrapper and sets estate->stmt_subxact_released, telling the block
+ * loop to skip the wrapper release it would otherwise do.  Blocks without
+ * handlers run statements without wrappers, so nothing special is needed
+ * there (in_handler_block is false).
+ */
+typedef struct PLMySQL_savepoint_entry
+{
+	char	   *name;
+	SubTransactionId id;
+} PLMySQL_savepoint_entry;
+
+static List *plmysql_savepoint_stack = NIL;
+
+static int
+plmysql_savepoint_find(const char *name)
+{
+	int			i;
+
+	for (i = list_length(plmysql_savepoint_stack) - 1; i >= 0; i--)
+	{
+		PLMySQL_savepoint_entry *entry =
+			(PLMySQL_savepoint_entry *) lfirst(list_nth_cell(plmysql_savepoint_stack, i));
+
+		if (strcmp(entry->name, name) == 0)
+			return i;
+	}
+	return -1;
+}
+
+static void
+plmysql_savepoint_push(const char *name)
+{
+	PLMySQL_savepoint_entry *entry;
+	MemoryContext oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+
+	/*
+	 * TopMemoryContext: rolling back the savepoint destroys its own
+	 * subtransaction context, which would free an entry allocated inside
+	 * it while the stack still refers to the entry.
+	 */
+	entry = palloc(sizeof(PLMySQL_savepoint_entry));
+	entry->name = pstrdup(name);
+	entry->id = GetCurrentSubTransactionId();
+	plmysql_savepoint_stack = lappend(plmysql_savepoint_stack, entry);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * Unwind to the entry at stack index target (exclusive of popping it).
+ * keep_effects selects RELEASE semantics (Release, work kept) for ROLLBACK
+ * TO's discard-above the caller passes false and aborts the target itself
+ * afterwards -- PostgreSQL cannot roll back INTO a still-open
+ * subtransaction.
+ */
+static void
+plmysql_savepoint_unwind_above(int target, bool keep_effects)
+{
+	while (list_length(plmysql_savepoint_stack) > target + 1)
+	{
+		plmysql_savepoint_stack = list_truncate(plmysql_savepoint_stack,
+												list_length(plmysql_savepoint_stack) - 1);
+		if (keep_effects)
+			ReleaseCurrentSubTransaction();
+		else
+			RollbackAndReleaseCurrentSubTransaction();
+	}
+}
+
+void
+plmysql_release_all_savepoints(void)
+{
+	while (plmysql_savepoint_stack != NIL)
+	{
+		plmysql_savepoint_stack = list_truncate(plmysql_savepoint_stack,
+												list_length(plmysql_savepoint_stack) - 1);
+		ReleaseCurrentSubTransaction();
+	}
+}
+
+/*
  * exec_stmt_commit
  *
- * Commit the transaction.
+ * Commit the transaction.  MySQL's COMMIT also releases every savepoint,
+ * which is mandatory here anyway: PostgreSQL refuses to commit while an
+ * internal subtransaction is open.
  */
 static int
 exec_stmt_commit(PLMySQL_execstate *estate, PLMySQL_stmt_commit *stmt)
 {
+	if (estate->in_stmt_wrapper)
+	{
+		ReleaseCurrentSubTransaction();
+		estate->stmt_subxact_released = true;
+	}
+	plmysql_release_all_savepoints();
+
 	if (stmt->chain)
 		SPI_commit_and_chain();
 	else
@@ -4889,6 +5121,13 @@ exec_stmt_commit(PLMySQL_execstate *estate, PLMySQL_stmt_commit *stmt)
 static int
 exec_stmt_rollback(PLMySQL_execstate *estate, PLMySQL_stmt_rollback *stmt)
 {
+	if (estate->in_stmt_wrapper)
+	{
+		ReleaseCurrentSubTransaction();
+		estate->stmt_subxact_released = true;
+	}
+	plmysql_release_all_savepoints();
+
 	if (stmt->chain)
 		SPI_rollback_and_chain();
 	else
@@ -4901,6 +5140,126 @@ exec_stmt_rollback(PLMySQL_execstate *estate, PLMySQL_stmt_rollback *stmt)
 	estate->simple_eval_estate = NULL;
 	estate->simple_eval_resowner = NULL;
 	plmysql_create_econtext(estate);
+
+	return PLMYSQL_RC_OK;
+}
+
+/*
+ * exec_stmt_start
+ *
+ * START TRANSACTION in MySQL implicitly commits the current transaction and
+ * opens a new one -- which is exactly what a plain COMMIT does in a
+ * PostgreSQL nonatomic procedure.
+ */
+static int
+exec_stmt_start(PLMySQL_execstate *estate, PLMySQL_stmt_savepoint *stmt)
+{
+	if (estate->in_stmt_wrapper)
+	{
+		ReleaseCurrentSubTransaction();
+		estate->stmt_subxact_released = true;
+	}
+	plmysql_release_all_savepoints();
+
+	SPI_commit();
+
+	estate->simple_eval_estate = NULL;
+	estate->simple_eval_resowner = NULL;
+	plmysql_create_econtext(estate);
+
+	return PLMYSQL_RC_OK;
+}
+
+/*
+ * exec_stmt_savepoint
+ *
+ * Establish a named savepoint: open an internal subtransaction that stays
+ * open across the statements that follow.  The creating statement pops its
+ * own wrapper first (flagged via stmt_subxact_released) so the savepoint
+ * is not buried inside it.
+ */
+static int
+exec_stmt_savepoint(PLMySQL_execstate *estate, PLMySQL_stmt_savepoint *stmt)
+{
+	if (estate->in_stmt_wrapper)
+	{
+		ReleaseCurrentSubTransaction();
+		estate->stmt_subxact_released = true;
+	}
+
+	BeginInternalSubTransaction(stmt->name);
+	plmysql_savepoint_push(stmt->name);
+
+	return PLMYSQL_RC_OK;
+}
+
+/*
+ * exec_stmt_rollback_to
+ *
+ * Undo everything since the named savepoint (and cancel savepoints
+ * established after it), keeping the savepoint itself established:
+ * PostgreSQL has no "roll back into an open subtransaction", so the
+ * target's subtransaction is aborted and immediately re-opened.
+ */
+static int
+exec_stmt_rollback_to(PLMySQL_execstate *estate, PLMySQL_stmt_savepoint *stmt)
+{
+	int			target = plmysql_savepoint_find(stmt->name);
+	PLMySQL_savepoint_entry *entry;
+
+	if (target < 0)
+	{
+		mysSetPendingMySQLErrno(1305);	/* ER_SP_DOES_NOT_EXIST */
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("SAVEPOINT %s does not exist", stmt->name)));
+	}
+
+	if (estate->in_stmt_wrapper)
+	{
+		ReleaseCurrentSubTransaction();
+		estate->stmt_subxact_released = true;
+	}
+	plmysql_savepoint_unwind_above(target, false);
+
+	/* Abort the target's contents, then re-establish it. */
+	entry = (PLMySQL_savepoint_entry *) llast(plmysql_savepoint_stack);
+	plmysql_savepoint_stack = list_truncate(plmysql_savepoint_stack,
+											list_length(plmysql_savepoint_stack) - 1);
+	RollbackAndReleaseCurrentSubTransaction();
+	BeginInternalSubTransaction(entry->name);
+	entry->id = GetCurrentSubTransactionId();
+	plmysql_savepoint_stack = lappend(plmysql_savepoint_stack, entry);
+
+	return PLMYSQL_RC_OK;
+}
+
+/*
+ * exec_stmt_release
+ *
+ * Delete the named savepoint (and any established after it), keeping all
+ * of their effects.
+ */
+static int
+exec_stmt_release(PLMySQL_execstate *estate, PLMySQL_stmt_savepoint *stmt)
+{
+	int			target = plmysql_savepoint_find(stmt->name);
+
+	if (target < 0)
+	{
+		mysSetPendingMySQLErrno(1305);	/* ER_SP_DOES_NOT_EXIST */
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("SAVEPOINT %s does not exist", stmt->name)));
+	}
+
+	if (estate->in_stmt_wrapper)
+	{
+		ReleaseCurrentSubTransaction();
+		estate->stmt_subxact_released = true;
+	}
+
+	plmysql_savepoint_unwind_above(target, true);
 
 	return PLMYSQL_RC_OK;
 }

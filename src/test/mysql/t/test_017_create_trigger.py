@@ -64,7 +64,7 @@ def run(cluster):
     out = cluster.psql("""
         SELECT prosrc, array_to_string(proconfig, ',')
         FROM pg_proc
-        WHERE proname = '__mysql_trigger_t017_before';""")
+        WHERE proname LIKE '%t017_before' AND proname LIKE '__mysql_trigger%';""")
     assert "RETURN NEW;" in out, "generated trigger function lacks RETURN NEW: %r" % out
     assert "plmysql.trigger_body=BEGIN" in out, \
         "original body was not recorded in proconfig: %r" % out

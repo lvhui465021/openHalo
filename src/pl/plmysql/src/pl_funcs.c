@@ -281,6 +281,14 @@ plmysql_stmt_typename(PLMySQL_stmt *stmt)
 			return "COMMIT";
 		case PLMYSQL_STMT_ROLLBACK:
 			return "ROLLBACK";
+		case PLMYSQL_STMT_START:
+			return "START TRANSACTION";
+		case PLMYSQL_STMT_SAVEPOINT:
+			return "SAVEPOINT";
+		case PLMYSQL_STMT_ROLLBACK_TO:
+			return "ROLLBACK TO SAVEPOINT";
+		case PLMYSQL_STMT_RELEASE_SAVEPOINT:
+			return "RELEASE SAVEPOINT";
 	}
 
 	return "unknown";
@@ -424,6 +432,12 @@ free_stmt(PLMySQL_stmt *stmt)
 			break;
 		case PLMYSQL_STMT_ROLLBACK:
 			free_rollback((PLMySQL_stmt_rollback *) stmt);
+			break;
+		case PLMYSQL_STMT_START:
+		case PLMYSQL_STMT_SAVEPOINT:
+		case PLMYSQL_STMT_ROLLBACK_TO:
+		case PLMYSQL_STMT_RELEASE_SAVEPOINT:
+			/* no separately-allocated storage worth chasing */
 			break;
 		default:
 			elog(ERROR, "unrecognized cmd_type: %d", stmt->cmd_type);
@@ -734,6 +748,7 @@ static void dump_perform(PLMySQL_stmt_perform *stmt);
 static void dump_call(PLMySQL_stmt_call *stmt);
 static void dump_commit(PLMySQL_stmt_commit *stmt);
 static void dump_rollback(PLMySQL_stmt_rollback *stmt);
+static void dump_savepoint(PLMySQL_stmt_savepoint *stmt);
 static void dump_expr(PLMySQL_expr *expr);
 
 
@@ -820,6 +835,12 @@ dump_stmt(PLMySQL_stmt *stmt)
 			break;
 		case PLMYSQL_STMT_ROLLBACK:
 			dump_rollback((PLMySQL_stmt_rollback *) stmt);
+			break;
+		case PLMYSQL_STMT_START:
+		case PLMYSQL_STMT_SAVEPOINT:
+		case PLMYSQL_STMT_ROLLBACK_TO:
+		case PLMYSQL_STMT_RELEASE_SAVEPOINT:
+			dump_savepoint((PLMySQL_stmt_savepoint *) stmt);
 			break;
 		default:
 			elog(ERROR, "unrecognized cmd_type: %d", stmt->cmd_type);
@@ -1136,6 +1157,29 @@ dump_rollback(PLMySQL_stmt_rollback *stmt)
 		printf("ROLLBACK AND CHAIN\n");
 	else
 		printf("ROLLBACK\n");
+}
+
+static void
+dump_savepoint(PLMySQL_stmt_savepoint *stmt)
+{
+	dump_ind();
+	switch (stmt->cmd_type)
+	{
+		case PLMYSQL_STMT_START:
+			printf("START TRANSACTION\n");
+			break;
+		case PLMYSQL_STMT_SAVEPOINT:
+			printf("SAVEPOINT %s\n", stmt->name);
+			break;
+		case PLMYSQL_STMT_ROLLBACK_TO:
+			printf("ROLLBACK TO SAVEPOINT %s\n", stmt->name);
+			break;
+		case PLMYSQL_STMT_RELEASE_SAVEPOINT:
+			printf("RELEASE SAVEPOINT %s\n", stmt->name);
+			break;
+		default:
+			break;
+	}
 }
 
 static void

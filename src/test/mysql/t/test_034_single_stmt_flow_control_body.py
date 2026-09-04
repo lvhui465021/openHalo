@@ -188,15 +188,12 @@ def run(cluster):
                 "WHERE table_name = 't034_alter' ORDER BY column_name")
             assert cur.fetchall() == (('id',), ('k',))
 
-    # COMMIT / START TRANSACTION as the entire body.  COMMIT now runs at
-    # CALL time too: the routine's default DEFINER characteristic is carried
-    # as a plmysql.sql_security label item (not pg_proc.prosecdef), so the
-    # CALL stays nonatomic (see the C2 fix in the gap-analysis doc and
-    # test_030/test_037).  START TRANSACTION stays pinned to fail with
-    # MySQL's 1235: PostgreSQL procedures only support COMMIT/ROLLBACK as
-    # transaction-control statements, an engine limitation unrelated to the
-    # security-mode mechanism.
-    import pymysql
+    # COMMIT / START TRANSACTION as the entire body both run at CALL time
+    # now: the routine's default DEFINER characteristic is carried as a
+    # plmysql.sql_security label item (not pg_proc.prosecdef), so the CALL
+    # stays nonatomic (see the C2 fix in the gap-analysis doc and
+    # test_030/test_037), and START TRANSACTION lowers to the same
+    # implicit-commit-and-reopen action as COMMIT (exec_stmt_start).
 
     _ddl(cluster,
          "DROP PROCEDURE IF EXISTS t034_commit_p",
@@ -207,15 +204,8 @@ def run(cluster):
         with conn.cursor() as cur:
             cur.execute("CALL t034_commit_p()")
             cur.fetchall()
-            try:
-                cur.execute("CALL t034_start_p()")
-                cur.fetchall()
-                raise AssertionError(
-                    "t034_start_p: expected the known SQL SECURITY "
-                    "DEFINER-vs-START TRANSACTION limitation to still apply")
-            except pymysql.err.NotSupportedError as e:
-                assert e.args[0] == 1235, e
-
+            cur.execute("CALL t034_start_p()")
+            cur.fetchall()
     # Regression: WHILE/CASE nested *inside* a BEGIN...END body (the
     # already-working case this fix must not disturb) still work, and a
     # single-statement leader from before this fix (a bare SELECT) is

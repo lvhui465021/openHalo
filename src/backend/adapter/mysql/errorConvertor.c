@@ -290,6 +290,7 @@ static const struct
     {"42703", "42S22"},         /* 1054 ER_BAD_FIELD_ERROR */
     {"42710", "42000"},         /* 1359 ER_TRG_ALREADY_EXISTS */
     {"42883", "42000"},         /* 1305 ER_SP_DOES_NOT_EXIST */
+    {"2BP000", "42000"},        /* dependent objects still exist (non-view dependents keep blocking) */
     {"42501", "42000"},         /* 1044 ER_DBACCESS_DENIED_ERROR */
     {"55P03", "HY000"},         /* 1205 ER_LOCK_WAIT_TIMEOUT (generic) */
     {"57014", "70100"},         /* 1317 ER_QUERY_INTERRUPTED */
