@@ -188,15 +188,14 @@ def run(cluster):
                 "WHERE table_name = 't034_alter' ORDER BY column_name")
             assert cur.fetchall() == (('id',), ('k',))
 
-    # COMMIT / START TRANSACTION as the entire body -- these only need to
-    # *compile*.  Calling them still hits the pre-existing, already-known
-    # limitation that a routine's default SQL SECURITY DEFINER maps to PG's
-    # prosecdef=true, which PG itself refuses transaction-control statements
-    # in (see C2 in the gap-analysis doc, explicitly deferred pending a
-    # product decision) -- that is a separate, already-tracked issue, not
-    # something this fix is expected to resolve.  Pinning both here as
-    # "compiles, and fails a specific, known way at CALL" keeps that
-    # boundary visible instead of silently dropping the coverage.
+    # COMMIT / START TRANSACTION as the entire body.  COMMIT now runs at
+    # CALL time too: the routine's default DEFINER characteristic is carried
+    # as a plmysql.sql_security label item (not pg_proc.prosecdef), so the
+    # CALL stays nonatomic (see the C2 fix in the gap-analysis doc and
+    # test_030/test_037).  START TRANSACTION stays pinned to fail with
+    # MySQL's 1235: PostgreSQL procedures only support COMMIT/ROLLBACK as
+    # transaction-control statements, an engine limitation unrelated to the
+    # security-mode mechanism.
     import pymysql
 
     _ddl(cluster,
@@ -206,14 +205,8 @@ def run(cluster):
          "CREATE PROCEDURE t034_start_p() START TRANSACTION")
     with cluster.mysql(dbname="public") as conn:
         with conn.cursor() as cur:
-            try:
-                cur.execute("CALL t034_commit_p()")
-                cur.fetchall()
-                raise AssertionError(
-                    "t034_commit_p: expected the known SQL SECURITY "
-                    "DEFINER-vs-COMMIT limitation to still apply")
-            except pymysql.err.OperationalError as e:
-                assert e.args[0] == 1105, e
+            cur.execute("CALL t034_commit_p()")
+            cur.fetchall()
             try:
                 cur.execute("CALL t034_start_p()")
                 cur.fetchall()

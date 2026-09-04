@@ -130,5 +130,19 @@ void setSystemVariableDatum(char *varName, Datum varConfValue,
                             bool isSessionSystemVar);
 bool isSystemVariable(char *varName);
 
+/*
+ * Effective-definer identity stack for SQL SECURITY DEFINER execution.
+ * plmysql_call_handler() pushes the routine's definer ("user@host" exactly
+ * as recorded at CREATE time) while the routine body runs, so MySQL
+ * CURRENT_USER() can report the definer; USER()/SESSION_USER() keep
+ * reporting the login account.  The state lives here in the backend (not in
+ * mysm, where mysql.current_user() is implemented) because plmysql.so must
+ * be able to call the push/pop: loadable modules can only reach symbols
+ * exported by the postgres executable.
+ */
+extern void mysPushEffectiveDefiner(const char *user_at_host);
+extern void mysPopEffectiveDefiner(void);
+extern const char *mysGetEffectiveDefiner(void);
+
 
 #endif                          /* SYSTEMVAR_H */

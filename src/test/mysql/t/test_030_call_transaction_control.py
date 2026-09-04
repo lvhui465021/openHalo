@@ -19,23 +19,19 @@ either one enough on its own to force atomic=true:
 
   2. "In security definer procedures, we can't allow transaction commands.
      StartTransaction() insists that the security context stack is empty."
-     This one is NOT fixed, and can't be by a similar storage change: it is
-     tied directly to prosecdef itself, which mys_apply_default_sql_security()
-     (mys_gram.y) sets to true by default for any routine with no explicit
-     SQL SECURITY clause -- matching MySQL's own DEFINER default (13.1.16).
-     Since real MySQL has no equivalent restriction (its DEFINER is a
-     privilege-check identity, not a PostgreSQL-style security-context-stack
-     push/pop), this is a genuine, deeper PostgreSQL-vs-MySQL semantic gap,
-     independent of rule 1 -- and still open.
+     Also fixed now, but NOT by a storage change: a plmysql routine no
+     longer carries the MySQL DEFINER default as pg_proc.prosecdef at all.
+     mys_plmysql_redirect_sql_security() (mys_utility.c) records the SQL
+     SECURITY characteristic in the "plmysql" security label instead
+     (leaving prosecdef false, so ExecuteCallStmt() keeps the CALL
+     nonatomic), and plmysql_switch_to_routine_definer() (pl_handler.c)
+     switches the effective user to the definer for the invocation --
+     with zero security-restriction bits, so StartTransaction()'s
+     assertion never fires.  See test_037 for the identity semantics.
 
-Net effect verified below: an explicit SQL SECURITY INVOKER routine can now
-COMMIT/ROLLBACK in its body (this was unconditionally broken before, for
-every routine regardless of security mode).  A routine with no SQL SECURITY
-clause -- MySQL's own default, which openHalo maps to DEFINER -- still
-cannot, and is expected to keep failing with 1105 until that second,
-independent restriction is addressed (a separate, larger question: it would
-mean either accepting the gap, or reworking DEFINER to not rely on
-PostgreSQL's native prosecdef/security-context-stack machinery at all).
+Net effect verified below: COMMIT/ROLLBACK inside a CALLed routine body
+works for BOTH explicit SQL SECURITY INVOKER and MySQL's own default
+(no clause -> DEFINER).
 """
 
 import pymysql
@@ -87,29 +83,48 @@ def run(cluster):
     assert out.strip() == "", \
         "t030_commit_invoker must have an empty proconfig, got %r" % out
 
-    # Known, separate, still-open limitation: MySQL's own default (no SQL
-    # SECURITY clause -> DEFINER, prosecdef=true) still hits PostgreSQL's
-    # unrelated "no transaction commands in a security-definer procedure"
-    # rule -- see the module docstring, rule 2.  Pin this as an explicit
-    # regression check (not a silent expectation) so a future fix to rule 2
-    # is noticed here, rather than this test just going stale.
+    # MySQL's own default (no SQL SECURITY clause -> DEFINER): COMMIT must
+    # now work here too.  The DEFINER default is carried as a
+    # plmysql.sql_security label item and executed via a run-time identity
+    # switch rather than pg_proc.prosecdef, so this CALL stays nonatomic.
+    # (Before the rule-2 fix this was pinned to fail with 1105.)
     _ddl(cluster,
          "DROP PROCEDURE IF EXISTS t030_commit_definer",
          "CREATE PROCEDURE t030_commit_definer() "
          "BEGIN INSERT INTO t030_t VALUES (3); COMMIT; END")
     with cluster.mysql(dbname="public") as conn:
         with conn.cursor() as cur:
-            try:
-                cur.execute("CALL t030_commit_definer()")
-                cur.fetchall()
-                raise AssertionError(
-                    "CALL of a default-SQL-SECURITY (DEFINER) routine with "
-                    "COMMIT in its body unexpectedly succeeded -- rule 2 "
-                    "(prosecdef forces atomic) appears to be fixed; update "
-                    "this test's expectations and its module docstring")
-            except pymysql.err.OperationalError as e:
-                assert e.args[0] == 1105, \
-                    "expected 1105 (still-open DEFINER/atomic gap), got %r" % (e.args,)
+            cur.execute("CALL t030_commit_definer()")
+            cur.fetchall()
+            cur.execute("SELECT * FROM t030_t WHERE id = 3")
+            assert cur.fetchall() == ((3,),)
+
+    # ROLLBACK in a default-DEFINER routine must also work now.
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t030_rollback_definer",
+         "CREATE PROCEDURE t030_rollback_definer() "
+         "BEGIN INSERT INTO t030_t VALUES (5); ROLLBACK; END")
+    with cluster.mysql(dbname="public") as conn:
+        with conn.cursor() as cur:
+            cur.execute("CALL t030_rollback_definer()")
+            cur.fetchall()
+            cur.execute("SELECT * FROM t030_t WHERE id = 5")
+            assert cur.fetchall() == tuple(), \
+                "ROLLBACK inside default-DEFINER CALL did not discard the write"
+
+    # The mechanism itself: a plmysql routine must NOT carry prosecdef any
+    # more (that is what forced the atomic context), and must carry the
+    # characteristic in its label instead.
+    out = cluster.psql(
+        "SELECT prosecdef FROM pg_proc WHERE proname = 't030_commit_definer';")
+    assert out.strip() == "f", \
+        "t030_commit_definer must have prosecdef=false, got %r" % out
+    out = cluster.psql(
+        "SELECT label FROM pg_seclabel s JOIN pg_proc p "
+        "ON p.oid = s.objoid WHERE p.proname = 't030_commit_definer' "
+        "AND s.provider = 'plmysql';")
+    assert "plmysql.sql_security=DEFINER" in out, \
+        "t030_commit_definer label must record sql_security=DEFINER, got %r" % out
 
     # Regression: a routine with no transaction-control statements must be
     # unaffected either way.

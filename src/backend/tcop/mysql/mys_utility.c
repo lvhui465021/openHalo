@@ -63,6 +63,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
 #include "executor/tstoreReceiver.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/mysql/mys_parsenodes.h"
 #include "rewrite/rewriteHandler.h"
@@ -268,6 +269,110 @@ mys_plmysql_lang(List *options)
 			return strcmp(defGetString(defel), "plmysql") == 0;
 	}
 	return false;
+}
+
+/*
+ * Fetch the value of one "key=value" entry from a list as returned by
+ * mys_plmysql_extract_meta(); NULL when the list carries no such key.
+ */
+static const char *
+mys_meta_item_value(List *meta, const char *key)
+{
+	ListCell   *lc;
+	size_t		keylen = strlen(key);
+
+	foreach(lc, meta)
+	{
+		const char *item = (const char *) lfirst(lc);
+
+		if (strncmp(item, key, keylen) == 0 && item[keylen] == '=')
+			return item + keylen + 1;
+	}
+	return NULL;
+}
+
+/*
+ * MySQL 5.7 defaults a routine's SQL SECURITY to DEFINER, and an explicit
+ * SQL SECURITY DEFINER/INVOKER characteristic must survive
+ * SHOW/dump/restore round-trips.  For a plmysql routine neither may become
+ * pg_proc.prosecdef, though: PostgreSQL's ExecuteCallStmt() forces any CALL
+ * of a prosecdef routine into an atomic context, permanently blocking
+ * COMMIT/ROLLBACK in its body (the C2 gap in the compat report).  So for
+ * plmysql routines the native "security" option is removed here and the
+ * characteristic recorded as a "plmysql.sql_security" meta-label item
+ * instead; plmysql_call_handler() switches the effective user to the
+ * definer at run time (plmysql_switch_to_routine_definer(), pl_handler.c).
+ * mys_apply_default_sql_security() (mys_gram.y) still adds the native
+ * default option, so a non-plmysql function (an explicit LANGUAGE plpgsql
+ * routine created over the MySQL protocol) keeps PostgreSQL-side behavior
+ * and is left untouched by this redirect.
+ */
+static void
+mys_plmysql_redirect_sql_security(List **options, List **meta)
+{
+	ListCell   *lc;
+
+	if (!mys_plmysql_lang(*options))
+		return;
+
+	foreach(lc, *options)
+	{
+		DefElem    *defel = (DefElem *) lfirst(lc);
+
+		if (strcmp(defel->defname, "security") == 0)
+		{
+			List	   *kept = NIL;
+			const char *value = intVal(defel->arg) ? "DEFINER" : "INVOKER";
+			ListCell   *lc2;
+
+			foreach(lc2, *options)
+			{
+				DefElem    *other = (DefElem *) lfirst(lc2);
+
+				if (other != defel)
+					kept = lappend(kept, other);
+			}
+			*options = kept;
+			*meta = lappend(*meta,
+							psprintf("plmysql.sql_security=%s", value));
+			return;
+		}
+	}
+
+	/* No explicit clause: MySQL's own default is DEFINER. */
+	*meta = lappend(*meta, "plmysql.sql_security=DEFINER");
+}
+
+/*
+ * MySQL 5.7 lets only SUPER set a routine's or trigger's DEFINER to another
+ * account (everything else silently keeps the creator as definer).  This
+ * check matters because plmysql really does execute the routine under the
+ * definer's identity, so an unchecked DEFINER=other would be a privilege
+ * escalation.  openHalo's MySQL accounts map 1:1 to roles by name at login
+ * (authenticate(), adapter.c), so "naming oneself" compares the definer's
+ * user part against the current role name.
+ */
+static void
+mys_check_definer_privilege(const char *definer)
+{
+	const char *at;
+	char	   *current;
+	size_t		userlen;
+
+	if (definer == NULL || superuser())
+		return;
+
+	at = strchr(definer, '@');
+	userlen = at ? (size_t) (at - definer) : strlen(definer);
+	current = GetUserNameFromId(GetUserId(), false);
+	if (strlen(current) == userlen && strncmp(current, definer, userlen) == 0)
+		return;
+
+	mysSetPendingMySQLErrno(1227);	/* ER_SPECIFIC_ACCESS_DENIED_ERROR */
+	ereport(ERROR,
+			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			 errmsg("Access denied; you need (at least one of) the SUPER "
+					"privilege(s) for this operation")));
 }
 
 static char *
@@ -1845,6 +1950,10 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 
 					mys_plmysql_inject_create_meta(cfstmt);
 					plmysql_meta = mys_plmysql_extract_meta(&cfstmt->options);
+					mys_plmysql_redirect_sql_security(&cfstmt->options,
+													  &plmysql_meta);
+					mys_check_definer_privilege(
+						mys_meta_item_value(plmysql_meta, "plmysql.definer"));
 					address = CreateFunction(pstate, cfstmt);
 					mys_plmysql_set_meta_label(address.objectId, plmysql_meta);
 				}
@@ -1907,6 +2016,9 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 
 					mys_check_mysql_trigger_uniqueness((CreateTrigStmt *) parsetree);
 					mys_check_mysql_trigger_target((CreateTrigStmt *) parsetree);
+					mys_check_definer_privilege(
+						mys_mysql_trigger_marker((CreateTrigStmt *) parsetree,
+												 "mysql_trigger_definer"));
 					wrapper->commandType = CMD_UTILITY;
 					wrapper->canSetTag = false;
 					wrapper->utilityStmt = (Node *)

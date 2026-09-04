@@ -30,6 +30,7 @@
 #include "storage/ipc.h"
 #include "adapter/mysql/adapter.h"
 #include "utils/array.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -52,6 +53,26 @@ static void plmysql_restore_sql_mode(PLMySQL_sql_mode_scope *scope);
 static void plmysql_sql_mode_error_cleanup(int code, Datum arg);
 static bool plmysql_get_sql_mode_snapshot(Oid fn_oid, char **sql_mode_out);
 static void plmysql_seclabel_check(const ObjectAddress *object, const char *seclabel);
+
+/*
+ * The effective-identity switch a SQL SECURITY DEFINER routine runs under.
+ * Restoring is an unconditional global-state assignment (SetUserIdAndSecContext
+ * is documented to never fail), safe to run both on the normal path and from
+ * the error-unwinding cleanup hook.
+ */
+typedef struct PLMySQL_definer_scope
+{
+	bool		active;
+	Oid			saved_userid;
+	int			saved_sec_context;
+} PLMySQL_definer_scope;
+
+static void plmysql_restore_definer(PLMySQL_definer_scope *scope);
+static void plmysql_definer_error_cleanup(int code, Datum arg);
+static char *plmysql_label_meta_item(Oid fn_oid, const char *key);
+static char *plmysql_proconfig_meta_item(HeapTuple proctup, const char *key);
+static void plmysql_switch_to_routine_definer(Oid fn_oid,
+											  PLMySQL_definer_scope *scope);
 
 /*
  * This is deliberately a backend-local stack.  A PL handler invocation
@@ -263,6 +284,197 @@ plmysql_get_sql_mode_snapshot(Oid fn_oid, char **sql_mode_out)
 		cursor = nl ? nl + 1 : NULL;
 	}
 	return false;
+}
+
+/*
+ * Fetch one "key=value" item (key like "plmysql.definer") from the routine's
+ * "plmysql" security label, the same storage plmysql_get_sql_mode_snapshot()
+ * reads.  Returns a pstrdup'd value or NULL when the routine carries no such
+ * item; an explicitly empty value is a real value, not absence.
+ */
+static char *
+plmysql_label_meta_item(Oid fn_oid, const char *key)
+{
+	ObjectAddress address;
+	char	   *label;
+	char	   *cursor;
+	size_t		keylen = strlen(key);
+
+	ObjectAddressSet(address, ProcedureRelationId, fn_oid);
+	label = GetSecurityLabel(&address, "plmysql");
+	if (label == NULL)
+		return NULL;
+
+	for (cursor = label; cursor != NULL && *cursor != '\0'; )
+	{
+		char	   *nl = strchr(cursor, '\n');
+		size_t		linelen = nl ? (size_t) (nl - cursor) : strlen(cursor);
+
+		if (linelen > keylen + 1 &&
+			strncmp(cursor, key, keylen) == 0 && cursor[keylen] == '=')
+			return pnstrdup(cursor + keylen + 1, linelen - keylen - 1);
+		cursor = nl ? nl + 1 : NULL;
+	}
+	return NULL;
+}
+
+/*
+ * A MySQL trigger's private function still carries its plmysql.definer in
+ * pg_proc.proconfig (mys_plmysql_meta_item(), mys_utility.c) rather than in
+ * the security label -- a trigger is never dispatched through CALL's
+ * atomic/non-atomic machinery, so proconfig's "forces the call atomic" side
+ * effect does not apply to it.  Read one "key=value" GUC string back out of
+ * the array; NULL when absent.  proconfig is a CATALOG_VARLEN attribute, so
+ * it must be fetched with heap_getattr rather than off Form_pg_proc.
+ */
+static char *
+plmysql_proconfig_meta_item(HeapTuple proctup, const char *key)
+{
+	ArrayType  *arr;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	int			i;
+	size_t		keylen = strlen(key);
+	char	   *result = NULL;
+	bool		isnull;
+	Datum		datum;
+
+	datum = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_proconfig,
+							&isnull);
+	if (isnull)
+		return NULL;
+
+	arr = DatumGetArrayTypeP(datum);
+	deconstruct_array(arr, TEXTOID, -1, false, 'i', &elems, &nulls, &nelems);
+	for (i = 0; i < nelems; i++)
+	{
+		char	   *item;
+
+		if (nulls[i])
+			continue;
+		item = TextDatumGetCString(elems[i]);
+		if (strncmp(item, key, keylen) == 0 && item[keylen] == '=')
+		{
+			result = pstrdup(item + keylen + 1);
+			break;
+		}
+	}
+	pfree(elems);
+	pfree(nulls);
+	return result;
+}
+
+/*
+ * Switch this invocation to the routine's SQL SECURITY DEFINER identity.
+ *
+ * MySQL's DEFINER is a privilege-check identity only.  It must NOT become
+ * PostgreSQL's prosecdef: ExecuteCallStmt() (functioncmds.c) forces any CALL
+ * of a prosecdef routine into an atomic context, permanently blocking
+ * COMMIT/ROLLBACK in its body, and fmgr_security_definer()'s
+ * SECURITY_LOCAL_USERID_CHANGE bit would trip StartTransaction()'s
+ * "security context must be empty" assertion (xact.c) as soon as the body
+ * starts a new transaction.  plmysql therefore keeps prosecdef false (see
+ * mys_plmysql_redirect_sql_security(), mys_utility.c) and switches the
+ * effective user here instead -- with the caller's security-restriction
+ * bits verbatim, adding none, so the whole word stays what it was and
+ * transaction control keeps working.  MySQL accounts map 1:1 to roles by
+ * name at login (adapter.c authenticate()), so the definer's user part maps
+ * to a role the same way; a definer naming no existing role is MySQL's
+ * ER_NO_SUCH_USER (1449), which MySQL itself raises at CALL time too.
+ *
+ * Routines created before this mechanism carry prosecdef=true and have had
+ * fmgr_security_definer() switch to the owner already; those keep their old
+ * (owner-identity, atomic) semantics.  A definer that was never written
+ * explicitly means "the creator", which is exactly pg_proc.proowner.
+ */
+static void
+plmysql_switch_to_routine_definer(Oid fn_oid, PLMySQL_definer_scope *scope)
+{
+	HeapTuple	proctup;
+	Form_pg_proc procform;
+	char	   *sql_security;
+	char	   *definer;
+	Oid			target;
+
+	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn_oid));
+	if (!HeapTupleIsValid(proctup))
+		return;					/* shouldn't happen */
+	procform = (Form_pg_proc) GETSTRUCT(proctup);
+
+	if (procform->prosecdef)
+	{
+		ReleaseSysCache(proctup);
+		return;
+	}
+
+	/* SQL SECURITY INVOKER: run with the caller's own identity, no switch. */
+	sql_security = plmysql_label_meta_item(fn_oid, "plmysql.sql_security");
+	if (sql_security != NULL && pg_strcasecmp(sql_security, "INVOKER") == 0)
+	{
+		ReleaseSysCache(proctup);
+		return;
+	}
+
+	definer = plmysql_label_meta_item(fn_oid, "plmysql.definer");
+	if (definer == NULL)
+		definer = plmysql_proconfig_meta_item(proctup, "plmysql.definer");
+
+	target = procform->proowner;
+	if (definer != NULL)
+	{
+		char	   *at = strchr(definer, '@');
+		char	   *user = at ? pnstrdup(definer, at - definer)
+			: pstrdup(definer);
+
+		target = get_role_oid(user, true);
+		if (!OidIsValid(target))
+		{
+			ReleaseSysCache(proctup);
+			mysSetPendingMySQLErrno(1449);	/* ER_NO_SUCH_USER */
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("The user specified as a definer (`%s`) does not exist",
+							definer)));
+		}
+	}
+
+	if (target != GetUserId())
+	{
+		GetUserIdAndSecContext(&scope->saved_userid,
+							   &scope->saved_sec_context);
+		SetUserIdAndSecContext(target, scope->saved_sec_context);
+		scope->active = true;
+
+		/*
+		 * CURRENT_USER() reports the routine's definer while it runs; with no
+		 * explicit definer that is the creator, whose role name proowner
+		 * already carries.
+		 */
+		mysPushEffectiveDefiner(definer != NULL ? definer :
+								psprintf("%s@%%",
+										 GetUserNameFromId(target, false)));
+	}
+
+	ReleaseSysCache(proctup);
+}
+
+static void
+plmysql_restore_definer(PLMySQL_definer_scope *scope)
+{
+	if (!scope->active)
+		return;
+
+	mysPopEffectiveDefiner();
+	SetUserIdAndSecContext(scope->saved_userid, scope->saved_sec_context);
+	scope->active = false;
+}
+
+static void
+plmysql_definer_error_cleanup(int code, Datum arg)
+{
+	(void) code;
+	plmysql_restore_definer((PLMySQL_definer_scope *) DatumGetPointer(arg));
 }
 
 
@@ -512,6 +724,7 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 	ResourceOwner procedure_resowner;
 	PLMySQL_call_stack_entry call_stack_entry;
 	PLMySQL_sql_mode_scope sql_mode_scope;
+	PLMySQL_definer_scope definer_scope;
 	volatile Datum retval = (Datum) 0;
 	int			rc;
 
@@ -524,6 +737,18 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 	sql_mode_scope.saved_mode = mys_sqlMode;
 	sql_mode_scope.saved_strict = isStrictTransTablesOn;
 	sql_mode_scope.active = false;
+	definer_scope.active = false;
+
+	/*
+	 * A SQL SECURITY DEFINER routine runs under its definer's identity for
+	 * this whole invocation, restored on every exit path including error
+	 * unwinding (see plmysql_switch_to_routine_definer()).  This scope
+	 * brackets the sql_mode one; the two states are independent, both just
+	 * need the same always-restore treatment.
+	 */
+	PG_ENSURE_ERROR_CLEANUP(plmysql_definer_error_cleanup,
+							PointerGetDatum(&definer_scope));
+	{
 
 	/*
 	 * Legacy routines without the metadata GUC retain their caller session
@@ -540,6 +765,8 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 			sql_mode_scope.active = true;
 			mysApplySqlMode(sql_mode_snapshot, false);
 		}
+
+		plmysql_switch_to_routine_definer(fcinfo->flinfo->fn_oid, &definer_scope);
 
 	/*
 	 * Connect to SPI manager
@@ -618,6 +845,11 @@ plmysql_call_handler(PG_FUNCTION_ARGS)
 	PG_END_ENSURE_ERROR_CLEANUP(plmysql_sql_mode_error_cleanup,
 							PointerGetDatum(&sql_mode_scope));
 
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(plmysql_definer_error_cleanup,
+							PointerGetDatum(&definer_scope));
+
+	plmysql_restore_definer(&definer_scope);
 	plmysql_restore_sql_mode(&sql_mode_scope);
 
 	return retval;

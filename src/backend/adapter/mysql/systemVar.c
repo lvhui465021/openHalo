@@ -1765,3 +1765,51 @@ getOSTimeZone(void)
 
     return ret;
 }
+
+
+/*
+ * Effective-definer identity stack, shared between plmysql (writer) and
+ * mysm's mysql.current_user() (reader) -- see the declaration block in
+ * systemVar.h for why the state lives here in the backend.  Frames live in
+ * TopMemoryContext because a pop must survive whatever context the routine
+ * invocation (or the error unwinding out of it) happens to be in.
+ */
+typedef struct MysEffectiveDefinerFrame
+{
+	struct MysEffectiveDefinerFrame *prev;
+	char	   *ident;			/* "user@host" as recorded at CREATE time */
+} MysEffectiveDefinerFrame;
+
+static MysEffectiveDefinerFrame *mys_effective_definer_top = NULL;
+
+void
+mysPushEffectiveDefiner(const char *user_at_host)
+{
+	MysEffectiveDefinerFrame *frame;
+	MemoryContext oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+
+	frame = (MysEffectiveDefinerFrame *) palloc(sizeof(MysEffectiveDefinerFrame));
+	frame->ident = pstrdup(user_at_host);
+	frame->prev = mys_effective_definer_top;
+	mys_effective_definer_top = frame;
+	MemoryContextSwitchTo(oldcxt);
+}
+
+void
+mysPopEffectiveDefiner(void)
+{
+	MysEffectiveDefinerFrame *frame = mys_effective_definer_top;
+
+	if (frame == NULL)
+		return;
+	mys_effective_definer_top = frame->prev;
+	pfree(frame->ident);
+	pfree(frame);
+}
+
+const char *
+mysGetEffectiveDefiner(void)
+{
+	return mys_effective_definer_top != NULL ?
+		mys_effective_definer_top->ident : NULL;
+}

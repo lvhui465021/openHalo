@@ -52,19 +52,34 @@
 #include "utils/builtins.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
+#include "adapter/mysql/systemVar.h"
 
 
 PG_FUNCTION_INFO_V1(getCurrentUser);
 Datum
 getCurrentUser(PG_FUNCTION_ARGS)
 {
+    /*
+     * Inside a SQL SECURITY DEFINER routine CURRENT_USER() must report the
+     * routine's definer, not the login account (MySQL 5.7, CURRENT_USER
+     * docs).  plmysql_call_handler() maintains that effective identity; when
+     * no routine is on the stack this is a plain top-level query and the
+     * login account is the right answer.
+     */
+    const char *definer = mysGetEffectiveDefiner();
+
+    if (definer != NULL)
+    {
+        PG_RETURN_TEXT_P(cstring_to_text(definer));
+    }
+
     if ((MyProcPort != NULL) && (MyProcPort->user_name != NULL))
     {
         char userInfo[256];
         snprintf(userInfo, 256, "%s@%%", MyProcPort->user_name);
         PG_RETURN_TEXT_P(cstring_to_text(userInfo));
     }
-    else 
+    else
     {
         PG_RETURN_NULL();
     }
