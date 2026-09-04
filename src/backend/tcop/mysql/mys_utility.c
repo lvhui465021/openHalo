@@ -402,6 +402,36 @@ mys_check_mysql_trigger_uniqueness(CreateTrigStmt *stmt)
 	}
 }
 
+/*
+ * MySQL rejects CREATE TRIGGER on a view or a temporary table outright
+ * (ER_TRG_ON_VIEW_OR_TEMP_TABLE, 1361), regardless of trigger event/timing.
+ * The view case was already being rejected here (CreateTrigger()'s own
+ * native relkind check fires first), just with a generic errno (1105) and
+ * wording ("\"%s\" is a view") instead of MySQL's; the temporary-table case
+ * was not rejected at all, since PostgreSQL itself has no such restriction.
+ * Checking both explicitly, before the native path, gets both the errno and
+ * the coverage right in one place.
+ */
+static void
+mys_check_mysql_trigger_target(CreateTrigStmt *stmt)
+{
+	Oid			relid;
+
+	relid = RangeVarGetRelid(stmt->relation, NoLock, true);
+	if (!OidIsValid(relid))
+		return;					/* missing table: CreateTrigger reports it */
+
+	if (get_rel_relkind(relid) == RELKIND_VIEW ||
+		get_rel_persistence(relid) == RELPERSISTENCE_TEMP)
+	{
+		mysSetPendingMySQLErrno(1361);	/* ER_TRG_ON_VIEW_OR_TEMP_TABLE */
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("Trigger's '%s' is view or temporary table",
+						stmt->relation->relname)));
+	}
+}
+
 static char *
 mys_mysql_trigger_function_body(CreateTrigStmt *stmt, const char *body)
 {
@@ -1854,6 +1884,7 @@ mys_ProcessUtilitySlow(ParseState *pstate,
 					PlannedStmt *wrapper = makeNode(PlannedStmt);
 
 					mys_check_mysql_trigger_uniqueness((CreateTrigStmt *) parsetree);
+					mys_check_mysql_trigger_target((CreateTrigStmt *) parsetree);
 					wrapper->commandType = CMD_UTILITY;
 					wrapper->canSetTag = false;
 					wrapper->utilityStmt = (Node *)
