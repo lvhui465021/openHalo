@@ -1082,6 +1082,21 @@ typedef struct PLMySQL_execstate
 	 */
 	int			resultsets_sent;
 
+	/*
+	 * The MySQL "more results exist" server-status flag (moreResultsFlag,
+	 * adapter/mysql/adapter.c) as the top-level multi-statement dispatch
+	 * loop (tcop/postgres.c) had already set it when this invocation began:
+	 * nonzero iff there are more top-level statements queued after the CALL
+	 * that is running this routine.  plmysql_push_execsql_resultset() must
+	 * fall back to this, rather than to 0, once this invocation's own
+	 * result sets are exhausted -- otherwise the last result set of a CALL
+	 * unconditionally reports "no more results", even when a following
+	 * statement in the same multi-statement batch is still pending, which
+	 * desyncs the client's read of the wire protocol for the rest of the
+	 * batch.
+	 */
+	int			outer_more_results_flag;
+
 	void	   *plugin_info;	/* reserved for use by optional plugin */
 } PLMySQL_execstate;
 

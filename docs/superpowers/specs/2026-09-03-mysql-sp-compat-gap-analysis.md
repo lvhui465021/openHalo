@@ -90,7 +90,7 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 
 | # | 缺口 | 证据 | 方案 |
 |---|---|---|---|
-| **C1** | **`CALL` 多结果集协议帧错乱** | 过程体含裸 `SELECT`（返回结果集）的 `CALL`，在 pymysql 上稳定触发 “Packet sequence number wrong”，随后连接不可用。这正是 §1 里必须用一次性连接隔离的原因 | 高优先级：核对 MySQL 协议下 CALL 结果集的 `SERVER_MORE_RESULTS_EXISTS` 标志与包序号（sequence id）。疑似适配层在多结果集之间的收尾 OK 包/序号处理有误。**需先用官方 `mysql` CLI 复核**是否 pymysql 特有，再定位 `src/backend/adapter/mysql/` 的结果集发包路径 |
+| **C1** | **`CALL` 多结果集协议帧错乱** | **已用官方 `mysql` CLI 复核，确认是服务端真实缺陷，与 pymysql 无关**：`CALL proc()`（体内一条裸 `SELECT`，返回一个结果集）后面若还有下一条语句（无论是另一个 `CALL` 还是普通 `SELECT`，且无论是否属于同一个 multi-statement 批次），下一条语句的数据要么整体丢失、要么连接直接报 “Lost connection”/pymysql 的 “Packet sequence number wrong”；只作为连接里唯一一条语句时完全正常。定位到一个真实、已修的子缺陷：`plmysql_push_execsql_resultset()`（`pl_exec_ext.c`）每次推送本例程自己的结果集时都会重算共享全局 `moreResultsFlag`，用完本例程自己的计数后无条件清零——但这个全局同时被顶层 multi-statement 循环（`tcop/postgres.c`）用来表示“这批里还有没执行的语句”，清零会把顶层循环刚设好的“还有更多语句”信号覆盖掉。**已修**（`estate->outer_more_results_flag` 快照 + 兜底，而非硬编 0）。但这**不是** C1 的全部根因：修复后用 pymysql 显式开 `CLIENT_MULTI_STATEMENTS` 复测，`CALL` 自身结果集仍正确，可后续语句的数据依然拿不到（`cur.nextset()` 返回 True 但 `fetchall()` 为空），只是连接不再整体失联。且经排查发现 `mysql` CLI 对分号分隔的多条语句实际是**逐条独立发送/独立收发**（不是一次性 multi-statement 包），`tcop/postgres.c` 里 `stmtIndex</stmtsNum` 那段判断因此在这个路径下从未真正触发过（`stmtsNum` 恒为 1）——说明还有另一层问题（很可能是 `CALL` 自身收尾包和/或包序号计数器在跨语句之间没有正确处理），未定位到具体代码位置 | 已完成部分：`outer_more_results_flag` 快照修复（`pl_exec.c`/`pl_exec_ext.c`/`plmysql.h`），回归见 `test_028`。剩余部分需要专门的协议抓包/单步调试（推荐用 `tcpdump`/`Wireshark` 解 MySQL 协议帧，或在 `adapter.c` 的发包函数上打点比对包序号），定位跨语句的包序号/收尾包缺陷，工作量与原方案的“2–4 天”估计相近，且现在有了更精确的复现步骤和范围 |
 | **C2** | **过程内 `COMMIT`/`ROLLBACK` 运行期 1105** | **根因已重新定位（2026-09-04 复测更正）**：MySQL 协议的 CALL 分发其实已经正确构造了 `atomic=false` 的 `CallContext`（`mys_utility.c`/`utility.c` 的 `T_CallStmt` 分支与标准 PG 路径一致，实测 `isAtomicContext=0`）。真正原因是 `ExecuteCallStmt()`（`functioncmds.c`）里一条更早、更宽的 PG 原生规则：只要目标过程的 `pg_proc.proconfig` 非空就无条件把 `atomic` 强制改回 `true`（注释：GUC 栈在事务边界弹不出去）。而 plmysql **每一个**例程都会把 `sql_mode`/`created`/`last_altered`/`definer` 等元数据以 `SET`-style DefElem 写进 `proconfig`（见 `mys_make_routine_meta_item`），所以这条限制对所有 MySQL 例程恒为真——与 SQL SECURITY DEFINER/INVOKER 无关（两种都试过，一样报错）。即 M9 之前设计文档 §7 风险 6 的描述已过时，实际是元数据存储机制与 PG 事务控制语句的结构性冲突，不是简单的“少传一个标志位” | 三选一，均有代价：**(a)** 把这些元数据挪出 `proconfig`（例如专用 catalog 表或 `COMMENT ON FUNCTION`），恢复 `proconfig` 为空——改动面大，牵涉 SHOW CREATE PROCEDURE/information_schema.ROUTINES/mysqldump 导出等已完成里程碑（test_012/016/019 都依赖当前存储方式），需要专项评审；**(b)** 仅对“确实含有 COMMIT/ROLLBACK”的例程尝试绕过该限制（例如探测请求时临时清空/搬移 proconfig）——本质是绕开 PG 官方为 GUC 栈安全设的保护，风险高，不建议；**(c)** 维持现状，作为已知限制记录（MySQL 例程可以合法使用显式事务控制，但目前会报 1105）。建议与用户确认取舍后再排期，不要在未评审下直接改 |
 
 ### D. 错误码与严格性缺口（负向，`MISSING_ERR`=openHalo 过于宽松）
@@ -160,8 +160,9 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
   引擎问题。
 - **`WRONG_ERR` 需分层看**：约 102 条“真实不符”里，很大比例是“语义错误退化成 1064”，会随
   M9 的编译修复自动改善，不应单独计入 SP 引擎缺陷。
-- **C1（CALL 帧错乱）目前只在 pymysql 上观察到**，写方案前应先用官方 `mysql` CLI 复核，排除
-  客户端实现差异。
+- **C1（CALL 帧错乱）已用官方 `mysql` CLI 复核，非客户端实现差异**：定位并修复了其中一个真实
+  子缺陷（`moreResultsFlag` 被结果集推送逻辑无条件清零，见 §3 表格更新），但完整问题仍未解决，
+  详情与复现步骤见 §3 C1 行。
 - 复现实验脚本与逐条结果 JSON 保存在会话 scratchpad：`mysqltest_parse.py` /
   `run_sp_compat.py` / `analyze.py` / `*.result.json`；可固化进 `src/test/mysql/` 作为持续
   兼容性看板。

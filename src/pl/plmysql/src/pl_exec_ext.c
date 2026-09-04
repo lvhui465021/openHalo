@@ -181,6 +181,16 @@ plmysql_clear_signal_errno(void)
  * than one result set can undercount "how many are left" on later
  * iterations.  That's an accepted limitation (matches the design spec's own
  * framing of this bookkeeping), not a case in scope today.
+ *
+ * Once this invocation's own result sets are exhausted, moreResultsFlag
+ * must fall back to estate->outer_more_results_flag (the flag's value as
+ * the top-level multi-statement loop had already set it before this CALL
+ * started running), not unconditionally to 0: a CALL is very often not the
+ * last statement in its client's multi-statement batch, and stomping that
+ * outer signal here made the client believe the whole batch was done as
+ * soon as this CALL's own last result set was sent -- silently dropping
+ * every statement queued after it and desyncing the wire protocol for the
+ * rest of the connection.
  */
 void
 plmysql_push_execsql_resultset(PLMySQL_execstate *estate,
@@ -193,7 +203,7 @@ plmysql_push_execsql_resultset(PLMySQL_execstate *estate,
 
 	estate->resultsets_sent++;
 	moreResultsFlag = (estate->resultsets_sent < estate->func->n_resultsets)
-		? HALO_SVR_MORE_RESULTS_EXISTS : 0;
+		? HALO_SVR_MORE_RESULTS_EXISTS : estate->outer_more_results_flag;
 
 	dest = CreateDestReceiver(DestRemote);
 	tstate = begin_tup_output_tupdesc(dest, tuptab->tupdesc, &TTSOpsHeapTuple);

@@ -24,6 +24,7 @@
 #include "access/htup_details.h"
 #include "access/transam.h"
 #include "access/tupconvert.h"
+#include "adapter/mysql/adapter.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -4011,6 +4012,13 @@ plmysql_estate_setup(PLMySQL_execstate *estate,
 	estate->err_text = NULL;
 
 	estate->resultsets_sent = 0;
+
+	/*
+	 * Snapshot the outer "more results" state now, before this invocation's
+	 * own result-set pushes (if any) start overwriting the shared
+	 * moreResultsFlag global; see the field's comment in plmysql.h.
+	 */
+	estate->outer_more_results_flag = moreResultsFlag;
 
 	estate->plugin_info = NULL;
 
