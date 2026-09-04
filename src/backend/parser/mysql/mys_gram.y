@@ -255,9 +255,13 @@ static CreateTrigStmt *mys_make_pg_trigger_tail(RangeVar *relation,
 static CreateTrigStmt *mys_make_mysql_trigger_tail(RangeVar *relation,
 												char *body, int location);
 static CreateTrigStmt *mys_finish_trigger_stmt(bool replace, char *definer,
-												 char *trigname, int timing, List *events,
-												 CreateTrigStmt *stmt);
+										   List *trigname_spec, int timing,
+										   List *events,
+										   CreateTrigStmt *stmt);
 static bool mys_optlist_pins_foreign_language(List *options);
+static Node *mys_make_maintenance_select(const char *funcname,
+												 List *rel_list);
+static char *mys_check_role_id_name(char *name);
 static char *mys_return_body_text;
 
 %}
@@ -268,7 +272,14 @@ static char *mys_return_body_text;
 /* +1: DROP TRIGGER <ident> where "IF" is both the start of IF EXISTS and a
  * legal name token; default shift resolves it as IF EXISTS, matching MySQL
  * where IF is reserved. */
-%expect 48
+%expect 52
+/*
+ * Up from 48 for the routine-body leader additions: RESET as a single-
+ * statement routine body competes with PostgreSQL's RESET function
+ * characteristic (three states, default = body wins), and FLUSH TABLES
+ * <list> competes with itself over the WITH READ LOCK tail (default =
+ * keep shifting the table list).  All default resolutions are intended.
+ */
 
 %name-prefix="mys_yy"
 
@@ -358,6 +369,7 @@ static char *mys_return_body_text;
 		SecLabelStmt SelectStmt TransactionStmt TransactionStmtLegacy TruncateStmt
 		UnlistenStmt UpdateStmt MysUpdateStmt UsedbStmt VacuumStmt
 		VariableResetStmt VariableSetStmt VariableShowStmt DBTableInfoShowStmt LockUnLockStmt
+		MysFlushStmt MysTableMaintStmt
 		ViewStmt CheckPointStmt CreateConversionStmt
 		DeallocateStmt PrepareStmt ExecuteStmt
 		DropOwnedStmt ReassignOwnedStmt
@@ -446,6 +458,7 @@ static char *mys_return_body_text;
 
 %type <str>		iso_level opt_encoding opt_definer user
 				mysql_trigger_body
+%type <list>		mysql_trigger_name
 %type <rolespec> grantee
 %type <list>	grantee_list
 %type <accesspriv> privilege
@@ -753,7 +766,7 @@ static char *mys_return_body_text;
 	EXCLUDE EXCLUDING EXCLUSIVE EXECUTE EXISTS EXIT EXPLAIN EXPRESSION
 	EXTENSION EXTERNAL EXTRACT
 
-	FALSE_P FAMILY FETCH FIELDS FILTER FINALIZE FIRST_P FIXED FLOAT_P FOLLOWING FOR
+	FALSE_P FAMILY FETCH FIELDS FILTER FINALIZE FIRST_P FIXED FLOAT_P FLUSH FOLLOWS FOLLOWING FOR
 	FORCE FOREIGN FORWARD FOUND FREEZE FROM FULL FULLTEXT FUNCTION FUNCTIONS
 
 	GENERATED GET GLOBAL GRANT GRANTED GREATEST GROUP_P GROUPING GROUPS GROUP_CONCAT
@@ -771,7 +784,7 @@ static char *mys_return_body_text;
 
 	LABEL LANGUAGE LARGE_P LAST_P LATERAL_P
 	LEADING LEAKPROOF LEAST LEAVE LEFT LESS LEVEL LIKE LIMIT LINEAR LIST LISTEN LOAD LOCAL
-	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED LONG LONGBLOB
+	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED LOGS LONG LONGBLOB
     LONGTEXT LOOP LOW_PRIORITY 
 
 	MAPPING MATCH MATERIALIZED MAXVALUE MAX_ROWS 
@@ -783,18 +796,18 @@ static char *mys_return_body_text;
 	NOT NOTHING NOTIFY NOTNULL NOW NOWAIT NULL_P NULLIF
 	NULLS_P NUMERIC NVARCHAR
 
-	OBJECT_P OF OFF OFFSET OIDS OLD ON ONLY OPEN OPERATOR OPTION OPTIONS OR
+	OBJECT_P OF OFF OFFSET OIDS OLD ON ONLY OPEN OPERATOR OPTIMIZE OPTION OPTIONS OR
 	ORDER ORDINALITY OTHERS OUT_P OUTER_P
 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
 
 	PACK_KEYS PARALLEL PARSER PARTIAL PARTITION PARTITIONS PASSING PASSWORD PLACING PLANS PLUGINS POLICY
-	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
+	POSITION PRECEDES PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
 	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROCESSLIST PROGRAM PUBLICATION
 
     QUICK QUOTE
 
 	RANGE READ READS REAL REASSIGN RECHECK RECURSIVE REF REFERENCES REFERENCING
-	REFRESH REGEXP REINDEX RELATIVE_P RELEASE RENAME REPEAT REPEATABLE REPLACE REPLICA 
+	REFRESH REGEXP REINDEX RELATIVE_P RELEASE RENAME REPAIR REPEAT REPEATABLE REPLACE REPLICA 
 	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT RLIKE ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROW_FORMAT ROWS RULE
 
@@ -1130,6 +1143,8 @@ stmt:
 			| RefreshMatViewStmt
 			| LoadStmt
             | LockUnLockStmt
+            | MysFlushStmt
+            | MysTableMaintStmt
 			| NotifyStmt
 			| PrepareStmt
 			| ReassignOwnedStmt
@@ -1183,7 +1198,7 @@ CreateRoleStmt:
 				{
 					CreateRoleStmt *n = makeNode(CreateRoleStmt);
 					n->stmt_type = ROLESTMT_ROLE;
-					n->role = $3;
+					n->role = mys_check_role_id_name($3);
 					n->options = $5;
 					$$ = (Node *)n;
 				}
@@ -1344,7 +1359,7 @@ CreateUserStmt:
 				{
 					CreateRoleStmt *n = makeNode(CreateRoleStmt);
 					n->stmt_type = ROLESTMT_USER;
-					n->role = $3;
+					n->role = mys_check_role_id_name($3);
 					n->options = $5;
 					$$ = (Node *)n;
 				}
@@ -1483,7 +1498,7 @@ CreateGroupStmt:
 				{
 					CreateRoleStmt *n = makeNode(CreateRoleStmt);
 					n->stmt_type = ROLESTMT_GROUP;
-					n->role = $3;
+					n->role = mys_check_role_id_name($3);
 					n->options = $5;
 					$$ = (Node *)n;
 				}
@@ -4038,6 +4053,97 @@ LockTables:
             LockTable
             | LockTables ',' LockTable
         ;
+
+/*
+ * FLUSH ... openHalo has no statement-level caches to clear: logs are
+ * PostgreSQL-managed, privilege checks read pg_authid live, and table
+ * cache invalidation is automatic, so every FLUSH variant openHalo accepts
+ * is a no-op that returns OK -- the same treatment LOCK TABLES gets below
+ * (routed through mysql.set_system_session_variable()).  MySQL's
+ * NO_WRITE_TO_BINLOG/LOCAL modifier and the per-log-type spellings
+ * (ERROR/GENERAL/SLOW/RELAY LOGS, QUERY CACHE, HOSTS, USER_RESOURCES,
+ * DES_KEY_FILE) are not accepted yet.
+ */
+MysFlushStmt:
+			FLUSH flush_option_list
+				{
+					MysVariableSetStmt *rt;
+					SelectStmt *result;
+					ResTarget *target;
+					Node *funcCall;
+
+					rt = makeNode(MysVariableSetStmt);
+					result = makeNode(SelectStmt);
+					target = makeNode(ResTarget);
+					target->name = NULL;
+					target->indirection = NIL;
+					funcCall = (Node *) makeFuncCall(
+						list_make2(makeString(pstrdup("mysql")),
+								   makeString(pstrdup("set_system_session_variable"))),
+						list_make2(makeStringConst(pstrdup("halo_mysql_dummy_stmt_return_ok"), -1),
+								   makeStringConst(pstrdup("1"), -1)),
+						COERCE_EXPLICIT_CALL, @1);
+					target->val = funcCall;
+					target->location = -1;
+					result->targetList = lappend(result->targetList,
+												 ((Node *) target));
+					rt->varSetStmt = (Node *) result;
+
+					$$ = (Node *) rt;
+				}
+		;
+
+flush_option_list:
+			flush_option
+			| flush_option_list ',' flush_option
+		;
+
+flush_option:
+			  LOGS
+			| BINARY LOGS
+			| ENGINE LOGS
+			| PRIVILEGES
+			| STATUS
+			| TABLE opt_flush_tables_payload
+			| TABLES opt_flush_tables_payload
+		;
+
+opt_flush_tables_payload:
+			/* EMPTY */
+			| WITH READ LOCK_P
+			| qualified_name_list opt_with_read_lock
+		;
+
+opt_with_read_lock:
+			/* EMPTY */
+			| WITH READ LOCK_P
+		;
+
+/*
+ * CHECKSUM TABLE / REPAIR TABLE / OPTIMIZE TABLE, as SELECTs over the
+ * matching mysql.* functions (see mys_make_maintenance_select()).  REPAIR
+ * and OPTIMIZE report status rows without touching the table (InnoDB's own
+ * REPAIR is a no-op and OPTIMIZE is advisory); CHECKSUM TABLE computes a
+ * real, order-independent row checksum over the table's text
+ * representation -- its value is stable within openHalo but is NOT
+ * byte-compatible with MySQL's (different row format).
+ */
+MysTableMaintStmt:
+			CHECKSUM TABLE qualified_name_list
+				{
+					$$ = (Node *) mys_make_maintenance_select("checksum_table",
+															  $3);
+				}
+			| REPAIR TABLE qualified_name_list
+				{
+					$$ = (Node *) mys_make_maintenance_select("repair_table", $3);
+				}
+			| OPTIMIZE TABLE qualified_name_list
+				{
+					$$ = (Node *) mys_make_maintenance_select("optimize_table",
+															  $3);
+				}
+		;
 
 LockUnLockStmt:
             LOCK_P Lock_Tables LockTables
@@ -8752,13 +8858,13 @@ am_type:
  *****************************************************************************/
 
 CreateTrigStmt:
-			CREATE opt_or_replace opt_definer TRIGGER name TriggerActionTime TriggerOneEvent ON
+			CREATE opt_or_replace opt_definer TRIGGER mysql_trigger_name TriggerActionTime TriggerOneEvent ON
 			mysql_trigger_tail
 				{
 					$$ = (Node *) mys_finish_trigger_stmt($2, $3, $5, $6, $7,
 															(CreateTrigStmt *) $9);
 				}
-		  | CREATE opt_or_replace opt_definer TRIGGER name TriggerActionTime TriggerOneEvent OR
+		  | CREATE opt_or_replace opt_definer TRIGGER mysql_trigger_name TriggerActionTime TriggerOneEvent OR
 			TriggerEvents ON mysql_trigger_tail
 				{
 					List	   *events;
@@ -8876,11 +8982,40 @@ mysql_trigger_each_row_tail:
 				{
 					$$ = (Node *) mys_make_pg_trigger_tail(NULL, NIL, true, NULL, $3, $5);
 				}
+			| FOLLOWS name mysql_trigger_body
+				{
+					$$ = (Node *) mys_make_mysql_trigger_tail(NULL, $3, @3);
+					((CreateTrigStmt *) $$)->transitionRels =
+						lappend(((CreateTrigStmt *) $$)->transitionRels,
+									makeDefElem("mysql_trigger_order",
+												(Node *) makeString(psprintf("FOLLOWS=%s", $2)), @2));
+				}
+			| PRECEDES name mysql_trigger_body
+				{
+					$$ = (Node *) mys_make_mysql_trigger_tail(NULL, $3, @3);
+					((CreateTrigStmt *) $$)->transitionRels =
+						lappend(((CreateTrigStmt *) $$)->transitionRels,
+									makeDefElem("mysql_trigger_order",
+												(Node *) makeString(psprintf("PRECEDES=%s", $2)), @2));
+				}
 			| mysql_trigger_body
 				{
 					$$ = (Node *) mys_make_mysql_trigger_tail(NULL, $1, @1);
 				}
 		;
+
+/*
+ * MySQL's CREATE TRIGGER accepts the trigger name in qualified form
+ * ("CREATE TRIGGER db.name ...", as mysqldump emits).  The declared schema
+ * must match the trigger's table schema (checked as ER_TRG_IN_WRONG_SCHEMA,
+ * 1435, once the table is resolved); the trigger name itself stays
+ * schema-local, exactly like the unqualified form.
+ */
+mysql_trigger_name:
+			name										{ $$ = list_make2(NULL, $1); }
+			| ColId '.' name							{ $$ = list_make2($1, $3); }
+		;
+
 
 TriggerActionTime:
 			BEFORE								{ $$ = TRIGGER_TYPE_BEFORE; }
@@ -11391,9 +11526,24 @@ opt_definer:
             | DEFINER '=' user						{ $$ = $3; }
         ;
 
+
+/*
+ * The DEFINER account's host is metadata, not an identifier: capture it
+ * verbatim, without the 63-byte identifier truncation.  The unquoted host
+ * arrives lexed as one MysqlUserVariableName token ("user@host.dotted" is
+ * [RoleId, MysqlUserVariableName]); the single-quoted form arrives as a
+ * string constant.  A backquoted long host still truncates (known
+ * limitation).
+ *
+ * DEFINER = CURRENT_USER (5.7 spelling, with or without parentheses) is
+ * recorded as a marker and resolved to the creating role when the metadata
+ * label is written (mys_utility.c); the marker must never leak to disk.
+ */
 user:
-            RoleId									{ $$ = $1; }
-            | RoleId '@' RoleId						{ $$ = psprintf("%s@%s", $1, $3); }
+            RoleId										{ $$ = $1; }
+            | RoleId '@' RoleId							{ $$ = psprintf("%s@%s", $1, $3); }
+            | RoleId '@' Sconst							{ $$ = psprintf("%s@%s", $1, $3); }
+            | RoleId MysqlUserVariableName			{ $$ = psprintf("%s@%s", $1, $2); }
         ;
 
 func_args:	'(' func_args_list ')'					{ $$ = $2; }
@@ -12046,6 +12196,11 @@ mysql_routine_body:
  * statements the plain scan-to-';' fallback already handles correctly,
  * the same as SELECT/INSERT/etc. above; they only needed to be
  * recognized as legal leaders at all.
+ *
+ * ANALYZE/TRUNCATE/RESET/FLUSH/CHECKSUM/REPAIR/OPTIMIZE: more non-nesting
+ * statements from the same corpus bucket -- each already exists as a
+ * top-level statement in its own right (or is added alongside this list),
+ * so the plain scan-to-';' fallback captures the body correctly.
  */
 mysql_single_stmt_body_leader:
 			  SELECT		{ $$ = SELECT; }
@@ -12065,6 +12220,13 @@ mysql_single_stmt_body_leader:
 			| ALTER			{ $$ = ALTER; }
 			| START			{ $$ = START; }
 			| COMMIT		{ $$ = COMMIT; }
+			| ANALYZE		{ $$ = ANALYZE; }
+			| TRUNCATE		{ $$ = TRUNCATE; }
+			| RESET			{ $$ = RESET; }
+			| FLUSH			{ $$ = FLUSH; }
+			| CHECKSUM		{ $$ = CHECKSUM; }
+			| REPAIR			{ $$ = REPAIR; }
+			| OPTIMIZE		{ $$ = OPTIMIZE; }
 		;
 
 opt_routine_body:
@@ -22283,11 +22445,15 @@ RoleId:		RoleSpec
 									 parser_errposition(@1)));
 							break;
 						case ROLESPEC_CURRENT_USER:
-							ereport(ERROR,
-									(errcode(ERRCODE_RESERVED_NAME),
-									 errmsg("%s cannot be used as a role name here",
-											"CURRENT_USER"),
-									 parser_errposition(@1)));
+							/*
+							 * MySQL's "DEFINER = CURRENT_USER" arrives through this
+							 * derivation (user -> RoleId -> RoleSpec), so it resolves to a
+							 * marker that mys_utility.c rewrites to the creating role when
+							 * the metadata label is written.  Consumers that want a literal
+							 * role name (CREATE/ALTER ROLE/USER/GROUP) reject the marker
+							 * via mys_check_role_id_name().
+							 */
+							$$ = pstrdup("@CURRENT_USER@");
 							break;
 						case ROLESPEC_CURRENT_ROLE:
 							ereport(ERROR,
@@ -22606,7 +22772,9 @@ unreserved_keyword:
 			| FINALIZE
 			| FIRST_P
             | FIXED
+			| FLUSH
 			| FOLLOWING
+			| FOLLOWS
 			| FORCE
 			| FORWARD
 			| FUNCTION
@@ -22660,6 +22828,7 @@ unreserved_keyword:
 			| LOCK_P
 			| LOCKED
 			| LOGGED
+			| LOGS
 			| MAPPING
 			| MATCH
 			| MATERIALIZED
@@ -22696,6 +22865,7 @@ unreserved_keyword:
 			| OIDS
 			| OLD
 			| OPERATOR
+			| OPTIMIZE
 			| OPTION
 			| OPTIONS
 			| ORDINALITY
@@ -22740,6 +22910,7 @@ unreserved_keyword:
 			| RELATIVE_P
 			| RELEASE
 			| RENAME
+			| REPAIR
 			| REPEATABLE
 			| REPLACE
 			| REPLICA
@@ -23280,7 +23451,9 @@ bare_label_keyword:
 			| FIRST_P
             | FIXED
 			| FLOAT_P
+			| FLUSH
 			| FOLLOWING
+			| FOLLOWS
 			| FORCE
 			| FOREIGN
 			| FORWARD
@@ -23360,6 +23533,7 @@ bare_label_keyword:
 			| LOCK_P
 			| LOCKED
 			| LOGGED
+			| LOGS
             | LONG
             | LONGBLOB
             | LONGTEXT
@@ -23415,6 +23589,7 @@ bare_label_keyword:
 			| ONLY
             | OPEN
 			| OPERATOR
+			| OPTIMIZE
 			| OPTION
 			| OPTIONS
 			| OR
@@ -23469,6 +23644,7 @@ bare_label_keyword:
 			| RELATIVE_P
 			| RELEASE
 			| RENAME
+			| REPAIR
             | REPEAT
 			| REPEATABLE
 			| REPLACE
@@ -23900,13 +24076,91 @@ mys_make_mysql_trigger_tail(RangeVar *relation, char *body, int location)
 	return n;
 }
 
+/*
+ * Build "SELECT * FROM mysql.<funcname>(schema, table)" for each table in
+ * the list (unqualified names resolve against the current schema, the same
+ * rule the SHOW statements use), UNION ALL-chained for multiple tables.
+ * The mysql.* functions carry their result columns as OUT parameters, so a
+ * bare SELECT * produces MySQL's result-set shape.  REPAIR/OPTIMIZE return
+ * the MySQL Table/Op/Msg_type/Msg_text rows; CHECKSUM TABLE returns
+ * Table/Checksum.
+ */
+static Node *
+mys_make_maintenance_select(const char *funcname, List *rel_list)
+{
+	ListCell   *lc;
+	SelectStmt *result = NULL;
+
+	foreach(lc, rel_list)
+	{
+		RangeVar   *rel = lfirst(lc);
+		char	   *schemaname = rel->schemaname ? rel->schemaname :
+			get_namespace_name(getCurrentNamespaceOid());
+		FuncCall   *funcCall;
+		RangeFunction *rf;
+		SelectStmt *sel;
+		ResTarget  *target;
+		ColumnRef  *star;
+
+		funcCall = makeFuncCall(
+			list_make2(makeString(pstrdup("mysql")),
+					   makeString(pstrdup(funcname))),
+			list_make2(makeStringConst(schemaname, -1),
+					   makeStringConst(rel->relname, -1)),
+			COERCE_EXPLICIT_CALL, -1);
+
+		star = makeNode(ColumnRef);
+		star->fields = list_make1(makeNode(A_Star));
+		star->location = -1;
+		target = makeNode(ResTarget);
+		target->name = NULL;
+		target->indirection = NIL;
+		target->val = (Node *) star;
+		target->location = -1;
+		sel = makeNode(SelectStmt);
+		sel->targetList = list_make1(target);
+		rf = makeNode(RangeFunction);
+		rf->lateral = false;
+		rf->ordinality = false;
+		rf->is_rowsfrom = false;
+		rf->functions = list_make1(list_make2((Node *) funcCall, NIL));
+		rf->alias = NULL;
+		rf->coldeflist = NIL;
+		sel->fromClause = list_make1(rf);
+
+		if (result == NULL)
+			result = sel;
+		else
+			result = (SelectStmt *) makeSetOp(SETOP_UNION, true,
+											  (Node *) result, (Node *) sel);
+	}
+	return (Node *) result;
+}
+
+/*
+ * Reject the "@CURRENT_USER@" marker (RoleId's resolution of MySQL's
+ * "DEFINER = CURRENT_USER") anywhere a literal role name is required.
+ */
+static char *
+mys_check_role_id_name(char *name)
+{
+	if (name != NULL && strcmp(name, "@CURRENT_USER@") == 0)
+		ereport(ERROR,
+					(errcode(ERRCODE_RESERVED_NAME),
+						 errmsg("%s cannot be used as a role name here",
+									"CURRENT_USER")));
+	return name;
+}
+
 static CreateTrigStmt *
-mys_finish_trigger_stmt(bool replace, char *definer, char *trigname,
+mys_finish_trigger_stmt(bool replace, char *definer, List *trigname_spec,
 						int timing, List *events,
 						CreateTrigStmt *stmt)
 {
 	int			event_mask = intVal(linitial(events));
 	bool		is_mysql = (stmt->funcname == NULL);
+	char	   *schemaname = linitial(trigname_spec);
+	char	   *trigname = lsecond(trigname_spec);
 
 	if (is_mysql)
 	{
@@ -23932,6 +24186,10 @@ mys_finish_trigger_stmt(bool replace, char *definer, char *trigname,
 			stmt->transitionRels = lappend(stmt->transitionRels,
 				makeDefElem("mysql_trigger_definer",
 							(Node *) makeString(definer), -1));
+		if (schemaname != NULL)
+			stmt->transitionRels = lappend(stmt->transitionRels,
+				makeDefElem("mysql_trigger_name_schema",
+							(Node *) makeString(schemaname), -1));
 	}
 	else if (definer != NULL)
 		ereport(ERROR,
