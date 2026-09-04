@@ -106,7 +106,7 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 | `ER_BAD_FIELD_ERROR`/`ER_CANT_REOPEN_TABLE` (1054/1137) | 6 | 字段/表复用检查 | 部分退化为 1064 |
 | `ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG` (1422) | 4 | 函数/触发器内隐式提交（DDL 等），非字面 COMMIT | 本分支只拦了字面 `COMMIT`/`ROLLBACK`，未覆盖隐式提交语句 |
 | 触发器专属：`ER_SP_NO_RETSET`(1415)、`ER_STMT_NOT_ALLOWED_IN_SF_OR_TRG`(1336)、`ER_SP_BADRETURN`(1313)、`ER_TRG_ON_VIEW_OR_TEMP_TABLE`(1361)、`ER_TRG_IN_WRONG_SCHEMA`(1435)、`ER_NO_TRIGGERS_ON_SYSTEM_SCHEMA`(1465) | 各 1–2 | 触发器体内的语句/返回/对象限制 | 未强制 |
-| `ER_SP_UNDECLARED_VAR`(1327)、`ER_UNKNOWN_SYSTEM_VARIABLE`(1193) | 2 | 引用未声明变量 / 未知 `@@sysvar` | 编译期未拒绝 |
+| `ER_SP_UNDECLARED_VAR`(1327)、`ER_UNKNOWN_SYSTEM_VARIABLE`(1193) | 2 | 引用未声明变量 / 未知 `@@sysvar` | ✅ 已完成（2026-09-04）：两种情况其实本来就会报错，只是错误码不对（分别是通用的 1064/1105），不是"该报错而没报"；已改成精确匹配 MySQL 错误码，回归见 `test_031` |
 
 > 这些是“宽松”而非“错误结果”，危害次于 A/B/C，但影响与 MySQL 客户端/ORM 的报错契约。
 
@@ -152,8 +152,10 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 - **B1 ENUM/SET 类型**（~1–2 周，独立特性）：投入大，建议独立立项，非 SP 专属。
 
 ### M12 — 严格性/错误码对齐（打磨）
-- 编译期：**A/D 修好后**补 1327（未声明变量）、1193（未知 `@@sysvar`）、1691（LIMIT 变量类型）
-  的编译期检查（~2–3 天）。
+- **1327/1193 错误码对齐** ✅ 已完成（2026-09-04）：见 §3 表格更新，纯错误码修正（`mysSetPendingMySQLErrno`），
+  不涉及语义变化。回归见 `test_031`。
+- 1691（LIMIT 变量类型校验）：需要在 SP 执行路径里新增专门的 LIMIT 实参类型检查，比错误码对齐
+  本身工作量大，语料里只 6 条，暂未做。
 - 触发器语义：1415/1336/1313/1442/1361/1435/1465（~3–5 天，逐条按 MySQL 手册加 guard）。
 - LOCK TABLES 语义（1100/1099）、间接递归（1424）：投入较大、优先级低，可延后。
 
