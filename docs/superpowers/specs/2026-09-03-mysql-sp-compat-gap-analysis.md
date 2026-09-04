@@ -105,7 +105,8 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 | `ER_SP_NO_RECURSION` (1424) | 3 | 经 `SELECT`/视图的间接函数递归 | 现有守卫只拦直接重入 |
 | `ER_BAD_FIELD_ERROR`/`ER_CANT_REOPEN_TABLE` (1054/1137) | 6 | 字段/表复用检查 | 部分退化为 1064 |
 | `ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG` (1422) | 4 | 函数/触发器内隐式提交（DDL 等），非字面 COMMIT | 本分支只拦了字面 `COMMIT`/`ROLLBACK`，未覆盖隐式提交语句 |
-| 触发器专属：`ER_SP_NO_RETSET`(1415)、`ER_STMT_NOT_ALLOWED_IN_SF_OR_TRG`(1336)、`ER_SP_BADRETURN`(1313)、`ER_TRG_ON_VIEW_OR_TEMP_TABLE`(1361)、`ER_TRG_IN_WRONG_SCHEMA`(1435)、`ER_NO_TRIGGERS_ON_SYSTEM_SCHEMA`(1465) | 各 1–2 | 触发器体内的语句/返回/对象限制 | 未强制 |
+| `ER_TRG_ON_VIEW_OR_TEMP_TABLE`(1361) | 1–2 | 触发器建在 VIEW/临时表上 | ✅ 已完成（2026-09-04）：VIEW 情形本来就会被 PG 原生 `CreateTrigger()` 拒绝（无存储、没法挂行级触发器），只是错误码通用（1105）；临时表情形之前完全没拦（PG 原生临时表本身支持触发器）。`mys_check_mysql_trigger_target()` 在原生路径前统一按 MySQL 错误码/文案拦两种情形，回归见 `test_032` |
+| 触发器专属（其余）：`ER_SP_NO_RETSET`(1415)、`ER_STMT_NOT_ALLOWED_IN_SF_OR_TRG`(1336)、`ER_SP_BADRETURN`(1313)、`ER_TRG_IN_WRONG_SCHEMA`(1435)、`ER_NO_TRIGGERS_ON_SYSTEM_SCHEMA`(1465) | 各 1–2 | 触发器体内的语句/返回/对象限制 | 未强制。1313 复测发现比预想复杂：真实 MySQL 里 `RETURN` 语义本身按 FUNCTION/PROCEDURE/TRIGGER 三种上下文分别限制（不只是"有没有返回值"），要对齐需要先核实清楚三种上下文各自的真实行为，不是单纯错误码替换，未在本轮做 |
 | `ER_SP_UNDECLARED_VAR`(1327)、`ER_UNKNOWN_SYSTEM_VARIABLE`(1193) | 2 | 引用未声明变量 / 未知 `@@sysvar` | ✅ 已完成（2026-09-04）：两种情况其实本来就会报错，只是错误码不对（分别是通用的 1064/1105），不是"该报错而没报"；已改成精确匹配 MySQL 错误码，回归见 `test_031` |
 
 > 这些是“宽松”而非“错误结果”，危害次于 A/B/C，但影响与 MySQL 客户端/ORM 的报错契约。
@@ -156,7 +157,10 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
   不涉及语义变化。回归见 `test_031`。
 - 1691（LIMIT 变量类型校验）：需要在 SP 执行路径里新增专门的 LIMIT 实参类型检查，比错误码对齐
   本身工作量大，语料里只 6 条，暂未做。
-- 触发器语义：1415/1336/1313/1442/1361/1435/1465（~3–5 天，逐条按 MySQL 手册加 guard）。
+- **1361（触发器建在 VIEW/临时表上）** ✅ 已完成（2026-09-04）：见 §3 表格更新。回归见 `test_032`。
+- 触发器语义（其余）：1415/1336/1313/1442/1435/1465（~3–5 天，逐条按 MySQL 手册加 guard；1313 需
+  要先核实 MySQL 在 FUNCTION/PROCEDURE/TRIGGER 三种上下文里 RETURN 各自的真实限制，比单纯错误码
+  替换复杂，见 §3）。
 - LOCK TABLES 语义（1100/1099）、间接递归（1424）：投入较大、优先级低，可延后。
 
 ---
