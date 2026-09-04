@@ -202,4 +202,60 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 | LOCK TABLES 语义（1100/1099） | 独立的大特性（会话级锁追踪与全语句类型强制），不是 SP 专属 |
 | B1（ENUM/SET 类型） | 报告最初就定性为独立立项，非 SP 专属 |
 
+---
+
+## 7. 编译通过率冲刺至 80%（2026-09-04，第二轮）
+
+用户明确指示："先把现在能做的功能做了，先尽量让 create procedure，create function 编译
+通过率起来 80%，然后再考虑还有哪些功能能做，再能达到 85% 最好"——本轮聚焦纯工程、无产品
+语义取舍的编译期缺口，不涉及 §6 归档的 backlog 项。对 `sp.test`/`trigger.test`/
+`sp_trans.test` 三份语料合计的 `CREATE PROCEDURE`+`CREATE FUNCTION` 编译通过率：
+
+| 阶段 | 编译通过率 | 说明 |
+|---|---|---|
+| 本轮开始前（M9 记录基线，仅 procedure） | 76.0%（272/358） | 见 §4 M9 |
+| +A1 flow-control/DDL 单语句体 | 78.4%（395/504） | 见下 |
+| +REPEAT() 函数调用误判修复 | 78.6%（396/504） | 顺带修复，见下 |
+| +`#` 注释 / `SQLSTATE VALUE` | 79.6%（401/504） | 见下 |
+| +ALTER/START TRANSACTION/COMMIT 单语句体 | **80.16%（404/504）** | 已达标 |
+
+**已完成的四项修复**（均已提交，回归见对应 `test_0NN`）：
+
+1. **裸 WHILE/REPEAT/IF/CASE/CREATE/DROP 作为例程整个函数体**（无外层 `BEGIN...END`）：
+   `mysql_single_stmt_body_leader` 从 7 个候选扩到 14 个；`mys_capture_routine_body()`
+   新增 `leading_uncounted_kind` 参数处理无外层 BEGIN 时的嵌套边界识别；`CASE` 单独加
+   `MYS_LEADING_CASE` 哨兵处理后缀截断。回归：`test_034`。
+2. **`REPEAT(str,count)` 内建函数与 `REPEAT` 循环关键字共用一个 token 导致误判**：裸
+   REPEAT 循环体内如果调用了同名函数，会让上一条修复的"计数归零"判据永远凑不齐，报
+   "unterminated routine body: missing END"。因为 REPEAT 循环从不会在关键字后紧跟 `(`
+   （其 UNTIL 条件写在循环体末尾），而 IF/WHILE 的条件本身可以带括号，所以只对 REPEAT
+   做了这个一次性 lookahead 排除，IF/WHILE 维持原有保守策略。顺带修好了 `test_002`
+   里一个更窄的已知局限（CASE 表达式内联 REPEAT() 时自身的裸 END 被误判）。回归：
+   `test_002`、`test_034`。
+3. **`#` 单行注释完全不识别**（不止例程体内，任何 MySQL 协议语句里都不认，因为 `#`
+   被当成了 PG 风格自定义操作符的合法字符）；以及 **`DECLARE ... CONDITION FOR
+   SQLSTATE VALUE '...'`**（可选 VALUE 关键字）不被接受。两个缺口是在同一条语料
+   （`sp.test` 的 `hndlr1` 过程）里一起发现的。回归：`test_035`。
+4. **ALTER/START TRANSACTION/COMMIT 作为例程整个函数体**：和 CREATE/DROP 一样的模式，
+   补进 `mysql_single_stmt_body_leader` 即可，捕获逻辑复用已有的"扫到下一个顶层分号"
+   兜底路径。COMMIT/START TRANSACTION 编译能通过，但调用时仍会撞见 §6 归档的 C2
+   （默认 SQL SECURITY DEFINER 下事务控制受阻）——这是已知、已归档的限制，不在本轮
+   修复范围内，回归测试显式钉住这个边界（编译通过、CALL 按已知方式失败）而不是回避它。
+
+**剩余未达标的约 100 条失败，按体量排序**：
+
+| 类别 | 条数 | 归类 |
+|---|---|---|
+| VIEW 依赖阻塞 DROP FUNCTION（1304） | 30 | §6 已归档的产品/语义取舍问题；用户已明确决定**维持现状，不修** |
+| 带标签的循环/块作为函数体（`label: WHILE ...`） | ~7 | 语法扩展（需要在 leader 位置识别 `标签:` 前缀，且尾部可选标签回显要能被正确消费），比本轮四项复杂一级 |
+| `FLUSH` 类语句（TABLES/LOGS 等） | ~14 | openHalo 目前完全没有 FLUSH 语句，不是单纯加 leader 能解决的，需要新增一整类语句支持，超出 SP 专属范围 |
+| 长 DEFINER 主机名（60+ 字符） | ~4 | 疑似扫描器缓冲区长度限制，MySQL 自身语料里的极端测试用例，真实场景价值低 |
+| 带括号的 SELECT 作为函数体语句 | ~3 | 不在 mys_gram.y 捕获层，而是 plmysql 自己的语句文法（pl_gram.y）不接受 `(SELECT ...) UNION ...` 形态 |
+| `/*!50003 ...*/` 版本门控注释 | ~3 | MySQL 特有的条件注释语法，需要专门处理 |
+| 长尾个例（CHECKSUM/REPAIR/ANALYZE/TRUNCATE/RESET/HANDLER READ 等） | ~10 | 各自需要判断 openHalo 是否已支持该语句类型，逐条工作量小但数量分散 |
+
+**另发现一个与编译通过率无关的运行期 bug**（在语料重放过程中发现，尚未定位根因）：例程体
+含嵌套 `DECLARE CONTINUE HANDLER FOR SQLEXCEPTION` 时，`CALL` 该例程会挂起数十秒到数分钟
+才返回（需要给复现脚本加 watchdog 才能跑完整轮语料）。已记录，未深入排查。
+
 以上各项如需推进，建议作为独立 issue/里程碑分别评审，而非在这份报告的框架下继续挂起。
