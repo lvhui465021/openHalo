@@ -416,6 +416,8 @@ static void
 mys_check_mysql_trigger_target(CreateTrigStmt *stmt)
 {
 	Oid			relid;
+	Oid			namespaceOid;
+	char	   *schemaName;
 
 	relid = RangeVarGetRelid(stmt->relation, NoLock, true);
 	if (!OidIsValid(relid))
@@ -429,6 +431,26 @@ mys_check_mysql_trigger_target(CreateTrigStmt *stmt)
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("Trigger's '%s' is view or temporary table",
 						stmt->relation->relname)));
+	}
+
+	/*
+	 * MySQL 5.7 rejects a trigger on any table in one of its own system
+	 * schemas (mysql, information_schema, performance_schema, sys) --
+	 * ER_NO_TRIGGERS_ON_SYSTEM_SCHEMA (1465).  openHalo's equivalents are
+	 * "mysql" (unchanged), "mys_informa_schema" (information_schema) and
+	 * "mys_sys" (sys); there is no performance_schema equivalent to check.
+	 */
+	namespaceOid = get_rel_namespace(relid);
+	schemaName = get_namespace_name(namespaceOid);
+	if (schemaName != NULL &&
+		(strcmp(schemaName, "mysql") == 0 ||
+		 strcmp(schemaName, "mys_informa_schema") == 0 ||
+		 strcmp(schemaName, "mys_sys") == 0))
+	{
+		mysSetPendingMySQLErrno(1465);	/* ER_NO_TRIGGERS_ON_SYSTEM_SCHEMA */
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("Triggers can not be created on system tables")));
 	}
 }
 
