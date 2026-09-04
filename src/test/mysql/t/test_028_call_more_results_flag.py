@@ -119,3 +119,55 @@ def run(cluster):
         with conn4.cursor() as cur:
             cur.execute("CALL t028_a()")
             assert cur.fetchall() == (('AAA',),)
+
+    run_conditional_handler(cluster)
+
+
+def run_conditional_handler(cluster):
+    """A CALL whose *handler* streams the result set (nested handlers, only
+    the inner one fires) used to hang the client forever: the compiler's
+    static n_resultsets tally counted both handler SELECTs, the runtime sent
+    only one, so resultsets_sent < n_resultsets left moreResultsFlag set on
+    the CALL's trailing OK -- the client then waited for a second result set
+    that never arrived (sp.test's h_es/h_ss/h_xs family, and about 19 corpus
+    CALLs in total desynced exactly this way).  The trailing completion now
+    always carries the outer flag; pin the exact wire behavior: the result
+    set's own EOF claims "more" (the trailing OK is still coming), and the
+    trailing OK terminates the response cleanly.
+    """
+    _ddl(cluster,
+         "DROP TABLE IF EXISTS t028_dup",
+         "CREATE TABLE t028_dup(a SMALLINT PRIMARY KEY)",
+         "INSERT INTO t028_dup(a) VALUES (1)",
+         """CREATE PROCEDURE t028_h_es()
+            DETERMINISTIC
+         BEGIN
+           DECLARE CONTINUE HANDLER FOR 1062
+             SELECT 'Outer (bad)' AS 'h_es';
+           BEGIN
+             DECLARE CONTINUE HANDLER FOR SQLSTATE '23000'
+               SELECT 'Inner (good)' AS 'h_es';
+             INSERT INTO t028_dup VALUES (1);
+           END;
+         END""")
+
+    # Streaming (SSCursor) reads every packet: if the trailing OK claimed
+    # "more results exist", nextset() would block forever waiting for a
+    # second result set.
+    with cluster.mysql(dbname="public") as conn:
+        cur = conn.cursor(pymysql.cursors.SSCursor)
+        cur.execute("CALL t028_h_es()")
+        rows = cur.fetchall()
+        assert rows == [("Inner (good)",)], \
+            "inner handler result set not streamed: %r" % (rows,)
+        sets = 0
+        while cur.nextset():
+            sets += 1
+            assert sets < 4, "unbounded result-set loop on CALL response"
+        assert sets >= 1, "trailing CALL completion missing from response"
+        cur.close()
+
+        # The same connection must still be fully usable afterwards.
+        with conn.cursor() as cur:
+            cur.execute("SELECT 42")
+            assert cur.fetchone() == (42,)

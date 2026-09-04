@@ -1076,8 +1076,9 @@ typedef struct PLMySQL_execstate
 	/*
 	 * Number of MySQL-style result sets this invocation has already
 	 * streamed to the client (bare SELECTs inside a PROCEDURE body, with no
-	 * INTO clause).  Compared against PLMySQL_function.n_resultsets to
-	 * decide whether more such pushes are still to come; see
+	 * INTO clause).  Diagnostic only -- the wire-protocol flag bookkeeping
+	 * no longer depends on it (the compiler's static n_resultsets overcounts
+	 * whenever a conditionally-fired handler SELECT was counted); see
 	 * plmysql_push_execsql_resultset() in pl_exec_ext.c.
 	 */
 	int			resultsets_sent;
@@ -1087,13 +1088,15 @@ typedef struct PLMySQL_execstate
 	 * adapter/mysql/adapter.c) as the top-level multi-statement dispatch
 	 * loop (tcop/postgres.c) had already set it when this invocation began:
 	 * nonzero iff there are more top-level statements queued after the CALL
-	 * that is running this routine.  plmysql_push_execsql_resultset() must
-	 * fall back to this, rather than to 0, once this invocation's own
-	 * result sets are exhausted -- otherwise the last result set of a CALL
-	 * unconditionally reports "no more results", even when a following
-	 * statement in the same multi-statement batch is still pending, which
-	 * desyncs the client's read of the wire protocol for the rest of the
-	 * batch.
+	 * that is running this routine.  plmysql_push_execsql_resultset() falls
+	 * back to this, rather than to 0, immediately after each of this
+	 * invocation's result sets is sent -- the packet carrying it is the
+	 * CALL's trailing completion, which is what the client reads last for
+	 * this statement.  Falling back to 0 instead would make the last result
+	 * set of a CALL unconditionally report "no more results", even when a
+	 * following statement in the same multi-statement batch is still
+	 * pending, which desyncs the client's read of the wire protocol for the
+	 * rest of the batch.
 	 */
 	int			outer_more_results_flag;
 

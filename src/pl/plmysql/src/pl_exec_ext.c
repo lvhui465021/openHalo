@@ -173,14 +173,15 @@ plmysql_clear_signal_errno(void)
  * (pl_handler.c's plmysql_require_mysql_protocol()).
  *
  * "More results" bookkeeping is the moreResultsFlag global that the
- * top-level MySQL multi-statement loop (tcop/postgres.c) also uses, compared
- * here against PLMySQL_function.n_resultsets -- the number of such
- * result-set-producing statements the compiler counted in this routine's
- * body.  This is a static, straight-line count: a bare SELECT that runs
- * repeatedly inside a loop is only counted once, so a loop emitting more
- * than one result set can undercount "how many are left" on later
- * iterations.  That's an accepted limitation (matches the design spec's own
- * framing of this bookkeeping), not a case in scope today.
+ * top-level MySQL multi-statement loop (tcop/postgres.c) also uses.  Each
+ * push claims the flag for its own completion packet and hands it straight
+ * back to estate->outer_more_results_flag afterward; see the comment at the
+ * top of the function body.  The compiler's n_resultsets count is not
+ * consulted: it is a static, straight-line tally of bare SELECTs, which
+ * overcounts when a handler's SELECT fires only conditionally at runtime
+ * (two nested handlers, only the inner one runs) and undercounts when a
+ * loop streams several result sets -- neither can be allowed to decide what
+ * the CALL's final packet claims.
  *
  * Once this invocation's own result sets are exhausted, moreResultsFlag
  * must fall back to estate->outer_more_results_flag (the flag's value as
@@ -208,17 +209,23 @@ plmysql_push_execsql_resultset(PLMySQL_execstate *estate,
 	 * never the last packet of the enclosing CALL's own response: a CALL
 	 * always has its own trailing completion packet sent afterward (see
 	 * CMDTAG_CALL in adapter.c's endCommand(), unconditional sendOKPacket()
-	 * for every CALL), whether or not there are more of this routine's own
-	 * result sets still to come.  So the flag on *this* packet must always
-	 * claim more results exist, regardless of estate->resultsets_sent vs.
-	 * estate->func->n_resultsets -- otherwise the client sees this result
-	 * set's own "no more results" and considers the whole CALL finished
-	 * before that trailing packet (which it doesn't know to expect) has
-	 * even been sent, corrupting its read of whatever the connection sends
-	 * next.  Only after this packet has been sent do we restore
-	 * moreResultsFlag to outer_more_results_flag -- the correct true final
-	 * value -- so that trailing CALL completion (sent later, once this
-	 * invocation returns) carries it instead.
+	 * for every CALL).  So the flag on *this* packet must always claim more
+	 * results exist -- otherwise the client sees this result set's own "no
+	 * more results" and considers the whole CALL finished before that
+	 * trailing packet (which it doesn't know to expect) has even been sent,
+	 * corrupting its read of whatever the connection sends next.
+	 *
+	 * Once the packet is out, restore moreResultsFlag to
+	 * estate->outer_more_results_flag right away -- the value the trailing
+	 * CALL completion must carry.  Whether further pushes of this routine
+	 * are still to come is deliberately not consulted: the compiler's
+	 * n_resultsets count is a static straight-line tally of bare SELECTs,
+	 * and it overcounts whenever a handler's SELECT (each one counted)
+	 * fires only conditionally at runtime -- say two nested handlers of
+	 * which only the inner one runs.  Restoring the outer flag immediately
+	 * after every push makes the trailing completion correct in every
+	 * case; the next push, if any, simply re-claims the flag before its
+	 * own EOF goes out, and no other packet is sent in between.
 	 */
 	moreResultsFlag = HALO_SVR_MORE_RESULTS_EXISTS;
 
@@ -237,8 +244,7 @@ plmysql_push_execsql_resultset(PLMySQL_execstate *estate,
 	if (MyProcPort)
 		MyProcPort->protocol_handler->end_command(&qc, DestRemote);
 
-	if (estate->resultsets_sent >= estate->func->n_resultsets)
-		moreResultsFlag = estate->outer_more_results_flag;
+	moreResultsFlag = estate->outer_more_results_flag;
 
 	SPI_freetuptable(tuptab);
 }
