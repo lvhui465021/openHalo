@@ -218,6 +218,7 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 | +REPEAT() 函数调用误判修复 | 78.6%（396/504） | 顺带修复，见下 |
 | +`#` 注释 / `SQLSTATE VALUE` | 79.6%（401/504） | 见下 |
 | +ALTER/START TRANSACTION/COMMIT 单语句体 | **80.16%（404/504）** | 已达标 |
+| +带标签单语句体（2026-09-05） | **81.75%（412/504）** | 见上方"带标签"行；同轮修复 CALL handler 结果集挂起（见下），带执行重放三文件 TIMEOUT=0 |
 
 **已完成的四项修复**（均已提交，回归见对应 `test_0NN`）：
 
@@ -247,15 +248,25 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 | 类别 | 条数 | 归类 |
 |---|---|---|
 | VIEW 依赖阻塞 DROP FUNCTION（1304） | 30 | §6 已归档的产品/语义取舍问题；用户已明确决定**维持现状，不修** |
-| 带标签的循环/块作为函数体（`label: WHILE ...`） | ~7 | 语法扩展（需要在 leader 位置识别 `标签:` 前缀，且尾部可选标签回显要能被正确消费），比本轮四项复杂一级 |
+| ~~带标签的循环/块作为函数体（`label: WHILE ...`）~~ | ~7 | ✅ **已完成（2026-09-05）**：`mysql_routine_body` 新增 `IDENT ':' mysql_single_stmt_body_leader` 与 `IDENT ':' BEGIN_P` 两条产生式（bison 冲突数不变，仍 48），捕获子串从标签起始；`mys_capture_routine_body()` 在最外层 closer（裸 `END` 与 seed 路径的 `END WHILE/LOOP/REPEAT`）消费可选标签回声，回声不再漏成 bison lookahead。回归见 `test_036` |
 | `FLUSH` 类语句（TABLES/LOGS 等） | ~14 | openHalo 目前完全没有 FLUSH 语句，不是单纯加 leader 能解决的，需要新增一整类语句支持，超出 SP 专属范围 |
 | 长 DEFINER 主机名（60+ 字符） | ~4 | 疑似扫描器缓冲区长度限制，MySQL 自身语料里的极端测试用例，真实场景价值低 |
 | 带括号的 SELECT 作为函数体语句 | ~3 | 不在 mys_gram.y 捕获层，而是 plmysql 自己的语句文法（pl_gram.y）不接受 `(SELECT ...) UNION ...` 形态 |
 | `/*!50003 ...*/` 版本门控注释 | ~3 | MySQL 特有的条件注释语法，需要专门处理 |
 | 长尾个例（CHECKSUM/REPAIR/ANALYZE/TRUNCATE/RESET/HANDLER READ 等） | ~10 | 各自需要判断 openHalo 是否已支持该语句类型，逐条工作量小但数量分散 |
 
-**另发现一个与编译通过率无关的运行期 bug**（在语料重放过程中发现，尚未定位根因）：例程体
-含嵌套 `DECLARE CONTINUE HANDLER FOR SQLEXCEPTION` 时，`CALL` 该例程会挂起数十秒到数分钟
-才返回（需要给复现脚本加 watchdog 才能跑完整轮语料）。已记录，未深入排查。
+**另发现一个与编译通过率无关的运行期 bug——✅ 已定位并修复（2026-09-05）**：例程体含嵌套
+`DECLARE CONTINUE HANDLER FOR SQLEXCEPTION` 时，`CALL` 该例程会挂起数十秒到数分钟。根因：
+`pl_gram.c` 把**所有** handler 动作体里的裸 SELECT 都计入 `n_resultsets`（静态直线计数），运行期
+handler 按条件触发、实际推送数少于计数，`resultsets_sent < n_resultsets` 使
+`plmysql_push_execsql_resultset()` 不恢复 `moreResultsFlag`，CALL 恒定尾随的收尾 OK 包便谎报
+"还有结果集"（wire 抓包实证：收尾 OK 的 status 位 0x000a 含 MORE_RESULTS_EXISTS），客户端
+永远等待第二个结果集——语料重放中 19 条 CALL（h_es/h_ss/h_xs 全系及多个 bugNNNN 过程）均
+如此失步。修复：每次结果集推送发出后立即恢复 `moreResultsFlag = outer_more_results_flag`，
+完全不再依赖静态计数（计数对循环多次推送只会少算、对条件 handler 只会多算，两端都不可信）；
+结果集自身 EOF 恒报"还有更多"（因为收尾 OK 恒随后）的不变式保持不变。回归见 `test_028` 的
+`run_conditional_handler`（SSCursor 逐结果集读取 + 后续语句连接保活断言）。修复后三份语料
+带执行重放 TIMEOUT=0，其余 DESYNC 均为独立问题（`SHOW CREATE` 输出二进制字节的
+UnicodeDecodeError ×4、`proc_33618` 断连 ×1，另行归档）。
 
 以上各项如需推进，建议作为独立 issue/里程碑分别评审，而非在这份报告的框架下继续挂起。
