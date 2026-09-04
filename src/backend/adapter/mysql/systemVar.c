@@ -51,6 +51,7 @@
 #include "access/sdir.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "adapter/mysql/errorConvertor.h"
 #include "catalog/namespace.h"
 #include "executor/tuptable.h"
 #include "storage/ipc.h"
@@ -336,6 +337,8 @@ getSystemVariableValueForSelect(char *varName,
     }
     else if (getRet == 1)
     {
+        /* MySQL 5.7: ER_UNKNOWN_SYSTEM_VARIABLE (1193, SQLSTATE HY000). */
+        mysSetPendingMySQLErrno(1193);
         elog(ERROR, "Unknown system variable '%s'", varName);
     }
     else 
@@ -362,6 +365,8 @@ getSystemVariableValueForShow(char *varName,
     }
     else if (getRet == 1)
     {
+        /* MySQL 5.7: ER_UNKNOWN_SYSTEM_VARIABLE (1193, SQLSTATE HY000). */
+        mysSetPendingMySQLErrno(1193);
         elog(ERROR, "Unknown system variable '%s'", varName);
     }
     else 
@@ -427,6 +432,8 @@ setSystemVariableValue(char *varName, char *varValue, bool isSessionSystemVar)
         }
         else
         {
+            /* MySQL 5.7: ER_UNKNOWN_SYSTEM_VARIABLE (1193, SQLSTATE HY000). */
+            mysSetPendingMySQLErrno(1193);
             elog(ERROR, "Unknown system variable '%s'", varName);
         }
     }
@@ -489,6 +496,8 @@ setSystemVariableValue(char *varName, char *varValue, bool isSessionSystemVar)
         else
         {
             unlockGlobalSystemVars();
+            /* MySQL 5.7: ER_UNKNOWN_SYSTEM_VARIABLE (1193, SQLSTATE HY000). */
+            mysSetPendingMySQLErrno(1193);
             elog(ERROR, "Unknown system variable '%s'", varName);
         }
     }
@@ -1357,7 +1366,9 @@ rectifySystemVarValue(const char *varName, char **varValue,
                                                      &found);
                 if (!found)
                 {
-                    elog(ERROR, "Unknown system variable '%s'", varName);
+                    /* MySQL 5.7: ER_UNKNOWN_SYSTEM_VARIABLE (1193, SQLSTATE HY000). */
+            mysSetPendingMySQLErrno(1193);
+            elog(ERROR, "Unknown system variable '%s'", varName);
                 }
 
                 if (0 < systemVar->resultNum)

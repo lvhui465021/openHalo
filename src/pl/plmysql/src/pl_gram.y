@@ -90,6 +90,8 @@ static	bool			tok_is_keyword(int token, union YYSTYPE *lval,
 									   int kw_token, const char *kw_str);
 static	void			word_is_not_variable(PLword *word, int location);
 static	void			cword_is_not_variable(PLcword *cword, int location);
+static	void			set_target_word_is_not_variable(PLword *word, int location);
+static	void			set_target_cword_is_not_variable(PLcword *cword, int location);
 static	void			current_token_is_not_variable(int tok);
 static	PLMySQL_expr	*read_sql_construct(int until,
 											int until2,
@@ -1135,15 +1137,15 @@ stmt_set		: K_SET set_assign_list
 						}
 						else
 						{
-							/* just to give a better message than "syntax error" */
-							word_is_not_variable(&($2), @2);
+							/* MySQL's ER_SP_UNDECLARED_VAR (1327) for this specific case */
+							set_target_word_is_not_variable(&($2), @2);
 							$$ = NIL;
 						}
 					}
 				| K_SET T_CWORD
 					{
-						/* just to give a better message than "syntax error" */
-						cword_is_not_variable(&($2), @2);
+						/* MySQL's ER_SP_UNDECLARED_VAR (1327) for this specific case */
+						set_target_cword_is_not_variable(&($2), @2);
 						$$ = NIL;
 					}
 				;
@@ -2275,6 +2277,39 @@ cword_is_not_variable(PLcword *cword, int location)
 	ereport(ERROR,
 			(errcode(ERRCODE_SYNTAX_ERROR),
 			 errmsg("\"%s\" is not a known variable",
+					NameListToString(cword->idents)),
+			 parser_errposition(location)));
+}
+
+/*
+ * Same as word_is_not_variable()/cword_is_not_variable(), but for the one
+ * context where MySQL 5.7 has a specific, well-known errno for exactly this
+ * situation: "SET <name> = expr" where <name> isn't a declared local
+ * variable, a MySQL system variable, or a "@uservar" (see stmt_set in this
+ * grammar) -- ER_SP_UNDECLARED_VAR (1327, SQLSTATE 42000), message
+ * "Undeclared variable: %s".  The other callers of word_is_not_variable()/
+ * cword_is_not_variable() (a bare, unrecognized identifier turning up where
+ * a T_DATUM was expected in various other grammar positions) don't have as
+ * specific a MySQL equivalent, so they keep the generic message and the
+ * generic 1064 syntax-error fallback.
+ */
+static void
+set_target_word_is_not_variable(PLword *word, int location)
+{
+	mysSetPendingMySQLErrno(1327);
+	ereport(ERROR,
+			(errcode(ERRCODE_SYNTAX_ERROR),
+			 errmsg("Undeclared variable: %s", word->ident),
+			 parser_errposition(location)));
+}
+
+static void
+set_target_cword_is_not_variable(PLcword *cword, int location)
+{
+	mysSetPendingMySQLErrno(1327);
+	ereport(ERROR,
+			(errcode(ERRCODE_SYNTAX_ERROR),
+			 errmsg("Undeclared variable: %s",
 					NameListToString(cword->idents)),
 			 parser_errposition(location)));
 }

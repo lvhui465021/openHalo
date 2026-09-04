@@ -373,7 +373,7 @@ def _must_fail_loudly(cluster):
     # SET 的目标必须是已知变量，且报错要点名
     _expect_error(cluster, "SET on unknown name",
                   "CREATE PROCEDURE t003_bad2() BEGIN SET nosuchvar = 1; END",
-                  '"nosuchvar" is not a known variable')
+                  'Undeclared variable: nosuchvar')
 
     # 同一条 DECLARE 里重名
     _expect_error(cluster, "duplicate name within one DECLARE",

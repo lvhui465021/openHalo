@@ -13,8 +13,11 @@ variable.
 The fix consults isSystemVariable() (the same registry the top-level MySQL
 SET statement already uses) to tell the two cases apart: a known system
 variable name is handed to SPI verbatim, exactly like the pre-existing
-"SET @uservar = expr" passthrough; anything else keeps the original
-"not a known variable" error.
+"SET @uservar = expr" passthrough; anything else keeps erroring, now with
+MySQL's own ER_SP_UNDECLARED_VAR (1327, "Undeclared variable: %s") instead
+of the generic 1064 -- a separate, later D-category errno-alignment fix
+(set_target_word_is_not_variable(), pl_gram.y) that landed on this same
+code path.
 """
 
 
@@ -49,5 +52,5 @@ def run(cluster):
                             "BEGIN SET notavariable = 1; END")
             except Exception as e:
                 raised = True
-                assert getattr(e, "args", [None])[0] == 1064, e
+                assert getattr(e, "args", [None])[0] == 1327, e
             assert raised, "SET of an undeclared local variable must still error"
