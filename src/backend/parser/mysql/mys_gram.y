@@ -19110,17 +19110,28 @@ opt_charset_with_opt_binary:
                     //      为字符串数据类型指定BINARY字符集($2)，将使字段创建为相应的二进制字符串数据类型(char->binary, varchar->varbinary, text->blob)
                     $$ = list_make1(makeString($2));
                 }
-            //| BINARY
-            //    {
-            //        // TODO: BINARY确定使用字符集的二进制排序规则
-            //        $$ = NIL;
-            //    }
-            //| BINARY character_set charset_name
-            //    {
-            //        // TODO: 字符集为$3, BINARY确定使用该字符集的二进制排序规则
-            //        //      为字符串数据类型指定BINARY字符集($3)，将使字段创建为相应的二进制字符串数据类型(char->binary, varchar->varbinary, text->blob)
-            //        $$ = list_make1(makeString($3));
-            //    }
+            | BINARY
+                {
+                    /*
+                     * "CHAR(n) BINARY" with no CHARACTER SET/CHARSET before
+                     * it (MySQL's other permitted ordering: BINARY may
+                     * either follow a charset_name, handled above via
+                     * opt_bin_mod, or stand on its own / precede its own
+                     * CHARACTER SET clause, handled here and below).  Like
+                     * the charset_name case above, this is accepted and
+                     * silently ignored -- see CharacterWithLength/
+                     * CharacterWithoutLength, which don't consult $$ at
+                     * all -- rather than left as a dangling BINARY token
+                     * for the enclosing type-name grammar to trip over.
+                     */
+                    $$ = NIL;
+                }
+            | BINARY character_set charset_name
+                {
+                    // TODO: 字符集为$3, BINARY确定使用该字符集的二进制排序规则
+                    //      为字符串数据类型指定BINARY字符集($3)，将使字段创建为相应的二进制字符串数据类型(char->binary, varchar->varbinary, text->blob)
+                    $$ = list_make1(makeString($3));
+                }
         ;
 
 //ascii:

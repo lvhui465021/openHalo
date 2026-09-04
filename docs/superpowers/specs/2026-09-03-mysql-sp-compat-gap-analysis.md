@@ -84,7 +84,7 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
 | # | 缺口 | 失败数 | 说明 | 方案 |
 |---|---|---|---|---|
 | **B1** | **`ENUM(...)` / `SET(...)` 作为 `DECLARE` 变量类型或 `RETURNS` 类型** | 6 | `declare v enum('a','b')` / `returns enum(...)` → “type does not exist”(1091)。openHalo 无 ENUM/SET 类型域 | 中大型：需要在 aux_mysql 里提供 ENUM/SET 语义（或退化为受 CHECK 约束的文本域），并让例程/函数参数与返回类型解析支持内联 `enum(...)`/`set(...)` |
-| **B2** | **列级 `CHAR … BINARY` / `CHARSET x` 特性** | 3 | `returns char binary` / `returns char(10) charset koi8r` → 1064。MySQL 期望的是 1235(NOT_SUPPORTED) 而非语法错误 | 语法层接受并忽略（或映射）`BINARY`/`CHARSET` 类型特性；至少给出 1235 而非 1064 |
+| **B2** | **列级 `CHAR … BINARY` / `CHARSET x` 特性** | 3 | **已修（2026-09-04），且发现比报告原描述更严重**：`returns char(10) charset koi8r` 确实只是 1064；但 `returns char(10) binary`（裸 `BINARY`，前面没有 `CHARACTER SET`/`CHARSET`）不是语法错误而是**服务端直接段错误（SIGSEGV）崩溃**，日志里能看到 `terminated by signal 11` 且连带踢掉同实例上所有其他会话——`mys_gram.y` 的 `opt_charset_with_opt_binary` 产生式当年只写了“先 CHARSET 后可选 BINARY”一种顺序，裸 `BINARY`/`BINARY` 在前的两种写法整段被注释掉，导致这个 token 在 `RETURNS` 位置被留在一个语法没准备好接收的地方 | 已修：把注释掉的 `\| BINARY` 与 `\| BINARY character_set charset_name` 两个分支补全（语法层接受并忽略，和已有的 charset-first 分支一致），bison 冲突数不变（仍是 `%expect 48`）。四种顺序（纯 `BINARY`、`CHARSET x`、`CHARSET x BINARY`、`BINARY CHARSET x`）均已验证不再崩溃、能正确编译执行。回归见 `test_029` |
 
 ### C. 运行期 / 协议缺口（不在编译通过率里，但直接影响可用性）
 
@@ -143,7 +143,8 @@ MySQL 的 `.test` 文件是 mysqltest 脚本（含 `delimiter`、`--error`、`ev
   快速修复范围。
 
 ### M11 — 类型系统
-- **B2 `BINARY`/`CHARSET` 类型特性**（~1 天，接受并忽略或给 1235）。
+- **B2 `BINARY`/`CHARSET` 类型特性** ✅ 已完成（2026-09-04）：见 §3 表格更新——实际是一个未接线
+  完整导致的服务端崩溃（SIGSEGV），已修复并验证四种书写顺序。回归见 `test_029`。
 - **B1 ENUM/SET 类型**（~1–2 周，独立特性）：投入大，建议独立立项，非 SP 专属。
 
 ### M12 — 严格性/错误码对齐（打磨）
