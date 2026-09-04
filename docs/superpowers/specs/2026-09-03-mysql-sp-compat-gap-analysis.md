@@ -270,3 +270,45 @@ handler 按条件触发、实际推送数少于计数，`resultsets_sent < n_res
 UnicodeDecodeError ×4、`proc_33618` 断连 ×1，另行归档）。
 
 以上各项如需推进，建议作为独立 issue/里程碑分别评审，而非在这份报告的框架下继续挂起。
+---
+
+## 8. 补完轮(2026-09-05):procedure/function/trigger 批量落地
+
+依三份方案文档(trigger-completion / beyond-sp / procfunc-completion)实施,全部合入
+`feature/mysql-stored-procedure-m1`:
+
+- **文法/词法**(77f0db8952):leader 列表 17→24(ANALYZE/TRUNCATE/RESET/FLUSH/
+  CHECKSUM/REPAIR/OPTIMIZE);FLUSH 全族解析并按 LOCK TABLES 先例 no-op;
+  CHECKSUM/REPAIR/OPTIMIZE TABLE 走 mysql.* 函数(真校验和/状态行);
+  DEFINER host 不再被 63 字节截断(裸 host 与单引号 host 两条新路径,反引号
+  host 仍截断=已知限制);DEFINER=CURRENT_USER 经 RoleSpec 链解析为创建者
+  (marker 机制,CREATE/ALTER ROLE/USER/GROUP 拒绝 marker);限定名触发器
+  (mysqldump 形态)进入文法;FOLLOWS/PRECEDES 解析并记录元数据。
+  %expect 48→52(RESET 语句体 vs PG RESET 特性等,默认解析均符合预期),
+  bison 新增关键词走 %token 块 + 两张关键词表 + kwlist.h + check 脚本四处同步。
+- **引擎**:括号 SELECT 语句体(is_select 同步识别,结果集不吞);体内
+  START TRANSACTION=COMMIT 同义;SAVEPOINT/ROLLBACK TO/RELEASE 落在内部
+  子事务栈(handler 块 wrapper 协议:stmt_subxact_released;外层调用帧退出时
+  释放保存点保住适配器提交;未知保存点 1305;COMMIT 释放全部);1691 LIMIT
+  变量类型校验(查 plan sources 的 query_list 的 limitCount/limitOffset 的
+  PARAM_EXTERN,注意 list 元素是 CachedPlanSource 不是 Query);1422 编译期
+  首词嗅探(CREATE/DROP TEMPORARY 豁免)。
+- **服务端**:1313 扫描原始触发器体(绕开包装层注入的 RETURN NEW);
+  1304 剪依赖(DROP FUNCTION/PROCEDURE/TABLE 前删视图的 pg_rewrite NORMAL
+  依赖行,视图失效不阻塞,2BP000 补 sqlstate 映射);触发器私有函数名编码
+  创建序号 `__mysql_trigger_<seq>_<name>`(同事件按创建序触发;DROP 匹配双
+  兼容);1435 限定名 schema 校验;1227/1449 已随 C2 落地。
+- **显示**:SHOW CREATE 按label补 SQL SECURITY INVOKER(aux_mysql 1.12,
+  get_proc_def/get_func_def 以 1.9--1.10 最新定义为基)。
+
+**度量**:探针固化于 `src/test/mysql/corpus/compile_rate_probe.py`
+(方法=§1/§2 口径,只统计定义语句)。新口径基线:三份语料 CREATE
+PROCEDURE/FUNCTION 合计 520 条,通过 445 = **85.58%**;剔除 ~15 条因
+mysqltest 建库上下文缺失(1049)的语句后约 88%。距离旧口径 504 分母不可
+直接比较(解析器差异)。剩余失败桶:ENUM/SET 1091(6)、版本门控注释体内
+1064(需 pl_scanner 支持 /*!NNNNN)、8 次段错误(BUG#25411 `/*!99999`
+体、非 UTF-8 变量名体等,已归档待查)、mysqltest 上下文缺失(1049)。
+
+**新构建陷阱**:plmysql 的 Makefile 不跟踪头文件依赖——改 plmysql.h 后必须
+`rm src/pl/plmysql/src/*.o` 全量重编,否则旧 .o 结构体错位导致随机崩溃;
+mys_utility.c(文本包含)同理需 rm tcop/utility.o。
