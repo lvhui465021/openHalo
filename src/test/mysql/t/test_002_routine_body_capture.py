@@ -328,6 +328,9 @@ def run(cluster):
          "BEGIN IF 1 = 1 THEN DROP TABLE IF EXISTS t002_tmp; END IF; END"),
         ("REPEAT() before REPEAT blk",
          "BEGIN SELECT REPEAT('a', 3); REPEAT NULL; UNTIL 1 = 1 END REPEAT; END"),
+        ("REPEAT() inside CASE expr + alias repeat",
+         "BEGIN SELECT CASE WHEN 1 = 1 THEN REPEAT('a', 3) ELSE 'b' END repeat; "
+         "END"),
         ("END IF x2 sequential",
          "BEGIN IF 1 = 1 THEN NULL; END IF; IF 2 = 2 THEN NULL; END IF; END"),
         ("END IF wrapping BEGIN blk",
@@ -379,15 +382,19 @@ def run(cluster):
     # 一般形状：某个计数层（BEGIN 或 CASE 表达式开的）里，只要出现过同一个关键字
     # 的未配对用法——函数调用、IF EXISTS、别名，任何会让该层计数非零的写法都算——
     # 紧接着这一层自己的裸 END 后面又跟了同一个关键字，判据就只能取「闭合符」这
-    # 一读法，而不是把 END 还给主语法。下面用 CASE 表达式 + IF()/REPEAT() 函数
-    # 调用来实例化这个形状（目前只有 CASE 表达式的裸 END 能落进这个位置，见
-    # mys_gram.y 里 mys_capture_routine_body 的注释）。详见该函数注释。
+    # 一读法，而不是把 END 还给主语法。下面用 CASE 表达式 + IF() 函数调用来实例化
+    # 这个形状（目前只有 CASE 表达式的裸 END 能落进这个位置，见 mys_gram.y 里
+    # mys_capture_routine_body 的注释）。详见该函数注释。
+    #
+    # REPEAT() 的同构用例曾经也在这里，现已移到下面的 _check_bodies——REPEAT 和
+    # IF 不同：REPEAT 循环本身在语法上从不会紧跟 '('（其 UNTIL 条件写在循环体
+    # 末尾，不像 IF/WHILE 的条件可以紧跟在关键字后面括起来），所以「下一个 token
+    # 是不是 '('」足以把 REPEAT('a', 3) 这次函数调用同 REPEAT 循环开启符可靠地
+    # 分开，不需要再靠「记账只会多不会少」这条保守兜底。IF 做不到同样的事，仍然
+    # 留在这里。
     _expect_unterminated(cluster, [
         ("IF() inside + alias if",
          "BEGIN SELECT CASE WHEN 1 = 1 THEN IF(1, 2, 3) ELSE 2 END if; END"),
-        ("REPEAT() inside + alias repeat",
-         "BEGIN SELECT CASE WHEN 1 = 1 THEN REPEAT('a', 3) ELSE 'b' END repeat; "
-         "END"),
     ])
 
     # ------------------------------------------------------- CREATE FUNCTION 分支

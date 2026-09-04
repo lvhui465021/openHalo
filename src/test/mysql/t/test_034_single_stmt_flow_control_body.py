@@ -83,6 +83,32 @@ def run(cluster):
             cur.execute("SELECT * FROM t034_t WHERE id = 'r' ORDER BY data")
             assert cur.fetchall() == (('r', 1), ('r', 2))
 
+    # REPEAT, no BEGIN, whose body calls the REPEAT(str,count) builtin --
+    # taken directly from MySQL 5.7's own sp.test (procedure "b"). REPEAT
+    # the loop keyword and REPEAT() the function share one token; a bare
+    # leading REPEAT loop (no enclosing BEGIN) is only recognized as
+    # closed when mys_capture_routine_body()'s seeded nesting tally for
+    # that keyword returns to exactly zero, so an uncounted function-call
+    # occurrence of the same keyword inside the loop body must not be
+    # allowed to inflate that tally, or the real "END REPEAT" can never
+    # bring it back to zero and the capture runs off the end of the
+    # input. See the REPEAT-specific carve-out in mys_capture_routine_body
+    # for why this disambiguation is safe for REPEAT but not for IF/WHILE.
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t034_repeat_fn_collision",
+         """CREATE PROCEDURE t034_repeat_fn_collision(x INT)
+         REPEAT
+           INSERT INTO t034_t VALUES (REPEAT("q", 3), x);
+           SET x = x - 1;
+         UNTIL x = 0 END REPEAT""")
+    with cluster.mysql(dbname="public") as conn:
+        with conn.cursor() as cur:
+            cur.execute("CALL t034_repeat_fn_collision(2)")
+            cur.fetchall()
+            cur.execute(
+                "SELECT * FROM t034_t WHERE id = 'qqq' ORDER BY data")
+            assert cur.fetchall() == (('qqq', 1), ('qqq', 2))
+
     # IF/ELSEIF/ELSE, no BEGIN.
     _ddl(cluster,
          "DROP PROCEDURE IF EXISTS t034_if",

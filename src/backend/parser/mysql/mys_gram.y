@@ -25130,7 +25130,36 @@ mys_capture_routine_body(core_yyscan_t yyscanner, int body_start_loc,
 			 * tokens around them is precisely what cannot be done reliably, and
 			 * the tally does not need it done: it only has to never miss a real
 			 * opener.
+			 *
+			 * REPEAT is the one exception where it safely can be told apart:
+			 * unlike IF and WHILE, whose own conditions may themselves be
+			 * written in parentheses right after the keyword ("IF (x>0)
+			 * THEN", "WHILE (x>0) DO"), a REPEAT loop's UNTIL condition
+			 * comes at the *end* of the loop body, so a bare REPEAT is never
+			 * legitimately followed by '(' -- only REPEAT(str,count), the
+			 * builtin function, is.  That matters because, unlike the other
+			 * three kinds, a REPEAT loop with no enclosing BEGIN is closed
+			 * by leading_uncounted_kind's tally alone (there is no bare END
+			 * of an outer block to fall back on); left uncounted, a REPEAT
+			 * loop whose own body happens to call that same-named function
+			 * (as MySQL's own sp.test does) would see a tally that can never
+			 * return to zero, and the capture would run off the end of the
+			 * input looking for a second closer that does not exist.
 			 */
+			if (tok == REPEAT)
+			{
+				int			next_tok;
+				YYSTYPE		next_lval;
+				YYLTYPE		next_lloc;
+
+				next_tok = mys_yylex(&next_lval, &next_lloc, yyscanner);
+				if (next_tok != '(')
+					seen[depth * MYS_UNCOUNTED_KINDS + kind]++;
+				pending = next_tok;
+				pending_lval = next_lval;
+				pending_loc = next_lloc;
+				continue;
+			}
 			seen[depth * MYS_UNCOUNTED_KINDS + kind]++;
 			continue;
 		}
