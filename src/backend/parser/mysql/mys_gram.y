@@ -11992,6 +11992,13 @@ mysql_routine_body:
  * CREATE/DROP: a single DDL statement as a routine's entire body (e.g.
  * "CREATE PROCEDURE p1(v DATETIME) CREATE TABLE t1 SELECT v") is valid
  * MySQL syntax the same corpus exercises.
+ *
+ * ALTER/START/COMMIT: same idea, for ALTER TABLE and transaction control
+ * as a routine's entire body (e.g. "CREATE PROCEDURE p() COMMIT",
+ * "CREATE PROCEDURE p() START TRANSACTION") -- ordinary non-nesting
+ * statements the plain scan-to-';' fallback already handles correctly,
+ * the same as SELECT/INSERT/etc. above; they only needed to be
+ * recognized as legal leaders at all.
  */
 mysql_single_stmt_body_leader:
 			  SELECT		{ $$ = SELECT; }
@@ -12008,6 +12015,9 @@ mysql_single_stmt_body_leader:
 			| LOOP			{ $$ = LOOP; }
 			| CREATE		{ $$ = CREATE; }
 			| DROP			{ $$ = DROP; }
+			| ALTER			{ $$ = ALTER; }
+			| START			{ $$ = START; }
+			| COMMIT		{ $$ = COMMIT; }
 		;
 
 opt_routine_body:

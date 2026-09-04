@@ -1,6 +1,7 @@
 """A1 follow-up: a single-statement routine body whose one statement is
-itself a compound flow-control construct (WHILE/REPEAT/IF/CASE), or a DDL
-statement (CREATE/DROP), with no enclosing BEGIN...END.
+itself a compound flow-control construct (WHILE/REPEAT/IF/CASE), a DDL
+statement (CREATE/DROP/ALTER), or a transaction-control statement
+(START TRANSACTION/COMMIT), with no enclosing BEGIN...END.
 
 MySQL 5.7's own sp.test regression suite has several routines shaped
 exactly this way, e.g. "CREATE PROCEDURE a0(x INT) WHILE x DO ... END
@@ -171,6 +172,56 @@ def run(cluster):
             cur.execute("SELECT * FROM t034_ddl")
             row = cur.fetchall()
             assert len(row) == 1, row
+
+    # ALTER as the entire body -- runs to completion, no runtime caveat.
+    _ddl(cluster,
+         "DROP TABLE IF EXISTS t034_alter",
+         "CREATE TABLE t034_alter (id INT)",
+         "DROP PROCEDURE IF EXISTS t034_alter_p",
+         "CREATE PROCEDURE t034_alter_p() ALTER TABLE t034_alter ADD k INT")
+    with cluster.mysql(dbname="public") as conn:
+        with conn.cursor() as cur:
+            cur.execute("CALL t034_alter_p()")
+            cur.fetchall()
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 't034_alter' ORDER BY column_name")
+            assert cur.fetchall() == (('id',), ('k',))
+
+    # COMMIT / START TRANSACTION as the entire body -- these only need to
+    # *compile*.  Calling them still hits the pre-existing, already-known
+    # limitation that a routine's default SQL SECURITY DEFINER maps to PG's
+    # prosecdef=true, which PG itself refuses transaction-control statements
+    # in (see C2 in the gap-analysis doc, explicitly deferred pending a
+    # product decision) -- that is a separate, already-tracked issue, not
+    # something this fix is expected to resolve.  Pinning both here as
+    # "compiles, and fails a specific, known way at CALL" keeps that
+    # boundary visible instead of silently dropping the coverage.
+    import pymysql
+
+    _ddl(cluster,
+         "DROP PROCEDURE IF EXISTS t034_commit_p",
+         "CREATE PROCEDURE t034_commit_p() COMMIT",
+         "DROP PROCEDURE IF EXISTS t034_start_p",
+         "CREATE PROCEDURE t034_start_p() START TRANSACTION")
+    with cluster.mysql(dbname="public") as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("CALL t034_commit_p()")
+                cur.fetchall()
+                raise AssertionError(
+                    "t034_commit_p: expected the known SQL SECURITY "
+                    "DEFINER-vs-COMMIT limitation to still apply")
+            except pymysql.err.OperationalError as e:
+                assert e.args[0] == 1105, e
+            try:
+                cur.execute("CALL t034_start_p()")
+                cur.fetchall()
+                raise AssertionError(
+                    "t034_start_p: expected the known SQL SECURITY "
+                    "DEFINER-vs-START TRANSACTION limitation to still apply")
+            except pymysql.err.NotSupportedError as e:
+                assert e.args[0] == 1235, e
 
     # Regression: WHILE/CASE nested *inside* a BEGIN...END body (the
     # already-working case this fix must not disturb) still work, and a
