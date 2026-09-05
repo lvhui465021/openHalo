@@ -227,6 +227,7 @@ static void processCASbits(int cas_bits, int location, const char *constrType,
 
 static ColumnDef *createColumnDef(char *columnName, char *columnType, int typeMod);
 static void rectifyColumnsName(Node *expr);
+static char *mys_unaliased_target_name(Node *val);
 static ResTarget *createResTargetWithStart(void);
 static ResTarget *createResTargetWithColumn(char *name, char *val, core_yyscan_t yyscanner);
 static ResTarget *createResTargetWithString(char *name, char *val);
@@ -236,6 +237,50 @@ static ResTarget *createResTargetWithFunc2Args(char *name, char *funcShemaName, 
 static RangeVar *createRangeVar(char *schemaName, char *tableName);
 static void checkJoinOn(JoinExpr *joinExpr, bool *hasNotOn);
 static void makeOnClause(Node **expr, JoinExpr *joinExpr);
+
+/*
+ * MySQL names an unaliased select-list entry after the expression's own
+ * spelling: a user variable shows as "@a", a function call as "count(*)".
+ * PostgreSQL derives names in FigureColname() and falls back to "?column?"
+ * for anything it does not recognize -- and our user variables reach it as
+ * a rewritten mysql.get_user_var(...) call, so they always got "?column?".
+ * Synthesize the name here, where the original shape is still available.
+ */
+static char *
+mys_unaliased_target_name(Node *val)
+{
+	if (IsA(val, UserVarRef))
+		return psprintf("@%s", ((UserVarRef *) val)->userVarName);
+	if (IsA(val, FuncCall))
+	{
+		FuncCall  *fn = (FuncCall *) val;
+		StringInfoData buf;
+		ListCell   *lc;
+		bool		first = true;
+
+		if (fn->funcname == NIL)
+			return NULL;
+		initStringInfo(&buf);
+		appendStringInfoString(&buf, strVal(llast(fn->funcname)));
+		appendStringInfoChar(&buf, '(');
+		if (fn->agg_star)
+			appendStringInfoChar(&buf, '*');
+		else if (fn->agg_distinct)
+			appendStringInfoString(&buf, "distinct ");
+		foreach(lc, fn->args)
+		{
+			char	   *arg = mys_unaliased_target_name(lfirst(lc));
+
+			if (!first)
+				appendStringInfoString(&buf, ", ");
+			first = false;
+			appendStringInfoString(&buf, arg ? arg : "...");
+		}
+		appendStringInfoChar(&buf, ')');
+		return buf.data;
+	}
+	return NULL;
+}
 
 /* routine-body capture helpers (defined in the trailing C section) */
 static char *mys_capture_return_stmt_text(core_yyscan_t yyscanner,
@@ -22357,7 +22402,7 @@ target_el:	a_expr AS ColLabel
 			| a_expr
 				{
 					$$ = makeNode(ResTarget);
-					$$->name = NULL;
+					$$->name = mys_unaliased_target_name($1);
 					$$->indirection = NIL;
 					$$->val = (Node *)$1;
 					$$->location = @1;
