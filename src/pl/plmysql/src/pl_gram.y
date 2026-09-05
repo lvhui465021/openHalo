@@ -2039,6 +2039,15 @@ stmt_null		: K_NULL ';'
 stmt_commit		: K_COMMIT opt_transaction_chain ';'
 					{
 						PLMySQL_stmt_commit *new;
+						if (mysql_tx_disallowed_here())
+						{
+							mysSetPendingMySQLErrno(1422); /* ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG */
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+										 errmsg("Explicit or implicit commit is not allowed in stored function or trigger"),
+										 parser_errposition(@1)));
+						}
+
 
 
 						new = palloc(sizeof(PLMySQL_stmt_commit));
@@ -2046,7 +2055,6 @@ stmt_commit		: K_COMMIT opt_transaction_chain ';'
 						new->lineno = plmysql_location_to_lineno(@1);
 						new->stmtid = ++plmysql_curr_compile->nstatements;
 						new->chain = $2;
-						new->disallowed = mysql_tx_disallowed_here();
 
 						$$ = (PLMySQL_stmt *)new;
 					}
@@ -2055,6 +2063,15 @@ stmt_commit		: K_COMMIT opt_transaction_chain ';'
 stmt_rollback	: K_ROLLBACK opt_transaction_chain ';'
 					{
 						PLMySQL_stmt_rollback *new;
+						if (mysql_tx_disallowed_here())
+						{
+							mysSetPendingMySQLErrno(1422); /* ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG */
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+										 errmsg("Explicit or implicit commit is not allowed in stored function or trigger"),
+										 parser_errposition(@1)));
+						}
+
 
 
 						new = palloc(sizeof(PLMySQL_stmt_rollback));
@@ -2062,7 +2079,6 @@ stmt_rollback	: K_ROLLBACK opt_transaction_chain ';'
 						new->lineno = plmysql_location_to_lineno(@1);
 						new->stmtid = ++plmysql_curr_compile->nstatements;
 						new->chain = $2;
-						new->disallowed = mysql_tx_disallowed_here();
 
 						$$ = (PLMySQL_stmt *)new;
 					}
@@ -2079,6 +2095,15 @@ stmt_rollback	: K_ROLLBACK opt_transaction_chain ';'
 stmt_start		: K_START K_TRANSACTION ';'
 					{
 						PLMySQL_stmt_savepoint *new;
+						if (mysql_tx_disallowed_here())
+						{
+							mysSetPendingMySQLErrno(1422); /* ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG */
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+										 errmsg("Explicit or implicit commit is not allowed in stored function or trigger"),
+										 parser_errposition(@1)));
+						}
+
 
 
 						new = palloc(sizeof(PLMySQL_stmt_savepoint));
@@ -2086,7 +2111,6 @@ stmt_start		: K_START K_TRANSACTION ';'
 						new->lineno = plmysql_location_to_lineno(@1);
 						new->stmtid = ++plmysql_curr_compile->nstatements;
 						new->name = NULL;
-						new->disallowed = mysql_tx_disallowed_here();
 
 						$$ = (PLMySQL_stmt *)new;
 					}
@@ -2108,7 +2132,6 @@ stmt_savepoint	: K_SAVEPOINT any_identifier ';'
 						new->lineno = plmysql_location_to_lineno(@1);
 						new->stmtid = ++plmysql_curr_compile->nstatements;
 						new->name = $2;
-						new->disallowed = mysql_tx_disallowed_here();
 
 						$$ = (PLMySQL_stmt *)new;
 					}
@@ -2124,7 +2147,6 @@ stmt_rollback_to: K_ROLLBACK K_TO opt_savepoint_kw any_identifier ';'
 						new->lineno = plmysql_location_to_lineno(@1);
 						new->stmtid = ++plmysql_curr_compile->nstatements;
 						new->name = $4;
-						new->disallowed = mysql_tx_disallowed_here();
 
 						$$ = (PLMySQL_stmt *)new;
 					}
@@ -2140,7 +2162,6 @@ stmt_release		: K_RELEASE opt_savepoint_kw any_identifier ';'
 						new->lineno = plmysql_location_to_lineno(@1);
 						new->stmtid = ++plmysql_curr_compile->nstatements;
 						new->name = $3;
-						new->disallowed = mysql_tx_disallowed_here();
 
 						$$ = (PLMySQL_stmt *)new;
 					}
