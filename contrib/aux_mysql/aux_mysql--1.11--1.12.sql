@@ -171,3 +171,53 @@ END
 $$
 STABLE LANGUAGE PLPGSQL;
 
+
+-- mysql.if with a TEXT condition: MySQL coerces the condition to a number
+-- with leading-prefix semantics ("2:3" -> 2, "x" -> 0, "" -> 0).  The 612
+-- generated numeric overloads only accept tinyint/double conditions, so an
+-- IF(@user_var, ...) whose variable holds a string failed to resolve.
+CREATE OR REPLACE FUNCTION mysql.str_prefix_double(s pg_catalog.text)
+RETURNS float8
+AS
+$$
+DECLARE
+    d float8;
+    t pg_catalog.text := pg_catalog.btrim(s);
+BEGIN
+    BEGIN
+        d := t::float8;
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- leading numeric prefix, MySQL style
+            t := pg_catalog.regexp_replace(t, '^([-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?).*$', '\\1');
+            IF t IN ('', '+', '-') THEN
+                d := 0;
+            ELSE
+                BEGIN
+                    d := t::float8;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        d := 0;
+                END;
+            END IF;
+    END;
+    RETURN d;
+END;
+$$
+STABLE LANGUAGE PLPGSQL;
+
+CREATE OR REPLACE FUNCTION mysql.if(condition pg_catalog.text,
+                                    value2 pg_catalog.text,
+                                    value3 pg_catalog.text)
+RETURNS pg_catalog.text
+AS
+$$
+BEGIN
+    IF mysql.str_prefix_double(condition) != 0 THEN
+        RETURN value2;
+    ELSE
+        RETURN value3;
+    END IF;
+END;
+$$
+STABLE LANGUAGE PLPGSQL;

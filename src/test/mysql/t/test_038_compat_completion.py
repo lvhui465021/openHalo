@@ -252,6 +252,26 @@ def run(cluster):
                 assert e.args[0] == 1435, \
                     "expected 1435 for trigger schema mismatch, got %r" % (e.args,)
 
+    # ---- IF() 的 text 条件(MySQL 前缀数字语义)在触发器 @变量链中的可用性 ----
+    _ddl(cluster,
+         "DROP TABLE IF EXISTS t038_if_t",
+         "DROP TABLE IF EXISTS t038_if_a")
+    _ddl(cluster,
+         "CREATE TABLE t038_if_t (i INT)",
+         "CREATE TABLE t038_if_a (v VARCHAR(200))",
+         "CREATE TRIGGER t038_if_trg BEFORE INSERT ON t038_if_t FOR EACH ROW "
+         "SET @a := IF(@a, CONCAT(@a, ':', NEW.i), CAST(NEW.i AS CHAR))")
+    # @a 是会话变量,整条链必须在同一连接内
+    with cluster.mysql(dbname="public") as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET @a = ''")
+            cur.execute("INSERT INTO t038_if_t VALUES (2),(3),(4),(5)")
+            cur.execute("SELECT @a")
+            assert cur.fetchall() == (("2:3:4:5",),), \
+                "IF(text) condition chain must accumulate like MySQL"
+    _ddl(cluster, "DROP TRIGGER t038_if_trg", "DROP TABLE t038_if_t",
+         "DROP TABLE t038_if_a")
+
     # ---- C17: SHOW CREATE 反映 SQL SECURITY 特性 ----
     with cluster.mysql(dbname="public") as conn:
         with conn.cursor() as cur:

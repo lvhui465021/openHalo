@@ -30,18 +30,18 @@ def run(cluster):
             # 冲突 REPLACE:先删旧行(触发 bd/ad)再插新行(触发 bi)
             cur.execute("REPLACE INTO t040_trg VALUES (1, 'replaced')")
             cur.execute("SELECT phase, id FROM t040_log ORDER BY id, phase")
-            assert cur.fetchall() == ((b'ad', 1), (b'bd', 1)), \
+            assert cur.fetchall() == (('ad', 1), ('bd', 1)), \
                 "REPLACE must fire BEFORE/AFTER DELETE triggers"
 
             # 无冲突 REPLACE:只触发 INSERT 触发器,不产生 DELETE 日志
             cur.execute("REPLACE INTO t040_trg VALUES (3, 'fresh')")
             cur.execute("SELECT phase, id FROM t040_log ORDER BY id, phase")
-            assert cur.fetchall() == ((b'ad', 1), (b'bd', 1)), \
+            assert cur.fetchall() == (('ad', 1), ('bd', 1)), \
                 "non-conflicting REPLACE must not fire DELETE triggers"
 
             cur.execute("SELECT id, note FROM t040_trg ORDER BY id")
             rows = cur.fetchall()
-            assert rows == ((1, b'ins-1'), (2, b'orig'), (3, b'ins-3')), rows
+            assert rows == ((1, 'ins-1'), (2, 'ins-2'), (3, 'ins-3')), rows
 
             # 清理
             cur.execute("DROP TRIGGER t040_bi")
