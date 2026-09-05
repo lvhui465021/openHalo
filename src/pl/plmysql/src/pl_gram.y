@@ -2881,15 +2881,52 @@ make_execsql_stmt(int firsttoken, int location, PLword *word)
 			yyerror("unexpected end of function definition");
 		if (tok == K_INTO)
 		{
+			int			next_tok;
+
 			if (prev_tok == K_INSERT)
 				continue;		/* INSERT INTO is not an INTO-target */
 			if (firsttoken == K_IMPORT)
 				continue;		/* IMPORT ... INTO is not an INTO-target */
+			/*
+			 * yylloc still points at the INTO token itself; the
+			 * redaction machinery below needs that location even if
+			 * the peek moves the scanner forward.
+			 */
+			into_start_loc = yylloc;
+			/*
+			 * MySQL's SELECT ... INTO OUTFILE 'path' / INTO DUMPFILE
+			 * 'path': the word after INTO is the export keyword, not a
+			 * variable target.  Do not enter read_into_target(); leave
+			 * the whole clause in the statement text so it is passed
+			 * through to the core MySQL parser, which lowers it to a
+			 * server-side COPY (mys_gram.y -> mys_transformOptional-
+			 * SelectInto()).  The keyword is not removed from the
+			 * capture's point of view -- plmysql_append_source_text()
+			 * works from token locations -- so the statement text stays
+			 * byte-identical to the source.
+			 *
+			 * Peek in IDENTIFIER_LOOKUP_NORMAL mode, the mode
+			 * read_into_target() itself uses, so a pushed-back variable
+			 * datum replays as T_DATUM.  (plmysql's own keyword lists
+			 * do not know OUTFILE/DUMPFILE, so the keyword arrives as a
+			 * plain T_WORD.)  A quoted "outfile" is an identifier, not
+			 * the keyword.
+			 */
+			plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
+			next_tok = yylex();
+			if (next_tok == T_WORD &&
+				!yylval.word.quoted &&
+				yylval.word.ident != NULL &&
+				(pg_strcasecmp(yylval.word.ident, "outfile") == 0 ||
+				 pg_strcasecmp(yylval.word.ident, "dumpfile") == 0))
+			{
+				plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
+				continue;		/* INTO OUTFILE/DUMPFILE, not a target */
+			}
+			plmysql_push_back_token(next_tok);
 			if (have_into)
 				yyerror("INTO specified more than once");
 			have_into = true;
-			into_start_loc = yylloc;
-			plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
 			read_into_target(&target, &have_strict);
 			plmysql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
 		}

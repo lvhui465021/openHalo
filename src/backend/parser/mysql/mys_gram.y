@@ -261,7 +261,9 @@ static CreateTrigStmt *mys_finish_trigger_stmt(bool replace, char *definer,
 static bool mys_optlist_pins_foreign_language(List *options);
 static Node *mys_make_noop_stmt(int location);
 static Node *mys_make_maintenance_select(const char *funcname,
-												 List *rel_list);
+										 List *rel_list);
+static Node *mys_make_outfile_clause(bool is_dumpfile, char *filename,
+									 List *options, int location);
 static char *mys_check_role_id_name(char *name);
 static char *mys_return_body_text;
 
@@ -386,9 +388,10 @@ static char *mys_return_body_text;
 %type <node>    mysql_system_variable mysql_user_variable set_variable
 %type <list>    set_variables
 
-%type <node>	select_no_parens select_with_parens select_clause
+%type <node>	select_no_parens select_no_parens_core select_with_parens select_clause
 				simple_select values_clause insert_value_clause
 				PLpgSQL_Expr PLAssignStmt
+				into_outfile_clause opt_outfile_charset
 
 %type <node>	alter_column_default opclass_item opclass_drop alter_using
 %type <ival>	add_drop opt_asc_desc opt_nulls_order
@@ -525,6 +528,13 @@ static char *mys_return_body_text;
 %type <defelt>	fdw_option
 
 %type <into>	into_clause create_as_target create_mv_target
+/*
+ * MySQL SELECT ... INTO OUTFILE export options: each nonterminal yields a
+ * List of DefElems (empty when the clause is absent).
+ */
+%type <list>	opt_export_options field_options field_option_list field_option
+				opt_lines_clause line_options opt_line_starting
+				opt_line_terminated
 %type <list>    select_var_list
 %type <node>    select_var
 
@@ -766,9 +776,9 @@ static char *mys_return_body_text;
 	DEFERRABLE DEFERRED DEFINER DELAY_KEY_WRITE DELAYED DELETE_P DELIMITER DELIMITERS DEPENDS DEPTH DESC
 	DES_KEY_FILE DESCRIBE
 	DETACH DETERMINISTIC DICTIONARY DIRECTORY DISABLE_P DISCARD DISK DISTINCT DISTINCTROW DIV DO DOCUMENT_P DOMAIN_P
-	DOUBLE_P DROP DUPLICATE DYNAMIC
+	DOUBLE_P DROP DUMPFILE DUPLICATE DYNAMIC
 
-	EACH ELSE ELSEIF ENABLE_P ENCODING ENCRYPTED ENCRYPTION END_P ENGINE ENGINES ENUM_P ESCAPE EVENT EXCEPT
+	EACH ELSE ELSEIF ENABLE_P ENCLOSED ENCODING ENCRYPTED ENCRYPTION END_P ENGINE ENGINES ENUM_P ESCAPE ESCAPED EVENT EXCEPT
 	EXCLUDE EXCLUDING EXCLUSIVE EXECUTE EXISTS EXIT EXPLAIN EXPRESSION
 	EXTENSION EXTERNAL EXTRACT
 
@@ -789,7 +799,7 @@ static char *mys_return_body_text;
 	KEY KEYS_P KEY_BLOCK_SIZE
 
 	LABEL LANGUAGE LARGE_P LAST_P LATERAL_P
-	LEADING LEAKPROOF LEAST LEAVE LEFT LESS LEVEL LIKE LIMIT LINEAR LIST LISTEN LOAD LOCAL
+	LEADING LEAKPROOF LEAST LEAVE LEFT LESS LEVEL LIKE LIMIT LINEAR LINES LIST LISTEN LOAD LOCAL
 	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED LOGS LONG LONGBLOB
     LONGTEXT LOOP LOW_PRIORITY 
 
@@ -802,8 +812,8 @@ static char *mys_return_body_text;
 	NOT NOTHING NOTIFY NOTNULL NOW NOWAIT NULL_P NULLIF
 	NULLS_P NUMERIC NVARCHAR
 
-	OBJECT_P OF OFF OFFSET OIDS OLD ON ONLY OPEN OPERATOR OPTIMIZE OPTION OPTIONS OR
-	ORDER ORDINALITY OTHERS OUT_P OUTER_P
+	OBJECT_P OF OFF OFFSET OIDS OLD ON ONLY OPEN OPERATOR OPTIMIZE OPTION OPTIONALLY OPTIONS OR
+	ORDER ORDINALITY OTHERS OUT_P OUTER_P OUTFILE
 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
 
 	PACK_KEYS PARALLEL PARSER PARTIAL PARTITION PARTITIONS PASSING PASSWORD PLACING PLANS PLUGINS POLICY
@@ -822,10 +832,10 @@ static char *mys_return_body_text;
 	SIGNED SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SPATIAL SQL_BIG_RESULT SQL_BUFFER_RESULT SQL_CACHE SQL_NO_CACHE SQL_SMALL_RESULT SQL_P 
     SESSION_USER SET SETS SETOF SHARE SHARED SHOW
     SQLEXCEPTION SQLSTATE STABLE STANDALONE_P
-	START STATEMENT STATISTICS STATS_AUTO_RECALC STATS_PERSISTENT STATS_SAMPLE_PAGES STATUS STD STDDEV STDIN STDOUT STORAGE STORED STRICT_P STRIP_P
+	START STARTING STATEMENT STATISTICS STATS_AUTO_RECALC STATS_PERSISTENT STATS_SAMPLE_PAGES STATUS STD STDDEV STDIN STDOUT STORAGE STORED STRICT_P STRIP_P
 	SUBPARTITION SUBPARTITIONS SUBSCRIPTION SUBSTR SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
 
-	TABLE TABLES TABLESAMPLE TABLESPACE TEMP TEMPLATE TEMPORARY TEMPTABLE TEXT_P THAN THEN
+	TABLE TABLES TABLESAMPLE TABLESPACE TEMP TEMPLATE TEMPORARY TEMPTABLE TERMINATED TEXT_P THAN THEN
 	TIES TIME TIMESTAMP TIMESTAMPADD TIMESTAMPDIFF TINYBLOB TINYINT TINYTEXT TO TRAILING TRANSACTION TRANSFORM
 	TREAT TRIGGER TRIGGERS TRIM TRUE_P
 	TRUNCATE TRUSTED TYPE_P TYPES_P
@@ -890,6 +900,21 @@ static char *mys_return_body_text;
  * a bit higher. The SCONST token is added here to resolve the ambiguity
  * in the above example.
  */
+
+/*
+ * MySQL SELECT ... INTO: the trailing INTO OUTFILE clause
+ * (select_no_parens_core into_outfile_clause) puts INTO into the lookahead
+ * set of the empty into_clause reduction, so after "SELECT a" the parser
+ * sees shift-INTO (opening the pre-FROM into_clause) competing with
+ * reduce-into_clause-to-empty.  Shifting is the correct resolution (that
+ * INTO always opens the INTO clause, trailing OUTFILE clauses only follow
+ * a completed select); declare it via precedence so the conflict is
+ * resolved rather than counted in %expect.  INTO must sit above the
+ * marker precedence used by the empty into_clause production.
+ */
+%nonassoc	INTO_OUTFILE_EMPTY
+%nonassoc	INTO
+
 %left       KEYWORD_USED_AS_IDENT
 %nonassoc   SCONST
 
@@ -16939,7 +16964,35 @@ select_with_parens:
  * clause.
  *	2002-08-28 bjm
  */
+/*
+ * select_no_parens_core holds the original query-expression productions.
+ * select_no_parens wraps them and optionally appends MySQL's trailing
+ * INTO OUTFILE/DUMPFILE clause, which attaches the marker IntoClause to
+ * the (leftmost) SelectStmt for mys_transformOptionalSelectInto() to
+ * lower into a CopyStmt.  The trailing clause is a separate, non-empty
+ * production, so it introduces no shift/reduce decisions: INTO is not in
+ * the lookahead set of the core productions (no rule places INTO after a
+ * complete select), hence every parser state reached with a pending
+ * trailing clause has exactly one action for the INTO token.
+ */
 select_no_parens:
+			select_no_parens_core
+				{ $$ = $1; }
+			| select_no_parens_core into_outfile_clause
+				{
+					SelectStmt *sel = (SelectStmt *) $1;
+
+					if (sel->intoClause != NULL)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("INTO clause specified more than once"),
+								 parser_errposition(@2)));
+					sel->intoClause = (IntoClause *) $2;
+					$$ = $1;
+				}
+		;
+
+select_no_parens_core:
 			simple_select						{ $$ = $1; }
 			| select_clause sort_clause
 				{
@@ -17233,8 +17286,155 @@ into_clause:
 					$$->viewQuery = NULL;
 					$$->skipData = false;
 				}
+			|
+			/* MySQL: SELECT ... INTO OUTFILE 'path' [CHARACTER SET x]
+			 * <export options> FROM ... (INTO before FROM).  The marker
+			 * IntoClause is lowered to a CopyStmt by
+			 * mys_transformOptionalSelectInto(); see into_outfile_clause
+			 * for the trailing-INTO form. */
+			INTO OUTFILE Sconst opt_outfile_charset opt_export_options
+				{
+					$$ = (IntoClause *) mys_make_outfile_clause(false, $3, $5, @1);
+				}
+			|
+			/* MySQL: SELECT ... INTO DUMPFILE 'path' -- single-row raw
+			 * binary export.  The syntax is accepted; execution rejects it
+			 * (mys_utility.c) because PostgreSQL's COPY binary framing is
+			 * not byte-compatible with MySQL's raw dump. */
+			INTO DUMPFILE Sconst
+				{
+					$$ = (IntoClause *) mys_make_outfile_clause(true, $3, NIL, @1);
+				}
+			| /*EMPTY*/ %prec INTO_OUTFILE_EMPTY
+				{ $$ = NULL; }
+		;
+
+/*
+ * MySQL's trailing INTO position: SELECT ... FROM ... [ORDER BY ...]
+ * [LIMIT ...] INTO OUTFILE 'path' ...  (INTO after the LIMIT clause, before
+ * any locking clause).  Produces the same marker IntoClause as the
+ * pre-FROM into_clause alternative above; mys_transformOptionalSelectInto()
+ * lowers either form to a server-side CopyStmt.
+ *
+ * The INTO-clause export options are carried as DefElems in the
+ * IntoClause's options list, under defnames that cannot collide with
+ * PostgreSQL's own COPY options:
+ *
+ *	"mysql_outfile"					"outfile" | "dumpfile" (kind marker)
+ *	"mysql_outfile_escaped"			ESCAPED BY character ('' disables escaping)
+ *	"mysql_outfile_lines_starting"	LINES STARTING BY string
+ *	"mysql_outfile_lines_terminated"	LINES TERMINATED BY string
+ *	"delimiter"						FIELDS TERMINATED BY string
+ *	"format"						"csv" when ENCLOSED BY was given
+ *	"quote"							ENCLOSED BY character (implies format csv)
+ */
+into_outfile_clause:
+			INTO OUTFILE Sconst opt_outfile_charset opt_export_options
+				{
+					$$ = mys_make_outfile_clause(false, $3, $5, @1);
+				}
+			| INTO DUMPFILE Sconst
+				{
+					$$ = mys_make_outfile_clause(true, $3, NIL, @1);
+				}
+		;
+
+/* MySQL: [CHARACTER SET | CHAR SET | CHARSET] charset_name -- accepted and ignored. */
+opt_outfile_charset:
+			character_set charset_name
+				{ $$ = NULL; }
 			| /*EMPTY*/
 				{ $$ = NULL; }
+		;
+
+opt_export_options:
+			/*EMPTY*/
+				{ $$ = NIL; }
+			| FIELDS field_options opt_lines_clause
+				{ $$ = list_concat($2, $3); }
+			| COLUMNS field_options opt_lines_clause
+				{ $$ = list_concat($2, $3); }
+			| LINES line_options
+				{ $$ = $2; }
+		;
+
+/*
+ * MySQL allows the FIELDS sub-options in any order and repetition
+ * (sql_yacc.yy builds them as an un-ordered list), so parse them as a
+ * list here; mys_prep_outfile_copy_stmt() (mys_utility.c) applies the
+ * semantics.
+ */
+field_options:
+			/*EMPTY*/
+				{ $$ = NIL; }
+			| field_option_list
+				{ $$ = $1; }
+		;
+
+field_option_list:
+			field_option
+				{ $$ = $1; }
+			| field_option_list field_option
+				{ $$ = list_concat($1, $2); }
+		;
+
+field_option:
+			TERMINATED BY Sconst
+				{
+					$$ = list_make1(makeDefElem("delimiter",
+												(Node *) makeString($3), @1));
+				}
+			| ENCLOSED BY Sconst
+				{
+					$$ = list_make2(makeDefElem("format",
+												(Node *) makeString("csv"), @1),
+									makeDefElem("quote",
+												(Node *) makeString($3), @1));
+				}
+			| OPTIONALLY ENCLOSED BY Sconst
+				{
+					$$ = list_make2(makeDefElem("format",
+												(Node *) makeString("csv"), @1),
+									makeDefElem("quote",
+												(Node *) makeString($4), @1));
+				}
+			| ESCAPED BY Sconst
+				{
+					$$ = list_make1(makeDefElem("mysql_outfile_escaped",
+												(Node *) makeString($3), @1));
+				}
+		;
+
+opt_lines_clause:
+			/*EMPTY*/
+				{ $$ = NIL; }
+			| LINES line_options
+				{ $$ = $2; }
+		;
+
+line_options:
+			opt_line_starting opt_line_terminated
+				{ $$ = list_concat($1, $2); }
+		;
+
+opt_line_starting:
+			STARTING BY Sconst
+				{
+					$$ = list_make1(makeDefElem("mysql_outfile_lines_starting",
+												(Node *) makeString($3), @1));
+				}
+			| /*EMPTY*/
+				{ $$ = NIL; }
+		;
+
+opt_line_terminated:
+			TERMINATED BY Sconst
+				{
+					$$ = list_make1(makeDefElem("mysql_outfile_lines_terminated",
+												(Node *) makeString($3), @1));
+				}
+			| /*EMPTY*/
+				{ $$ = NIL; }
 		;
 
 select_var_list:
@@ -22749,10 +22949,12 @@ unreserved_keyword:
 			| DOCUMENT_P
 			| DOMAIN_P
 			| DROP
+			| DUMPFILE
 			| DUPLICATE
             | DYNAMIC
 			| EACH
 			| ENABLE_P
+			| ENCLOSED
 			| ENCODING
 			| ENCRYPTED
 			| ENCRYPTION
@@ -22760,6 +22962,7 @@ unreserved_keyword:
 			| ENGINES
 			| ENUM_P
 			| ESCAPE
+			| ESCAPED
 			| EVENT
 			| EXCLUDE
 			| EXCLUDING
@@ -22824,6 +23027,7 @@ unreserved_keyword:
 			| LEAKPROOF
 			| LESS
 			| LEVEL
+			| LINES
 			| LIST
 			| LISTEN
 			| LOAD
@@ -22871,9 +23075,11 @@ unreserved_keyword:
 			| OPERATOR
 			| OPTIMIZE
 			| OPTION
+			| OPTIONALLY
 			| OPTIONS
 			| ORDINALITY
 			| OTHERS
+			| OUTFILE
 			| OVER
 			| OVERRIDING
 			| OWNED
@@ -22961,6 +23167,7 @@ unreserved_keyword:
 			| STABLE
 			| STANDALONE_P
 			| START
+			| STARTING
 			| STATEMENT
 			| STATISTICS
 			| STATS_AUTO_RECALC
@@ -22985,6 +23192,7 @@ unreserved_keyword:
 			| TEMPLATE
 			| TEMPORARY
 			| TEMPTABLE
+			| TERMINATED
             | THAN
 			| TIES
 			| TRANSACTION
@@ -23426,12 +23634,14 @@ bare_label_keyword:
 			| DOMAIN_P
 			| DOUBLE_P
 			| DROP
+			| DUMPFILE
 			| DUPLICATE
             | DYNAMIC
 			| EACH
 			| ELSE
             | ELSEIF
 			| ENABLE_P
+			| ENCLOSED
 			| ENCODING
 			| ENCRYPTED
 			| ENCRYPTION
@@ -23440,6 +23650,7 @@ bare_label_keyword:
 			| ENGINES
 			| ENUM_P
 			| ESCAPE
+			| ESCAPED
 			| EVENT
 			| EXCLUDE
 			| EXCLUDING
@@ -23531,6 +23742,7 @@ bare_label_keyword:
 			| LEVEL
 			| LIKE
 			| LINEAR
+			| LINES
 			| LIST
 			| LISTEN
 			| LOAD
@@ -23599,12 +23811,14 @@ bare_label_keyword:
 			| OPERATOR
 			| OPTIMIZE
 			| OPTION
+			| OPTIONALLY
 			| OPTIONS
 			| OR
 			| ORDINALITY
 			| OTHERS
 			| OUT_P
 			| OUTER_P
+			| OUTFILE
 			| OVERLAY
 			| OVERRIDING
 			| OWNED
@@ -23712,6 +23926,7 @@ bare_label_keyword:
 			| STABLE
 			| STANDALONE_P
 			| START
+			| STARTING
 			| STATEMENT
 			| STATISTICS
 			| STATS_AUTO_RECALC
@@ -23744,6 +23959,7 @@ bare_label_keyword:
 			| TEMPLATE
 			| TEMPORARY
 			| TEMPTABLE
+			| TERMINATED
 			| TEXT_P
 			| THAN
 			| THEN
@@ -24177,6 +24393,43 @@ mys_make_noop_stmt(int location)
 	rt->varSetStmt = (Node *) result;
 
 	return (Node *) rt;
+}
+
+/*
+ * Build the marker IntoClause for MySQL's SELECT ... INTO OUTFILE /
+ * INTO DUMPFILE.  Both the pre-FROM position (into_clause) and the
+ * trailing position (into_outfile_clause) produce this node; the export
+ * options ride along as DefElems in options under "mysql_outfile*" names
+ * (plus the standard COPY option names for what maps directly).
+ *
+ * mys_transformOptionalSelectInto() recognizes the marker and lowers the
+ * enclosing SelectStmt to a CopyStmt; mys_utility.c then applies MySQL's
+ * runtime semantics (file-exists check, unsupported option reports) and
+ * strips the private DefElems before DoCopy() validates the list.
+ */
+static Node *
+mys_make_outfile_clause(bool is_dumpfile, char *filename, List *options,
+						int location)
+{
+	IntoClause *n = makeNode(IntoClause);
+
+	n->rel = NULL;
+	n->colNames = NIL;
+	n->onCommit = ONCOMMIT_NOOP;
+	n->tableSpaceName = NULL;
+	n->viewQuery = NULL;
+	n->skipData = false;
+	n->options = lappend(options,
+						 makeDefElem("mysql_outfile",
+									 (Node *) makeString(is_dumpfile ?
+														 "dumpfile" :
+														 "outfile"),
+									 location));
+	n->options = lappend(n->options,
+						 makeDefElem("mysql_outfile_filename",
+									 (Node *) makeString(filename),
+									 location));
+	return (Node *) n;
 }
 
 /*

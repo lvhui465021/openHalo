@@ -1081,7 +1081,8 @@ endCommand(QueryCompletion *qc, CommandDest dest)
              (qc->commandTag == CMDTAG_DROP_PROCEDURE) || 
              (qc->commandTag == CMDTAG_DROP_SEQUENCE) || 
              (qc->commandTag == CMDTAG_DROP_TRIGGER) ||
-             (qc->commandTag == CMDTAG_SELECT_INTO))
+             (qc->commandTag == CMDTAG_SELECT_INTO) ||
+             (qc->commandTag == CMDTAG_COPY))
              { 
                  if (0 < preOrPostSQLNum) 
                  {

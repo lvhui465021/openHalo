@@ -54,6 +54,7 @@
  */
 
 #include <ctype.h>
+#include <sys/stat.h>
 
 #include "commands/mysql/mys_uservar.h"
 #include "access/genam.h"
@@ -992,6 +993,7 @@ static void mys_ProcessUtilitySlow(ParseState *pstate,
 static void mys_ExecDropStmt(DropStmt *stmt, bool isTopLevel);
 static void MysExecSetVariableStmt(ParseState *pstate, MysVariableSetStmt *parsetree, ParamListInfo params, bool isTopLevel);
 static void MysExecSelectIntoStmt(ParseState *pstate, MysSelectIntoStmt *parsetree, ParamListInfo params, QueryCompletion *qc);
+static void mys_prep_outfile_copy_stmt(CopyStmt *stmt);
 
 
 void
@@ -1189,6 +1191,9 @@ mys_standard_ProcessUtility(PlannedStmt *pstmt,
 		case T_CopyStmt:
 			{
 				uint64		processed;
+
+				/* MySQL SELECT ... INTO OUTFILE semantics (marker check) */
+				mys_prep_outfile_copy_stmt((CopyStmt *) parsetree);
 
 				DoCopy(pstate, (CopyStmt *) parsetree,
 					   pstmt->stmt_location, pstmt->stmt_len,
@@ -2720,6 +2725,151 @@ MysExecSetVariableStmt(ParseState *pstate, MysVariableSetStmt *parsetree, ParamL
     FreeQueryDesc(queryDesc);
 
     PopActiveSnapshot();
+}
+
+/*
+ * mys_prep_outfile_copy_stmt -
+ *	  Apply MySQL's runtime semantics to a CopyStmt produced by lowering
+ *	  SELECT ... INTO OUTFILE/DUMPFILE (mys_gram.y -> mys_analyze.c), then
+ *	  strip the private "mysql_outfile*" DefElems so DoCopy()'s option
+ *	  validation never sees them.  Native COPY statements carry no kind
+ *	  marker and pass through untouched.
+ *
+ * What MySQL expresses that COPY does not, and how it is handled here:
+ *
+ *  - MySQL refuses to overwrite an existing file (ER_FILE_EXISTS_ERROR,
+ *    1086); PostgreSQL's COPY TO silently truncates.  Checked here before
+ *    DoCopy() opens the file.
+ *  - INTO DUMPFILE writes single-row raw bytes with no framing;
+ *    PostgreSQL's COPY ... FORMAT binary has a wire header, per-tuple
+ *    field counts and padded widths, so a faithful mapping does not
+ *    exist.  Rejected rather than silently mis-translated.
+ *  - ESCAPED BY '' (MySQL: disable escaping) has no equivalent in
+ *    PostgreSQL's text or CSV mode.  Rejected.
+ *  - A non-default ESCAPED BY character is only expressible in CSV mode,
+ *    so it selects FORMAT csv plus the escape option.  MySQL's default
+ *    backslash is already what PG's text format uses, and stays text.
+ *  - LINES STARTING BY has no equivalent (PG rows always start cleanly).
+ *    Rejected.
+ *  - LINES TERMINATED BY is fixed at a newline in both PG text and CSV
+ *    modes; only "\n" is accepted.  Rejected otherwise.
+ */
+static void
+mys_prep_outfile_copy_stmt(CopyStmt *stmt)
+{
+	ListCell   *lc;
+	char	   *kind = NULL;
+	char	   *escaped_by = NULL;
+	char	   *lines_starting = NULL;
+	char	   *lines_terminated = NULL;
+	List	   *options = NIL;
+	bool		have_format = false;
+	struct stat st;
+
+	if (stmt->options == NIL)
+		return;
+
+	foreach(lc, stmt->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (IsA(def, DefElem) && strcmp(def->defname, "mysql_outfile") == 0)
+		{
+			kind = strVal(def->arg);
+			break;
+		}
+	}
+	if (kind == NULL)
+		return;					/* not an INTO OUTFILE lowering */
+
+	if (strcmp(kind, "dumpfile") == 0)
+	{
+		mysSetPendingMySQLErrno(1235);	/* ER_NOT_SUPPORTED_YET */
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("SELECT ... INTO DUMPFILE is not supported"),
+				 errdetail("INTO DUMPFILE writes single-row raw bytes, which PostgreSQL's COPY TO cannot reproduce."),
+				 errhint("Use SELECT ... INTO OUTFILE instead.")));
+	}
+
+	foreach(lc, stmt->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "mysql_outfile") == 0)
+			continue;			/* kind marker, consumed */
+		else if (strcmp(def->defname, "mysql_outfile_escaped") == 0)
+			escaped_by = strVal(def->arg);
+		else if (strcmp(def->defname, "mysql_outfile_lines_starting") == 0)
+			lines_starting = strVal(def->arg);
+		else if (strcmp(def->defname, "mysql_outfile_lines_terminated") == 0)
+			lines_terminated = strVal(def->arg);
+		else
+		{
+			if (strcmp(def->defname, "format") == 0)
+				have_format = true;
+			options = lappend(options, def);
+		}
+	}
+
+	if (lines_starting != NULL)
+	{
+		mysSetPendingMySQLErrno(1235);	/* ER_NOT_SUPPORTED_YET */
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("LINES STARTING BY is not supported for INTO OUTFILE"),
+				 errdetail("PostgreSQL's COPY always starts each line cleanly.")));
+	}
+
+	if (lines_terminated != NULL &&
+		strcmp(lines_terminated, "\n") != 0)
+	{
+		mysSetPendingMySQLErrno(1235);	/* ER_NOT_SUPPORTED_YET */
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("LINES TERMINATED BY is not supported for INTO OUTFILE"),
+				 errdetail("PostgreSQL's COPY terminates lines with a newline; only \"\\n\" is accepted here.")));
+	}
+
+	if (escaped_by != NULL)
+	{
+		if (escaped_by[0] == '\0')
+		{
+			/* MySQL: ESCAPED BY '' disables escaping; PG cannot. */
+			mysSetPendingMySQLErrno(1235);	/* ER_NOT_SUPPORTED_YET */
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ESCAPED BY '' is not supported for INTO OUTFILE"),
+					 errdetail("PostgreSQL's COPY cannot disable escaping.")));
+		}
+		else if (strcmp(escaped_by, "\\") != 0)
+		{
+			/* A custom escape character is only expressible in CSV mode. */
+			if (!have_format)
+				options = lappend(options,
+								  makeDefElem("format",
+											  (Node *) makeString("csv"), -1));
+			options = lappend(options,
+							  makeDefElem("escape",
+										  (Node *) makeString(escaped_by),
+										  -1));
+		}
+	}
+
+	/*
+	 * MySQL refuses to overwrite an existing file with INTO OUTFILE
+	 * (ER_FILE_EXISTS_ERROR, 1086); PostgreSQL's COPY TO would truncate
+	 * it.  Mirror MySQL's behavior before DoCopy() opens the file.
+	 */
+	if (stat(stmt->filename, &st) == 0)
+	{
+		mysSetPendingMySQLErrno(1086);	/* ER_FILE_EXISTS_ERROR */
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_FILE),
+				 errmsg("File '%s' already exists", stmt->filename)));
+	}
+
+	stmt->options = options;
 }
 
 static void

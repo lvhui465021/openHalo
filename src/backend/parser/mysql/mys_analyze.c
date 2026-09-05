@@ -95,6 +95,8 @@ typedef struct
 
 static Query *transformMysVariableSetStmt(ParseState *pstate, MysVariableSetStmt *stmt);
 static Query *transformMysSelectIntoStmt(ParseState *pstate, MysSelectIntoStmt *stmt);
+static bool mys_into_clause_is_outfile(IntoClause *into);
+static Node *mys_make_outfile_copy(Node *query, IntoClause *into);
 static Query *transformUpdateStmtInternal(ParseState *pstate, UpdateStmt *stmt);
 static List *retrieveSetTargets(List *totalTargetList, RangeVar *relation);
 static Node *mergeWhereClauseOnClause(Node *whereClause, Node *onClause);
@@ -107,8 +109,90 @@ static void rectifyHavingAlias(HTAB *aliases, Node *expr);
 
 
 /*
+ * mys_into_clause_is_outfile -
+ *	  Does this IntoClause carry the marker produced by mys_gram.y for
+ *	  MySQL's SELECT ... INTO OUTFILE / INTO DUMPFILE?  The marker is a
+ *	  "mysql_outfile" DefElem in the options list, a name PostgreSQL's
+ *	  own COPY option parser would reject, so it cannot be confused with
+ *	  a native COPY statement's options.
+ */
+static bool
+mys_into_clause_is_outfile(IntoClause *into)
+{
+	ListCell   *lc;
+
+	if (into == NULL || into->options == NIL)
+		return false;
+
+	foreach(lc, into->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (IsA(def, DefElem) && strcmp(def->defname, "mysql_outfile") == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * mys_make_outfile_copy -
+ *	  Lower MySQL's SELECT ... INTO OUTFILE/DUMPFILE (whose syntax the
+ *	  grammar encodes as the marker IntoClause "into") to a PostgreSQL
+ *
+ *		COPY (query) TO 'filename' WITH (...)
+ *
+ *	  statement.  Options that map straight onto COPY's own DefElems
+ *	  (delimiter/quote/format) are passed through; the private
+ *	  "mysql_outfile*" DefElems are consumed here or left for
+ *	  mys_utility.c, which applies MySQL's runtime semantics before
+ *	  invoking DoCopy().
+ */
+static Node *
+mys_make_outfile_copy(Node *query, IntoClause *into)
+{
+	CopyStmt   *copyStmt = makeNode(CopyStmt);
+	ListCell   *lc;
+
+	copyStmt->relation = NULL;
+	copyStmt->query = query;
+	copyStmt->attlist = NIL;
+	copyStmt->is_from = false;
+	copyStmt->is_program = false;
+	copyStmt->filename = NULL;
+	copyStmt->whereClause = NULL;
+	copyStmt->options = NIL;
+
+	foreach(lc, into->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "mysql_outfile") == 0)
+		{
+			/*
+			 * Keep the kind marker: mys_utility.c uses it to recognize
+			 * an INTO OUTFILE-derived CopyStmt (and to reject INTO
+			 * DUMPFILE at execution time).
+			 */
+			copyStmt->options = lappend(copyStmt->options, def);
+		}
+		else if (strcmp(def->defname, "mysql_outfile_filename") == 0)
+		{
+			copyStmt->filename = strVal(def->arg);
+		}
+		else
+		{
+			/* delimiter/format/quote and mysql_outfile_* option data */
+			copyStmt->options = lappend(copyStmt->options, def);
+		}
+	}
+
+	return (Node *) copyStmt;
+}
+
+/*
  * mys_transformOptionalSelectInto -
- *	  If SELECT has INTO, convert it to MysSelectIntoStmt.
+ *	  If SELECT has INTO, convert it to MysSelectIntoStmt (INTO variables)
+ *	  or to a CopyStmt (INTO OUTFILE / INTO DUMPFILE).
  *
  * The only thing we do here that we don't do in transformStmt() is to
  * convert SELECT ... INTO into MysSelectIntoStmt.  Since utility statements
@@ -122,27 +206,53 @@ mys_transformOptionalSelectInto(ParseState *pstate, Node *parseTree)
 	if (IsA(parseTree, SelectStmt))
 	{
 		SelectStmt *stmt = (SelectStmt *) parseTree;
+		IntoClause *topInto = stmt->intoClause;
 
-		/* If it's a set-operation tree, drill down to leftmost SelectStmt */
-		while (stmt && stmt->op != SETOP_NONE)
-			stmt = stmt->larg;
-		Assert(stmt && IsA(stmt, SelectStmt) && stmt->larg == NULL);
-
-		if (stmt->intoClause)
+		/*
+		 * MySQL's trailing INTO position (SELECT ... FROM ... [LIMIT n]
+		 * INTO OUTFILE 'f') attaches the marker IntoClause to the
+		 * outermost SelectStmt of the statement -- which for a set
+		 * operation is the set-operation node itself, and the export
+		 * then applies to the whole result, matching MySQL.  Check the
+		 * top-level node first; the pre-FROM position
+		 * (SELECT ... INTO OUTFILE 'f' FROM ...) is found on the
+		 * leftmost component below.
+		 */
+		if (topInto && mys_into_clause_is_outfile(topInto))
 		{
-			MysSelectIntoStmt *newStmt = makeNode(MysSelectIntoStmt);
-
-            newStmt->target = stmt->intoClause->colNames;
-            newStmt->expr = parseTree;
-
-			/*
-			 * Remove the intoClause from the SelectStmt.  This makes it safe
-			 * for transformSelectStmt to complain if it finds intoClause set
-			 * (implying that the INTO appeared in a disallowed place).
-			 */
 			stmt->intoClause = NULL;
+			parseTree = mys_make_outfile_copy(parseTree, topInto);
+		}
+		else
+		{
+			/* If it's a set-operation tree, drill down to leftmost SelectStmt */
+			while (stmt && stmt->op != SETOP_NONE)
+				stmt = stmt->larg;
+			Assert(stmt && IsA(stmt, SelectStmt) && stmt->larg == NULL);
 
-			parseTree = (Node *) newStmt;
+			if (stmt->intoClause && mys_into_clause_is_outfile(stmt->intoClause))
+			{
+				IntoClause *into = stmt->intoClause;
+
+				stmt->intoClause = NULL;
+				parseTree = mys_make_outfile_copy(parseTree, into);
+			}
+			else if (stmt->intoClause)
+			{
+				MysSelectIntoStmt *newStmt = makeNode(MysSelectIntoStmt);
+
+				newStmt->target = stmt->intoClause->colNames;
+				newStmt->expr = parseTree;
+
+				/*
+				 * Remove the intoClause from the SelectStmt.  This makes it safe
+				 * for transformSelectStmt to complain if it finds intoClause set
+				 * (implying that the INTO appeared in a disallowed place).
+				 */
+				stmt->intoClause = NULL;
+
+				parseTree = (Node *) newStmt;
+			}
 		}
 	}
 
