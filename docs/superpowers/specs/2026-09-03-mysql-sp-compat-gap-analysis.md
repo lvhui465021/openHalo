@@ -312,3 +312,52 @@ mysqltest 建库上下文缺失(1049)的语句后约 88%。距离旧口径 504 �
 **新构建陷阱**:plmysql 的 Makefile 不跟踪头文件依赖——改 plmysql.h 后必须
 `rm src/pl/plmysql/src/*.o` 全量重编,否则旧 .o 结构体错位导致随机崩溃;
 mys_utility.c(文本包含)同理需 rm tcop/utility.o。
+---
+
+## 9. 结果等价校准(2026-09-05,从"兼容"到"验证过的等价")
+
+方法论升级:回放工具此前只判断"语句报不报错";本轮把 mysqltest 的期望结果
+文件(.result)接进回放做**逐行 diff**——三份语料的 .result 与 .test 成对
+(sp/trigger/sp_trans),期望块以语句 echo 为锚点顺序对齐,字段级归一比较
+(NULL/数值容差/行序),负向用例单独核对错误码。工具:`full_replay.py` +
+`result_diff.py`(corpus/ 下,含 faithful mysqltest 分段语义的 v2 解析:
+delimiter 为整参数、引号感知、convert_to_format_v1 回显)。
+
+### 9.1 首轮校准统计(口径:全部可执行语句)
+
+| 语料 | 语句 | 对齐 | 精确匹配 | 真差异/失败 | 要点 |
+|---|---|---|---|---|---|
+| trigger.test | 71 CREATE + 执行 | 校准中 | — | — | (并行校准) |
+| sp.test | 2877 | 2787 | 1981+14 | 净差异 342(**逐字段一致率 71.6%**) | exec_failed 394(含两类 CALL 挂起)、warning_dump 48、null_diff 13、rows_missing 85、real_diff 243、expected_error_but_ok 35 |
+| sp_trans.test | 253 正向+16 负向 | 269/269 | 184 | mismatch 29(5 条仅列名)+执行失败 39 | 静默语义差异 31 条 |
+
+### 9.2 静默语义差异(不报错但行为与 MySQL 不同)——下一轮修复输入,按严重度
+
+1. **事务语义**:语句错误回滚整个事务(MySQL 只回滚出错语句);continue
+   handler 捕获的函数内多行 INSERT 整体回滚(MySQL 保留);打开事务中过程
+   体 ROLLBACK 报 invalid transaction termination。
+2. **2026-09-05 已修**:FUNCTION/TRIGGER 内显式事务语句改回创建期 1422
+   (.result 证据),SAVEPOINT 族允许(a799a06e0e);SELECT INTO OUTFILE
+   已实现(700b72d2eb,COPY TO 映射,39/39)。
+3. **FUNCTION/PROCEDURE 命名空间**:同名 proc/func 冲突 1304(MySQL 两
+   命名空间独立)。
+4. **handler 内 SELECT 局部变量返回 NULL**(触发次数正确,值错)。
+5. **显示差异**(值全对):`count(*)`→`count` 列名、`@var`→`?column?`、
+   `show procedure status` 的 Definer/时间戳/字符集元数据、InnoDB 大小写。
+6. **过宽松**(35 条 MySQL 报错而 openHalo 成功)与 INSERT IGNORE 截断处
+   理(1406 vs 1265)、max_heap_table_size 未知、SET 子查询右值等。
+
+### 9.3 引擎非确定性缺陷(待专项排查)
+
+`SELECT <存储函数>()` 报 1105 "List syntax is invalid"(函数体访问基
+表),同一代码两个会话 283 vs 0 条、按历史原样重放不能复现——疑似
+catalog/plan 缓存或锁相关的会话态问题。CALL 挂起两类(ip(200) 素数循环
+超 15s、proc_33618 连锁锁超时;KILL QUERY 不支持,走
+pg_terminate_backend)。
+
+### 9.4 比较器(v2)状态
+
+v0 的三大对齐缺陷(echo 空白未归一、--meta 粘连、--error 块污染)已修;
+v2 采用 faithful mysqltest 语义(delimiter 整参数如 `;//`、引号感知扫描、
+v1 回显归一)后 sp.test not_found=0。已知待补:--echo 输出行、Warnings:
+转储(56 处)、多结果集表头、replace_column/replace_regex。
