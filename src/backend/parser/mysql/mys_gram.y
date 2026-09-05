@@ -177,6 +177,8 @@ static RawStmt *makeRawStmt(Node *stmt, int stmt_location);
 static void updateRawStmtEnd(RawStmt *rs, int end_location);
 static Node *makeColumnRef(char *colname, List *indirection,
 						   int location, core_yyscan_t yyscanner);
+static Node *mys_make_match_against(List *colNames, Node *query, int mode,
+									int location, core_yyscan_t yyscanner);
 static Node *makeTypeCast(Node *arg, TypeName *typename, int location);
 static Node *makeStringConst(char *str, int location);
 static Node *makeStringConstCast(char *str, int location, TypeName *typename);
@@ -320,7 +322,11 @@ static char *mys_return_body_text;
 /* +1: DROP TRIGGER <ident> where "IF" is both the start of IF EXISTS and a
  * legal name token; default shift resolves it as IF EXISTS, matching MySQL
  * where IF is reserved. */
-%expect 53
+%expect 54
+/* %expect was 53; the +1 is MATCH '(' name_list ')' AGAINST ... : when the
+ * parser sees AGAINST after a MATCH(...) expression the shift into the
+ * production is what MySQL itself relies on (AGAINST otherwise only occurs
+ * as an unreserved identifier, which the reduce arm covers). */
 /*
  * 53: ENUM_P/SET as a typed name followed by '(' (ENUM('a','b')) competes
  * with ENUM as a bare unreserved keyword; default shift makes the type
@@ -712,6 +718,7 @@ static char *mys_return_body_text;
 %type <list>	ColQualList
 %type <node>	ColConstraint ColConstraintElem ConstraintAttr
 %type <ival>	key_actions key_delete key_match key_update key_action
+%type <ival>	ag_match_against_opt
 %type <ival>	ConstraintAttributeSpec ConstraintAttributeElem
 //%type <str>		ExistingIndex
 
@@ -851,7 +858,7 @@ static char *mys_return_body_text;
     MEDIUMBLOB MEDIUMINT MEDIUMTEXT MEMORY METHOD MERGE MID MINUTE_P
     MINVALUE MIN_ROWS MOD MODE MODIFIES MODIFY MONTH_P MOVE
 
-	MAPPING MATCH MATERIALIZED MAXVALUE MAX_ROWS 
+	MAPPING MATCH AGAINST EXPANSION MATERIALIZED MAXVALUE MAX_ROWS 
 	NAME_P NAMES NATIONAL NATURAL NCHAR NEW NEXT NFC NFD NFKC NFKD NO NONE
 	NORMALIZE NORMALIZED
 	NOT NOTHING NOTIFY NOTNULL NOW NOWAIT NULL_P NULLIF
@@ -21029,8 +21036,21 @@ func_expr_windowless:
 /*
  * Special expressions that are considered to be functions.
  */
+ag_match_against_opt:
+			/* EMPTY */							{ $$ = 0; }
+			| IN_P NATURAL LANGUAGE MODE			{ $$ = 0; }
+			| IN_P BOOLEAN_P MODE					{ $$ = 1; }
+			| WITH QUERY EXPANSION				{ $$ = 2; }
+			| IN_P NATURAL LANGUAGE MODE WITH QUERY EXPANSION
+												{ $$ = 2; }
+		;
+
 func_expr_common_subexpr:
-            YEAR_P '(' a_expr ')'
+			MATCH '(' name_list ')' AGAINST '(' a_expr ag_match_against_opt ')'
+				{
+					$$ = mys_make_match_against($3, $7, $8, @1, yyscanner);
+				}
+            | YEAR_P '(' a_expr ')'
                 {
                     $$ = (Node *) makeFuncCall(list_make1(makeString("year")),
                                                list_make1($3),
@@ -22911,6 +22931,7 @@ unreserved_keyword:
 			| ADD_P
 			| ADMIN
 			| AFTER
+			| AGAINST
 			| AGGREGATE
             | ALGORITHM
 			| ALSO
@@ -23013,6 +23034,7 @@ unreserved_keyword:
 			| EXCLUDING
 			| EXCLUSIVE
 			| EXECUTE
+			| EXPANSION
 			| EXPLAIN
 			| EXPRESSION
 			| EXTENSION
@@ -23557,6 +23579,7 @@ bare_label_keyword:
 			| ADD_P
 			| ADMIN
 			| AFTER
+			| AGAINST
 			| AGGREGATE
             | ALGORITHM
 			| ALL
@@ -23702,6 +23725,7 @@ bare_label_keyword:
 			| EXCLUSIVE
 			| EXECUTE
 			| EXISTS
+			| EXPANSION
 			| EXPLAIN
 			| EXPRESSION
 			| EXTENSION
@@ -24123,6 +24147,47 @@ updateRawStmtEnd(RawStmt *rs, int end_location)
 
 	/* OK, update length of RawStmt */
 	rs->stmt_len = end_location - rs->stmt_location;
+}
+
+/*
+ * MySQL MATCH(col1, col2, ...) AGAINST(query [options]): build a call to
+ * mysql.match_against(doc, query, mode).  The "doc" is the searched text --
+ * MySQL indexes each column separately and a row matches when any column
+ * hits, so columns are concatenated with spaces (NULL columns act as empty
+ * strings, like concat_ws).  mode: 0 natural language, 1 boolean, 2 natural
+ * with query expansion.  The score-vs-predicate split happens later: the
+ * grammar emits the float8 score function, and the analyzer rewrites
+ * MATCH..AGAINST occurrences inside WHERE/HAVING quals to the boolean
+ * variant (score > 0) before transforming them.
+ */
+static Node *
+mys_make_match_against(List *colNames, Node *query, int mode, int location,
+						   core_yyscan_t yyscanner)
+{
+	List	   *docArgs = NIL;
+	ListCell   *lc;
+	Node	   *doc;
+	FuncCall   *fn;
+
+	foreach(lc, colNames)
+	{
+		char	   *nm = strVal(lfirst(lc));
+
+		docArgs = lappend(docArgs,
+						  makeColumnRef(nm, NIL, location, yyscanner));
+	}
+	docArgs = lcons(makeStringConst(" ", location), docArgs);
+	doc = (Node *) makeFuncCall(list_make2(makeString("pg_catalog"),
+										   makeString("concat_ws")),
+								docArgs,
+								COERCE_EXPLICIT_CALL, location);
+
+	fn = makeNode(FuncCall);
+	fn->funcname = list_make2(makeString("mysql"), makeString("match_against"));
+	fn->args = list_make3(doc, query, makeIntConst(mode, location));
+	fn->funcformat = COERCE_EXPLICIT_CALL;
+	fn->location = location;
+	return (Node *) fn;
 }
 
 static Node *

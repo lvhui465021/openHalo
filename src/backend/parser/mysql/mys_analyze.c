@@ -59,6 +59,68 @@
 #include "catalog/pg_depend.h"
 #include "catalog/pg_proc.h"
 #include "nodes/nodeFuncs.h"
+
+
+/*
+ * MySQL MATCH..AGAINST emits a call to mysql.match_against(), which
+ * returns the float8 relevance score.  In WHERE/HAVING (boolean) position
+ * the same syntax is a predicate, so before the qualifier is transformed
+ * every match_against call is renamed to the boolean variant
+ * (mysql.match_against_bool(), score > 0).  The rename happens on the raw
+ * parse tree, before transformWhereClause() resolves function names.
+ * Nested subqueries inside the qualifier are not rewritten here.
+ */
+static Node *
+mysRenameWhereMatch(Node *qual)
+{
+	Node	   *node;
+	ListCell   *lc;
+
+	if (qual == NULL)
+		return NULL;
+	if (IsA(qual, FuncCall))
+	{
+		FuncCall   *fn = (FuncCall *) qual;
+
+		if (list_length(fn->funcname) == 2 &&
+			strcmp(strVal(linitial(fn->funcname)), "mysql") == 0 &&
+			strcmp(strVal(lsecond(fn->funcname)), "match_against") == 0)
+		{
+			lc = list_nth_cell(fn->funcname, 1);
+			lc->ptr_value = makeString("match_against_bool");
+		}
+		foreach(lc, fn->args)
+			lfirst(lc) = mysRenameWhereMatch((Node *) lfirst(lc));
+	}
+	else if (IsA(qual, A_Expr))
+	{
+		A_Expr	   *a = (A_Expr *) qual;
+
+		a->lexpr = mysRenameWhereMatch(a->lexpr);
+		a->rexpr = mysRenameWhereMatch(a->rexpr);
+	}
+	else if (IsA(qual, BoolExpr))
+	{
+		BoolExpr   *b = (BoolExpr *) qual;
+
+		foreach(lc, b->args)
+			lfirst(lc) = mysRenameWhereMatch((Node *) lfirst(lc));
+	}
+	else if (IsA(qual, NullTest))
+	{
+		NullTest   *n = (NullTest *) qual;
+
+		n->arg = mysRenameWhereMatch(n->arg);
+	}
+	else if (IsA(qual, BooleanTest))
+	{
+		BooleanTest *bt = (BooleanTest *) qual;
+
+		bt->arg = mysRenameWhereMatch(bt->arg);
+	}
+	return qual;
+}
+
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/mysql/mys_parsenodes.h"
@@ -484,7 +546,7 @@ transformUpdateStmtInternal(ParseState *pstate, UpdateStmt *stmt)
     nsitem->p_lateral_only = false;
     nsitem->p_lateral_ok = true;
 
-    qual = transformWhereClause(pstate, stmt->whereClause,
+    qual = transformWhereClause(pstate, mysRenameWhereMatch(stmt->whereClause),
                                 EXPR_KIND_WHERE, "WHERE");
 
     qry->returningList = transformReturningList(pstate, stmt->returningList);
@@ -957,7 +1019,7 @@ mys_transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 
 
 	/* transform WHERE */
-	qual = transformWhereClause(pstate, stmt->whereClause,
+	qual = transformWhereClause(pstate, mysRenameWhereMatch(stmt->whereClause),
 								EXPR_KIND_WHERE, "WHERE");
 
 	/* initial processing of HAVING clause is much like WHERE clause */
@@ -965,7 +1027,7 @@ mys_transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
     {
         rectifyHavingClause(stmt);
     }
-	qry->havingQual = transformWhereClause(pstate, stmt->havingClause,
+	qry->havingQual = transformWhereClause(pstate, mysRenameWhereMatch(stmt->havingClause),
                                            EXPR_KIND_HAVING, "HAVING");
 
 	/*
@@ -1515,7 +1577,7 @@ mys_transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	nsitem->p_lateral_only = false;
 	nsitem->p_lateral_ok = true;
 
-	qual = transformWhereClause(pstate, stmt->whereClause,
+	qual = transformWhereClause(pstate, mysRenameWhereMatch(stmt->whereClause),
 								EXPR_KIND_WHERE, "WHERE");
 
     qry->sortClause = transformSortClause(pstate,
