@@ -1027,6 +1027,8 @@ standard_exec_simple_query(const char *query_string)
 	CommandDest dest = whereToSendOutput;
 	MemoryContext oldcontext;
 	List	   *parsetree_list;
+	bool		mysql_stmt_subxact;
+	bool		mysql_stmt_failed;
 	ListCell   *parsetree_item;
 	bool		save_log_statement_stats = log_statement_stats;
 	bool		was_logged = false;
@@ -1107,6 +1109,8 @@ standard_exec_simple_query(const char *query_string)
 	/*
 	 * Run through the raw parsetree(s) and process each one.
 	 */
+	mysql_stmt_subxact = false;
+	mysql_stmt_failed = false;
     stmtsNum = list_length(parsetree_list);
     stmtIndex = 0;
 	foreach(parsetree_item, parsetree_list)
@@ -1187,6 +1191,23 @@ standard_exec_simple_query(const char *query_string)
 		/* If we got a cancel signal in parsing or prior command, quit */
 		CHECK_FOR_INTERRUPTS();
 
+		/*
+		 * MySQL semantics: inside a transaction block a failing statement
+		 * rolls back only itself -- the transaction and everything before
+		 * it stay usable.  Wrap the statement in an internal subtransaction;
+		 * on error the catch below rolls it back, reports the error via the
+		 * MySQL protocol and continues with the next statement.
+		 */
+		mysql_stmt_subxact =
+			(MyProcPort != NULL &&
+			 nodeTag(MyProcPort->protocol_handler) == T_MySQLProtocol &&
+			 IsTransactionBlock() &&
+			 !IsTransactionExitStmt(parsetree->stmt));
+		if (mysql_stmt_subxact)
+			BeginInternalSubTransaction(NULL);
+
+		PG_TRY();
+		{
 		/*
 		 * Set up a snapshot if parse analysis/planning will need one.
 		 */
@@ -1315,6 +1336,15 @@ standard_exec_simple_query(const char *query_string)
 
 		PortalDrop(portal, false);
 
+		/*
+		 * Release the statement subtransaction BEFORE finish_xact_command():
+		 * CommitTransactionCommand() would otherwise commit/pop the
+		 * subtransaction itself and desynchronize the implicit-block book
+		 * keeping (see the MySQL statement-level-rollback comment above).
+		 */
+		if (mysql_stmt_subxact)
+			ReleaseCurrentSubTransaction();
+
 		if (lnext(parsetree_list, parsetree_item) == NULL)
 		{
 			/*
@@ -1365,7 +1395,43 @@ standard_exec_simple_query(const char *query_string)
 			MyProcPort->protocol_handler->end_command(&qc, dest);
 		else
 			EndCommand(&qc, dest, false);
-		
+
+		}
+		PG_CATCH();
+		{
+			if (mysql_stmt_subxact &&
+				MyProcPort != NULL &&
+				nodeTag(MyProcPort->protocol_handler) == T_MySQLProtocol &&
+				IsTransactionBlock())
+			{
+				/*
+				 * Report the error via the MySQL protocol, undo only this
+				 * statement's work (its internal subtransaction), and move
+				 * on to the next statement in the transaction.
+				 */
+				EmitErrorReport();
+				debug_query_string = NULL;
+				FlushErrorState();
+				MemoryContextSwitchTo(MessageContext);
+				RollbackAndReleaseCurrentSubTransaction();
+				if (per_parsetree_context)
+				{
+					MemoryContextDelete(per_parsetree_context);
+					per_parsetree_context = NULL;
+				}
+				disable_statement_timeout();
+				mysql_stmt_failed = true;
+			}
+			else
+				PG_RE_THROW();
+		}
+		PG_END_TRY();
+
+		if (mysql_stmt_failed)
+		{
+			mysql_stmt_failed = false;
+			continue;			/* next statement, transaction intact */
+		}
 
 		/* Now we may drop the per-parsetree context, if one was created. */
 		if (per_parsetree_context)
