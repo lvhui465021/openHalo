@@ -325,11 +325,11 @@ delimiter 为整参数、引号感知、convert_to_format_v1 回显)。
 
 ### 9.1 首轮校准统计(口径:全部可执行语句)
 
-| 语料 | 语句 | 对齐 | 精确匹配 | 真差异/失败 | 要点 |
+| 语料 | 语句 | 对齐 | 一致(match 类) | 真差异/失败 | 要点 |
 |---|---|---|---|---|---|
-| trigger.test | 71 CREATE + 执行 | 校准中 | — | — | (并行校准) |
-| sp.test | 2877 | 2787 | 1981+14 | 净差异 342(**逐字段一致率 71.6%**) | exec_failed 394(含两类 CALL 挂起)、warning_dump 48、null_diff 13、rows_missing 85、real_diff 243、expected_error_but_ok 35 |
-| sp_trans.test | 253 正向+16 负向 | 269/269 | 184 | mismatch 29(5 条仅列名)+执行失败 39 | 静默语义差异 31 条 |
+| trigger.test | 1359 正向+129 负向 | 1359/1359 | **1123 = 82.6%**(精确 1067/数值 2/行序 1/仅列名 36/仅警告块 17) | exec_failed 107 + mismatch 129;负向 neg_ok 50/neg_wrong 57/silent_ok 22 | 见 §9.5 触发器专项差异 |
+| sp.test | 2877 | 2787 | 1981+14(**逐字段一致率 71.6%**) | 净差异 342:exec_failed 394(含 CALL 挂起)、warning_dump 48、null_diff 13、rows_missing 85、real_diff 243、expected_error_but_ok 35 | 见 §9.3 非确定性缺陷 |
+| sp_trans.test | 253 正向+16 负向 | 269/269 | 184 | mismatch 29(5 条仅列名)+执行失败 39;负向 neg_ok 7/wrong 7/silent 2 | 静默语义差异 31 条 |
 
 ### 9.2 静默语义差异(不报错但行为与 MySQL 不同)——下一轮修复输入,按严重度
 
@@ -361,3 +361,27 @@ v0 的三大对齐缺陷(echo 空白未归一、--meta 粘连、--error 块污�
 v2 采用 faithful mysqltest 语义(delimiter 整参数如 `;//`、引号感知扫描、
 v1 回显归一)后 sp.test not_found=0。已知待补:--echo 输出行、Warnings:
 转储(56 处)、多结果集表头、replace_column/replace_regex。
+### 9.5 触发器专项差异(trigger.test 校准,逐条最小复现已验证)
+
+1. **触发器体内错误被吞**:`SET @x=5/0` 在 AFTER INSERT 触发器里,MySQL 置
+   @x=NULL 并报 1365,openHalo 判语句失败但 @x 保留旧值;触发器内 `IF()`
+   因 @参数类型解析失败**静默失效**,@a 累积链(期望 "2:3:4:5" 得空串)
+   整体断掉(约 40 处)。
+2. **REPLACE 不触发 DELETE 触发器**:命中重复键时 MySQL 会 DELETE 旧行
+   并 fire BEFORE/AFTER DELETE;openHalo 替换了行但触发器未 fire
+   (20+ 处)。
+3. **CALL p(NEW.x) 的 OUT/INOUT 不回写**:UPDATE 后 MySQL 得 5、openHalo
+   得 11(NEW 传入即丢失)。
+4. **触发器内语句失败的主行效果**:MySQL(MyISAM)保留已执行行效果,
+   openHalo 回滚整个语句(11 处);UPDATE IGNORE 的 fire 语义亦不同。
+5. **SHOW WARNINGS 恒空**:INSERT IGNORE 的 Note、sql_mode 弃用 Warning
+   均不产生(17 处 warnings_diff 根因)。
+
+### 9.6 首轮等价校准总结
+
+三份语料合计 ~4,500 条可执行语句完成 .result 逐行比对;一致率
+trigger 82.6% / sp 71.6% / sp_trans ~75%,锚点对齐率 100%(v2 faithful
+解析)。差异构成高度集中:exec_failed 类 ~500(其中 CALL 挂起、基表访
+问函数 1105 为两大簇)、语句级 vs 事务级回滚语义、触发器 fire 边界
+(REPLACE/IGNORE)、OUT/INOUT 回写、显示层(列名/警告)。这些即"从兼容
+到验证过的等价"的精确工作量清单,按 §9.2/§9.5 逐项排期。
