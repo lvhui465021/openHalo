@@ -387,9 +387,17 @@ v1 回显归一)后 sp.test not_found=0。已知待补:--echo 输出行、Warnin
    MySQL 标量形状(@@session.warning_count/error_count 恒一行);
    IGNORE 吞掉的错误降级为 Warning 行。回归 test_042。注意:语料里
    INSERT IGNORE 的 1265/1062 等行仍缺,因为重写层在跳过行时不产生
-   任何 ereport——该部分属重写/执行器,不在诊断区修复范围内;NOTICE
-   级事件在 client_min_messages=error 下到不了 hook,MySQL Note 行
-   需相应事件改发 WARNING 或后续单独处理。
+   任何 ereport——该部分属重写/执行器,不在诊断区修复范围内。
+   **2026-09-05 第二轮**:CREATE TABLE IF NOT EXISTS 命中已存在表现已
+   记录 Note 1050(mys 该路径 NOTICE 改 WARNING 以越过
+   client_min_messages=error 的抑制,adapter 按 errno 降回 "Note"——这
+   个模式即 NOTICE 事件的通用解法);显式 SET sql_mode 翻转
+   NO_AUTO_CREATE_USER 记录 Warning 3090(MySQL 5.7 异或规则,消息逐字
+   一致);SHOW WARNINGS/ERRORS 支持 [LIMIT [offset,] count];直传
+   MySQL errno 的报错点不再被 convertErrorCode 误映射为 1105(新增
+   sendErrPacketDirect;注:数值区间判别不可行——PG 6-bit MAKE_SQLSTATE
+   使 0A000==1088 与 MySQL errno 空间重叠)。INSERT IGNORE 逐行
+   1265/1062 仍缺(重写层不产生逐行事件),DO 语句协议形状已修。
 
 ### 9.6 首轮等价校准总结
 
