@@ -99,6 +99,18 @@ extern int autoCommit;
 extern uint64 mys_sqlMode;
 extern int default_week_format;
 
+/* MySQL diagnostics-area support (implemented in adapter.c): a per-connection
+ * condition queue behind SHOW WARNINGS / SHOW ERRORS / SHOW COUNT(*).
+ * Warning/Note conditions arrive through the emit_log_hook; Error conditions
+ * are appended by sendErrPacket().  Cleared at the start of each ordinary
+ * statement from processCommand(). */
+extern void	mysClearWarnings(void);
+extern int	mysGetWarningCount(void);
+extern int	mysGetErrorCount(void);
+extern const char *mysGetWarningLevel(int i);
+extern int	mysGetWarningCode(int i);
+extern const char *mysGetWarningMessage(int i);
+
 /* Textual sql_mode as SET by the client; NULL means untouched (MySQL 5.7
  * default spelling).  Used to record routine CREATE-time sql_mode snapshots.
  */

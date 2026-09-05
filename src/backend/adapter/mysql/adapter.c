@@ -180,9 +180,254 @@ static char systemVarName[1024];
 static char systemVarVal[1024];
 static int sessionStateChanged = 0;
 static List *sockPaths = NIL;
-static char *warnErrLevel = "Error";
+
+/* SHOW WARNINGS/ERRORS column-definition packets (Level/Code/Message) */
+static const char warn_packet_col_count[] = { 0x03 };
+static const char warn_packet_col_count_one[] = { 0x01 };  /* scalar SHOW COUNT(*) */
+static const char warn_packet_col_level[] = {
+    0x03, 0x64, 0x65, 0x66,
+    0x00, 0x00, 0x00, 0x05, 0x4c, 0x65, 0x76, 0x65,
+    0x6c, 0x00, 0x0c, 0x21, 0x00, 0x15, 0x00, 0x00,
+    0x00, 0xfd, 0x01, 0x00, 0x1f, 0x00, 0x00
+};
+static const char warn_packet_col_code[] = {
+    0x03, 0x64, 0x65, 0x66,
+    0x00, 0x00, 0x00, 0x04, 0x43, 0x6f, 0x64, 0x65,
+    0x00, 0x0c, 0x3f, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x03, 0xa1, 0x00, 0x00, 0x00, 0x00
+};
+static const char warn_packet_col_msg[] = {
+    0x03, 0x64, 0x65, 0x66,
+    0x00, 0x00, 0x00, 0x07, 0x4d, 0x65, 0x73, 0x73,
+    0x61, 0x67, 0x65, 0x00, 0x0c, 0x21, 0x00, 0x00,
+    0x06, 0x00, 0x00, 0xfd, 0x01, 0x00, 0x1f, 0x00,
+    0x00
+};
+
+typedef enum
+{
+    MYS_DIAG_NONE = 0,          /* not a diagnostics statement */
+    MYS_DIAG_SHOW_WARNINGS,     /* SHOW WARNINGS */
+    MYS_DIAG_SHOW_ERRORS,       /* SHOW ERRORS */
+    MYS_DIAG_COUNT_WARNINGS,    /* SHOW COUNT(*) WARNINGS */
+    MYS_DIAG_COUNT_ERRORS       /* SHOW COUNT(*) ERRORS */
+} MysDiagKind;
 static int warnErrCode;
 static char warnErrMsg[1024];
+
+/*
+ * MySQL diagnostics-area support (SHOW WARNINGS / SHOW ERRORS / SHOW
+ * COUNT(*) WARNINGS|ERRORS).  MySQL keeps a per-statement condition list;
+ * the area is cleared at the start of each ordinary statement and read --
+ * without being cleared -- by the diagnostics statements.  Warning/Note
+ * conditions are captured here from the emit_log_hook as PostgreSQL reports
+ * them; Error conditions are appended by sendErrPacket(), which knows the
+ * final MySQL errno (converting in the hook would consume a pending SIGNAL
+ * MYSQL_ERRNO before sendErrPacket() got to it).  Entries live in their own
+ * long-lived memory context so they survive transaction aborts;
+ * mysClearWarnings() resets the context, freeing every entry and its
+ * strings at once.
+ */
+#define MYS_WARNING_QUEUE_MAX 64	/* MySQL max_error_count default */
+
+typedef struct MysWarningEntry
+{
+	const char *level;			/* "Error" / "Warning" / "Note" (literal) */
+	int			code;			/* MySQL errno for the client row */
+	char	   *message;		/* pstrdup'd into mysWarningContext */
+} MysWarningEntry;
+
+static MemoryContext mysWarningContext = NULL;
+static MysWarningEntry mysWarningQueue[MYS_WARNING_QUEUE_MAX];
+static int	mysWarningCount = 0;
+
+/* previous emit_log_hook, for chained invocation */
+static emit_log_hook_type mys_prev_emit_log_hook = NULL;
+
+static void mysEnqueueCondition(const char *level, int code, const char *message);
+static void mys_emit_log_hook_impl(ErrorData *edata);
+static MysDiagKind mysDiagStmtKind(const char *stmt);
+static MysWarningEntry *mysGetWarning(int i);
+
+/*
+ * Core enqueue: append one condition to the diagnostics area, copying the
+ * message into mysWarningContext.
+ */
+static void
+mysEnqueueCondition(const char *level, int code, const char *message)
+{
+	MemoryContext oldcxt;
+
+	if (mysWarningContext == NULL)
+		mysWarningContext = AllocSetContextCreate(TopMemoryContext,
+												  "MySQL warning queue",
+												  ALLOCSET_SMALL_SIZES);
+	if (mysWarningCount >= MYS_WARNING_QUEUE_MAX)
+		return;					/* MySQL caps conditions too (max_error_count) */
+
+	oldcxt = MemoryContextSwitchTo(mysWarningContext);
+	mysWarningQueue[mysWarningCount].level = level;
+	mysWarningQueue[mysWarningCount].code = code;
+	mysWarningQueue[mysWarningCount].message = pstrdup(message);
+	mysWarningCount++;
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * emit_log_hook implementation.  Chained: the previous hook (if another
+ * extension installed one) is invoked first.  Only MySQL-protocol sessions
+ * collect, and only sub-ERROR reports: ERROR conditions are appended by
+ * sendErrPacket() instead (see the comment above).
+ */
+static void
+mys_emit_log_hook_impl(ErrorData *edata)
+{
+	if (mys_prev_emit_log_hook)
+		(*mys_prev_emit_log_hook) (edata);
+
+	if (MyProcPort == NULL ||
+		nodeTag(MyProcPort->protocol_handler) != T_MySQLProtocol)
+		return;
+
+	if (edata->elevel >= ERROR)
+		return;					/* handled by sendErrPacket() */
+
+	if (edata->elevel != WARNING && edata->elevel != NOTICE &&
+		edata->elevel != INFO)
+		return;
+
+	mysEnqueueCondition((edata->elevel == WARNING) ? "Warning" : "Note",
+						convertErrorCode(edata->sqlerrcode),
+						edata->message ? edata->message : "");
+}
+
+/*
+ * Reset the diagnostics area (start of every ordinary statement).
+ */
+void
+mysClearWarnings(void)
+{
+	if (mysWarningContext != NULL)
+		MemoryContextReset(mysWarningContext);
+	mysWarningCount = 0;
+}
+
+/*
+ * @@session.warning_count: total conditions stored -- Error, Warning and
+ * Note rows all count, matching MySQL.
+ */
+int
+mysGetWarningCount(void)
+{
+	return mysWarningCount;
+}
+
+/*
+ * @@session.error_count / SHOW ERRORS: number of stored Error conditions.
+ */
+int
+mysGetErrorCount(void)
+{
+	int			i;
+	int			n = 0;
+
+	for (i = 0; i < mysWarningCount; i++)
+	{
+		if (strcmp(mysWarningQueue[i].level, "Error") == 0)
+			n++;
+	}
+	return n;
+}
+
+const char *
+mysGetWarningLevel(int i)
+{
+	MysWarningEntry *e = mysGetWarning(i);
+	return e ? e->level : "Warning";
+}
+
+int
+mysGetWarningCode(int i)
+{
+	MysWarningEntry *e = mysGetWarning(i);
+	return e ? e->code : 0;
+}
+
+const char *
+mysGetWarningMessage(int i)
+{
+	MysWarningEntry *e = mysGetWarning(i);
+	return e ? e->message : "";
+}
+
+MysWarningEntry *
+mysGetWarning(int i)
+{
+	if (i < 0 || i >= mysWarningCount)
+		return NULL;
+	return &mysWarningQueue[i];
+}
+
+/*
+ * Classify the leading statement of stmt as one of the MySQL diagnostics
+ * statements -- SHOW WARNINGS, SHOW ERRORS, SHOW COUNT(*) WARNINGS/ERRORS.
+ * These read the current diagnostics area, so the statement-start clear
+ * must skip them.  Anything else, including other SHOW forms and trailing
+ * clauses such as LIMIT, returns MYS_DIAG_NONE.
+ */
+static MysDiagKind
+mysDiagStmtKind(const char *stmt)
+{
+	const char *p = stmt;
+
+	while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r'))
+		p++;
+	if (strncasecmp(p, "show", 4) != 0)
+		return MYS_DIAG_NONE;
+	p += 4;
+	while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r'))
+		p++;
+	if (strncasecmp(p, "warnings", 8) == 0)
+	{
+		p += 8;
+		while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r') || (*p == ';'))
+			p++;
+		return (*p == '\0') ? MYS_DIAG_SHOW_WARNINGS : MYS_DIAG_NONE;
+	}
+	if (strncasecmp(p, "errors", 6) == 0)
+	{
+		p += 6;
+		while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r') || (*p == ';'))
+			p++;
+		return (*p == '\0') ? MYS_DIAG_SHOW_ERRORS : MYS_DIAG_NONE;
+	}
+	if (strncasecmp(p, "count", 5) == 0)
+	{
+		p += 5;
+		while ((*p == ' ') || (*p == '\t'))
+			p++;
+		if ((p[0] != '(') || (p[1] != '*') || (p[2] != ')'))
+			return MYS_DIAG_NONE;
+		p += 3;
+		while ((*p == ' ') || (*p == '\t'))
+			p++;
+		if (strncasecmp(p, "warnings", 8) == 0)
+		{
+			p += 8;
+			while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r') || (*p == ';'))
+				p++;
+			return (*p == '\0') ? MYS_DIAG_COUNT_WARNINGS : MYS_DIAG_NONE;
+		}
+		if (strncasecmp(p, "errors", 6) == 0)
+		{
+			p += 6;
+			while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r') || (*p == ';'))
+				p++;
+			return (*p == '\0') ? MYS_DIAG_COUNT_ERRORS : MYS_DIAG_NONE;
+		}
+	}
+	return MYS_DIAG_NONE;
+}
 static Oid informationSchemaID = InvalidOid;
 static int systemVarType = 0;
 static bool isInformationSchema = false;
@@ -416,7 +661,8 @@ static int createServerPort(int family,
 static int lockAFUnix(const char *unixSocketDir, const char *unixSocketPath);
 static int setupAFUnix(const char *sockPath);
 static void closeSocket(int code, Datum arg);
-static void simulateShowWarnErrReturn(void);
+static void simulateShowWarnErrReturn(MysDiagKind diagKind);
+static void sendScalarDiagColDefPacket(const char *colName);
 static void simulateShowFieldsReturn(void);
 static bool simulateChecksumTable(char *stmt);
 static bool simulateAnalyzeCheckOptimizeRepairTable(char *stmt);
@@ -498,6 +744,9 @@ sendOKPacket(void)
     char *payloadBuf;
     int payloadLen;
 
+    /* MySQL: the OK packet carries the current diagnostics-area count, and
+     * clients use it to decide whether to fetch SHOW WARNINGS. */
+    warnings = mysGetWarningCount();
     netTransceiver->getWriteBufForHeaderPayload(&payloadBuf);
     serverStatus = sessionStateChanged | moreResultsFlag | autoCommit | inTransactionFlag;
     payloadLen = assembleOKPacketPayload(serverStatus, 
@@ -702,6 +951,17 @@ authenticate(Port *port, const char **username)
 
     initErrorCodeHashTable();
 
+    /*
+     * Chain our emit_log_hook for SHOW WARNINGS/ERRORS collection.  The
+     * errno-conversion hash table must exist first: queue entries convert
+     * the PostgreSQL errcode to a MySQL errno at enqueue time.
+     */
+    if (mys_prev_emit_log_hook == NULL)
+    {
+        mys_prev_emit_log_hook = emit_log_hook;
+        emit_log_hook = mys_emit_log_hook_impl;
+    }
+
     ClientAuthInProgress = true;
 
     payloadBuf = NULL;
@@ -833,6 +1093,16 @@ sendErrorMessage(ErrorData *edata)
         }
         else 
         {
+            /*
+             * IGNORE swallowed the error (INSERT IGNORE & friends): MySQL
+             * demotes such failures to Warning conditions visible to SHOW
+             * WARNINGS.  No earlier convertErrorCode() ran for this error,
+             * so a SIGNAL-chosen MYSQL_ERRNO (if any) is still pending and
+             * is consumed exactly once here, as sendErrPacket() would have.
+             */
+            mysEnqueueCondition("Warning",
+                                convertErrorCode(edata->sqlerrcode),
+                                edata->message ? edata->message : "");
             sendOKPacket();
         }
 
@@ -1298,6 +1568,29 @@ processCommand(int *firstChar, StringInfo inBuf)
     isExtendCloseStmt = false;
     isResetConnStmt = false;
 
+    /*
+     * MySQL diagnostics-area semantics: every new statement starts with a
+     * clean area -- except the diagnostics statements (SHOW WARNINGS, SHOW
+     * ERRORS, SHOW COUNT(*) WARNINGS/ERRORS), which must still see the
+     * previous statement's conditions.  Clear here, at the single entry
+     * point through which every COM_QUERY/COM_STMT_EXECUTE passes and
+     * before rectifyCommand()/parsing, so parse-time warnings are
+     * retained and both internally-handled and pass-through statements are
+     * covered.
+     */
+    if (*firstChar == MYS_REQ_QUERY)
+    {
+        if (mysDiagStmtKind(inBuf->data + inBuf->offset) == MYS_DIAG_NONE)
+            mysClearWarnings();
+    }
+    else if (*firstChar == MYS_REQ_EXECUTE)
+    {
+        /* A prepared SHOW WARNINGS/ERRORS/COUNT never survives
+         * COM_STMT_PREPARE, so an EXECUTE can never be a diagnostics
+         * statement: always start a fresh area. */
+        mysClearWarnings();
+    }
+
     if (*firstChar == MYS_REQ_EXECUTE)
     {
         isExtendExeStmt = true;
@@ -1431,9 +1724,11 @@ processCommand(int *firstChar, StringInfo inBuf)
         }
         else if (0 == strncasecmp(stmt, "show", 4))
         {
+            MysDiagKind diagKind;
             secondWord = stmt + 5;
             skipSpaces(&secondWord);
 
+            diagKind = mysDiagStmtKind(stmt);
             if (0 == strncasecmp(secondWord, "grants", 6))
             {
                 simulateShowGrants();
@@ -1441,16 +1736,16 @@ processCommand(int *firstChar, StringInfo inBuf)
                 warnErrCode = 0;
                 return 1;
             }
-            else if ((0 == strncasecmp(secondWord, "warnings", 8)) || 
-                     (0 == strncasecmp(secondWord, "errors", 6)))
+            else if (diagKind != MYS_DIAG_NONE)
             {
-                simulateShowWarnErrReturn();
+                simulateShowWarnErrReturn(diagKind);
                 return 1;
             }
-            else 
+            else
             {
+                /* any other SHOW form (tables/variables/...): let the
+                 * MySQL grammar handle it */
                 addAdditionalSQL(inBuf);
-
                 warnErrCode = 0;
                 *firstChar = HALO_REQ_QUERY;
                 return 0;
@@ -1666,6 +1961,7 @@ processCommand(int *firstChar, StringInfo inBuf)
     }
     else if (*firstChar == MYS_REQ_RESET_CONN)
     {
+        mysClearWarnings();		/* fresh-connection state, like MySQL */
         resetConnection(inBuf);
         *firstChar = HALO_REQ_QUERY;
         warnErrCode = 0;
@@ -4076,47 +4372,112 @@ closeSocket(int code, Datum arg)
 
 
 static void 
-simulateShowWarnErrReturn(void)
+sendScalarDiagColDefPacket(const char *colName)
 {
-    char packet_bytes01[] = {
-        0x03
+    static const char fixed[] = {
+        0x0c,                    /* length of the fixed-length fields */
+        0x3f, 0x00,              /* character set: binary */
+        0x14, 0x00, 0x00, 0x00,  /* column length */
+        0x08,                    /* column type: LONGLONG */
+        0x00, 0x00,              /* flags */
+        0x00,                    /* decimals */
+        0x00, 0x00               /* filler */
     };
-    char packet_bytes02[] = {
-        0x03, 0x64, 0x65, 0x66,
-        0x00, 0x00, 0x00, 0x05, 0x4c, 0x65, 0x76, 0x65,
-        0x6c, 0x00, 0x0c, 0x21, 0x00, 0x15, 0x00, 0x00,
-        0x00, 0xfd, 0x01, 0x00, 0x1f, 0x00, 0x00
-    };
-    char packet_bytes03[] = {
-        0x03, 0x64, 0x65, 0x66,
-        0x00, 0x00, 0x00, 0x04, 0x43, 0x6f, 0x64, 0x65,
-        0x00, 0x0c, 0x3f, 0x00, 0x04, 0x00, 0x00, 0x00,
-        0x03, 0xa1, 0x00, 0x00, 0x00, 0x00
-    };
-    char packet_bytes04[] = {
-        0x03, 0x64, 0x65, 0x66,
-        0x00, 0x00, 0x00, 0x07, 0x4d, 0x65, 0x73, 0x73,
-        0x61, 0x67, 0x65, 0x00, 0x0c, 0x21, 0x00, 0x00,
-        0x06, 0x00, 0x00, 0xfd, 0x01, 0x00, 0x1f, 0x00,
-        0x00
-    };
-    netTransceiver->writePacketHeaderPayloadNoFlush(&packet_bytes01[0], (sizeof(packet_bytes01) / sizeof(packet_bytes01[0])));
-    netTransceiver->writePacketHeaderPayloadNoFlush(&packet_bytes02[0], (sizeof(packet_bytes02) / sizeof(packet_bytes02[0])));
-    netTransceiver->writePacketHeaderPayloadNoFlush(&packet_bytes03[0], (sizeof(packet_bytes03) / sizeof(packet_bytes03[0])));
-    netTransceiver->writePacketHeaderPayloadNoFlush(&packet_bytes04[0], (sizeof(packet_bytes04) / sizeof(packet_bytes04[0])));
+    char *payloadBuf = NULL;
+    int payloadLen = 0;
+
+    netTransceiver->getWriteBufForHeaderPayload(&payloadBuf);
+    payloadLen += assembleLenencString("def", payloadBuf + payloadLen);
+    payloadLen += assembleLenencString("", payloadBuf + payloadLen);
+    payloadLen += assembleLenencString("", payloadBuf + payloadLen);
+    payloadLen += assembleLenencString("", payloadBuf + payloadLen);
+    payloadLen += assembleLenencString(colName, payloadBuf + payloadLen);
+    payloadLen += assembleLenencString("", payloadBuf + payloadLen);
+    memcpy(payloadBuf + payloadLen, fixed, sizeof(fixed));
+    payloadLen += sizeof(fixed);
+    netTransceiver->writePacketHeaderNoFlush(payloadLen);
+    netTransceiver->finishWriteToBufNoFlush(payloadLen);
+}
+
+/*
+ * Serve the four diagnostics statements from the current diagnostics area:
+ *   SHOW WARNINGS             -- every stored condition (Error/Warning/Note)
+ *   SHOW ERRORS               -- stored Error conditions only
+ *   SHOW COUNT(*) WARNINGS    -- scalar @@session.warning_count (always one row)
+ *   SHOW COUNT(*) ERRORS      -- scalar @@session.error_count (always one row)
+ * Serving these leaves the area intact, matching MySQL.
+ */
+static void 
+simulateShowWarnErrReturn(MysDiagKind diagKind)
+{
+    int     i;
+    int     total = mysGetWarningCount();
+
+    if (diagKind == MYS_DIAG_COUNT_WARNINGS || diagKind == MYS_DIAG_COUNT_ERRORS)
+    {
+        int         count;
+        char        numBuf[16];
+        char       *payloadBuf = NULL;
+        int         payloadLen = 0;
+        const char *colName;
+
+        if (diagKind == MYS_DIAG_COUNT_ERRORS)
+        {
+            colName = "@@session.error_count";
+            count = mysGetErrorCount();
+        }
+        else
+        {
+            colName = "@@session.warning_count";
+            count = total;
+        }
+        snprintf(numBuf, sizeof(numBuf), "%d", count);
+
+        /* single-column result set: one column definition, one row */
+        netTransceiver->writePacketHeaderPayloadNoFlush(&warn_packet_col_count_one[0],
+            sizeof(warn_packet_col_count_one) / sizeof(warn_packet_col_count_one[0]));
+        sendScalarDiagColDefPacket(colName);
+        sendEOFPacketNoFlush();
+
+        netTransceiver->getWriteBufForHeaderPayload(&payloadBuf);
+        payloadLen += assembleLenencString(numBuf, payloadLen + payloadBuf);
+        netTransceiver->writePacketHeaderNoFlush(payloadLen);
+        netTransceiver->finishWriteToBufNoFlush(payloadLen);
+
+        sendEOFPacketFlush();
+        return;
+    }
+
+    /* column definitions: Level / Code / Message */
+    netTransceiver->writePacketHeaderPayloadNoFlush(&warn_packet_col_count[0],
+        sizeof(warn_packet_col_count) / sizeof(warn_packet_col_count[0]));
+    netTransceiver->writePacketHeaderPayloadNoFlush(&warn_packet_col_level[0],
+        sizeof(warn_packet_col_level) / sizeof(warn_packet_col_level[0]));
+    netTransceiver->writePacketHeaderPayloadNoFlush(&warn_packet_col_code[0],
+        sizeof(warn_packet_col_code) / sizeof(warn_packet_col_code[0]));
+    netTransceiver->writePacketHeaderPayloadNoFlush(&warn_packet_col_msg[0],
+        sizeof(warn_packet_col_msg) / sizeof(warn_packet_col_msg[0]));
     sendEOFPacketNoFlush();
 
-    if (0 < warnErrCode)
+    for (i = 0; i < total; i++)
     {
-        char warnErrCodeBuf[16];
-        char *payloadBuf = NULL;
-        int payloadLen = 0;
+        const char *level = mysGetWarningLevel(i);
+        int         code;
+        const char *msg;
+        char        codeBuf[16];
+        char       *payloadBuf = NULL;
+        int         payloadLen = 0;
 
-        snprintf(warnErrCodeBuf, sizeof(warnErrCodeBuf), "%d", warnErrCode);
+        if (diagKind == MYS_DIAG_SHOW_ERRORS && strcmp(level, "Error") != 0)
+            continue;
+
+        code = mysGetWarningCode(i);
+        msg = mysGetWarningMessage(i);
+        snprintf(codeBuf, sizeof(codeBuf), "%d", code);
         netTransceiver->getWriteBufForHeaderPayload(&payloadBuf);
-        payloadLen += assembleLenencString(warnErrLevel, (payloadBuf + payloadLen));
-        payloadLen += assembleLenencString(warnErrCodeBuf, (payloadBuf + payloadLen));
-        payloadLen += assembleLenencString(warnErrMsg, (payloadBuf + payloadLen));
+        payloadLen += assembleLenencString(level, payloadBuf + payloadLen);
+        payloadLen += assembleLenencString(codeBuf, payloadBuf + payloadLen);
+        payloadLen += assembleLenencString(msg, payloadBuf + payloadLen);
         netTransceiver->writePacketHeaderNoFlush(payloadLen);
         netTransceiver->finishWriteToBufNoFlush(payloadLen);
     }
@@ -5389,6 +5750,7 @@ sendOKPacketSpecialInfo(const char *info)
     char *payloadBuf = NULL;
     int payloadLen = 0;
 
+    warnings = mysGetWarningCount();
     serverStatus = sessionStateChanged | moreResultsFlag | autoCommit | inTransactionFlag;
     netTransceiver->getWriteBufForHeaderPayload(&payloadBuf);
     payloadLen = assembleOKPacketPayload(serverStatus, warnings, payloadBuf);
@@ -5402,6 +5764,7 @@ sendEOFPacketFlush()
     char *payloadBuf = NULL;
     int payloadLen = 0;
 
+    warnings = mysGetWarningCount();
     serverStatus = sessionStateChanged | moreResultsFlag | autoCommit | inTransactionFlag;
     netTransceiver->getWriteBufForHeaderPayload(&payloadBuf);
     payloadLen = assembleEOFPacketPayload(warnings, serverStatus, payloadBuf);
@@ -5417,6 +5780,7 @@ sendEOFPacketNoFlush()
         char *payloadBuf = NULL;
         int payloadLen = 0;
 
+        warnings = mysGetWarningCount();
         serverStatus = sessionStateChanged | moreResultsFlag | autoCommit | inTransactionFlag;
         netTransceiver->getWriteBufForHeaderPayload(&payloadBuf);
         payloadLen = assembleEOFPacketPayload(warnings, serverStatus, payloadBuf);
@@ -5441,6 +5805,16 @@ sendErrPacket(int errCode, const char *errMsg, const char *sqlState)
     msgLen = msgLen > 1023 ? 1023 : msgLen;
     memcpy(warnErrMsg, errMsg, msgLen);
     warnErrMsg[msgLen] = '\0';
+
+    /*
+     * Append the Error condition to the diagnostics area (SHOW WARNINGS /
+     * SHOW ERRORS / SHOW COUNT(*)).  The errno is final here -- including
+     * any SIGNAL-chosen MYSQL_ERRNO, which the convertErrorCode() call
+     * above just consumed -- so this is the only place Error rows are
+     * captured (the emit_log_hook deliberately skips ERROR-level reports).
+     */
+    mysEnqueueCondition("Error", mySQLErrorCode, warnErrMsg);
+
     sqlStateMarker = 0;
 
     /* Canonical MySQL SQLSTATE when one exists; SIGNAL-chosen custom
