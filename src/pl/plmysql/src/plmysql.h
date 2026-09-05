@@ -595,6 +595,13 @@ typedef struct PLMySQL_stmt_commit
 	int			lineno;
 	unsigned int stmtid;
 	bool		chain;
+	/*
+	 * MySQL allows COMMIT/ROLLBACK inside a stored FUNCTION or trigger's
+	 * BODY at CREATE time and rejects them only when the statement actually
+	 * runs (ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG); the flag records that this
+	 * routine's kind forbids execution.
+	 */
+	bool		disallowed;
 } PLMySQL_stmt_commit;
 
 /*
@@ -607,6 +614,7 @@ typedef struct PLMySQL_stmt_savepoint
 	int			lineno;
 	unsigned int stmtid;
 	char	   *name;
+	bool		disallowed;	/* same CREATE-vs-run split as COMMIT above */
 } PLMySQL_stmt_savepoint;
 
 /*
@@ -618,6 +626,7 @@ typedef struct PLMySQL_stmt_rollback
 	int			lineno;
 	unsigned int stmtid;
 	bool		chain;
+	bool		disallowed;	/* same CREATE-vs-run split as COMMIT above */
 } PLMySQL_stmt_rollback;
 
 /*

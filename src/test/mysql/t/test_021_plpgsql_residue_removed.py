@@ -99,31 +99,35 @@ def run(cluster):
     # ---------------------------------------------------------- 1422：函数内禁止
     with cluster.mysql(dbname="public") as conn:
         with conn.cursor() as cur:
+            # MySQL 5.7 accepts the CREATE (body check happens at run
+            # time); the 1422 must come from calling the function.
             cur.execute("DROP FUNCTION IF EXISTS t021_commit_errno")
+            cur.execute("""CREATE FUNCTION t021_commit_errno()
+                RETURNS INT BEGIN ROLLBACK; RETURN 1; END""")
             try:
-                cur.execute("""CREATE FUNCTION t021_commit_errno()
-                    RETURNS INT BEGIN ROLLBACK; RETURN 1; END""")
+                cur.execute("SELECT t021_commit_errno()")
+                cur.fetchall()
+                raise AssertionError(
+                    "ROLLBACK inside a stored function unexpectedly ran")
             except pymysql.MySQLError as exc:
                 assert exc.args[0] == 1422, exc
-            else:
-                raise AssertionError(
-                    "ROLLBACK was accepted inside a stored function")
 
-    # 触发器内同样禁止 COMMIT/ROLLBACK
+    # 触发器内禁止 COMMIT/ROLLBACK——与 MySQL 一致的语义:CREATE 成功
+    # (body 检查在执行期),触发点火时该语句报 1422。
     _ddl(cluster, "DROP TABLE IF EXISTS t021_trg_t")
     _ddl(cluster, "CREATE TABLE t021_trg_t (v INT)")
     with cluster.mysql(dbname="public") as conn:
         with conn.cursor() as cur:
             cur.execute("DROP TRIGGER IF EXISTS t021_commit_trg")
+            cur.execute("""CREATE TRIGGER t021_commit_trg
+                BEFORE INSERT ON t021_trg_t FOR EACH ROW
+                BEGIN COMMIT; END""")
             try:
-                cur.execute("""CREATE TRIGGER t021_commit_trg
-                    BEFORE INSERT ON t021_trg_t FOR EACH ROW
-                    BEGIN COMMIT; END""")
+                cur.execute("INSERT INTO t021_trg_t VALUES (1)")
+                raise AssertionError(
+                    "COMMIT inside a trigger body unexpectedly ran")
             except pymysql.MySQLError as exc:
                 assert exc.args[0] == 1422, exc
-            else:
-                raise AssertionError(
-                    "COMMIT was accepted inside a trigger body")
 
     # ------------------------------------- COMMIT/ROLLBACK 是合法的 PROCEDURE 语法
     #

@@ -259,6 +259,7 @@ static CreateTrigStmt *mys_finish_trigger_stmt(bool replace, char *definer,
 										   List *events,
 										   CreateTrigStmt *stmt);
 static bool mys_optlist_pins_foreign_language(List *options);
+static Node *mys_make_noop_stmt(int location);
 static Node *mys_make_maintenance_select(const char *funcname,
 												 List *rel_list);
 static char *mys_check_role_id_name(char *name);
@@ -272,8 +273,12 @@ static char *mys_return_body_text;
 /* +1: DROP TRIGGER <ident> where "IF" is both the start of IF EXISTS and a
  * legal name token; default shift resolves it as IF EXISTS, matching MySQL
  * where IF is reserved. */
-%expect 52
+%expect 53
 /*
+ * 53: ENUM_P/SET as a typed name followed by '(' (ENUM('a','b')) competes
+ * with ENUM as a bare unreserved keyword; default shift makes the type
+ * form win, which is the intended parse.
+ *
  * Up from 48 for the routine-body leader additions: RESET as a single-
  * statement routine body competes with PostgreSQL's RESET function
  * characteristic (three states, default = body wins), and FLUSH TABLES
@@ -758,7 +763,8 @@ static char *mys_return_body_text;
 	CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR CYCLE
 
 	DATA_P DATABASE DATABASES DATE DATETIME DAY_P DEALLOCATE DEC DECIMAL_P DECLARE DEFAULT DEFAULTS 
-	DEFERRABLE DEFERRED DEFINER DELAY_KEY_WRITE DELAYED DELETE_P DELIMITER DELIMITERS DEPENDS DEPTH DESC DESCRIBE
+	DEFERRABLE DEFERRED DEFINER DELAY_KEY_WRITE DELAYED DELETE_P DELIMITER DELIMITERS DEPENDS DEPTH DESC
+	DES_KEY_FILE DESCRIBE
 	DETACH DETERMINISTIC DICTIONARY DIRECTORY DISABLE_P DISCARD DISK DISTINCT DISTINCTROW DIV DO DOCUMENT_P DOMAIN_P
 	DOUBLE_P DROP DUPLICATE DYNAMIC
 
@@ -771,7 +777,7 @@ static char *mys_return_body_text;
 
 	GENERATED GET GLOBAL GRANT GRANTED GREATEST GROUP_P GROUPING GROUPS GROUP_CONCAT
 
-	HANDLER HASH HAVING HEADER_P HIGH_PRIORITY HOLD HOUR_P
+	HANDLER HASH HAVING HEADER_P HIGH_P HIGH_PRIORITY HOLD HOSTS HOUR_P
 
 	IDENTIFIED IDENTITY_P IF_P IGNORE ILIKE IMMEDIATE IMMUTABLE IMPLICIT_P IMPORT_P IN_P INCLUDE
 	INCLUDING INCREMENT INDEX INDEXES INHERIT INHERITS INITIALLY INLINE_P
@@ -787,10 +793,10 @@ static char *mys_return_body_text;
 	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED LOGS LONG LONGBLOB
     LONGTEXT LOOP LOW_PRIORITY 
 
-	MAPPING MATCH MATERIALIZED MAXVALUE MAX_ROWS 
     MEDIUMBLOB MEDIUMINT MEDIUMTEXT MEMORY METHOD MERGE MID MINUTE_P
     MINVALUE MIN_ROWS MOD MODE MODIFIES MODIFY MONTH_P MOVE
 
+	MAPPING MATCH MATERIALIZED MAXVALUE MAX_ROWS 
 	NAME_P NAMES NATIONAL NATURAL NCHAR NEW NEXT NFC NFD NFKC NFKD NO NONE
 	NORMALIZE NORMALIZED
 	NOT NOTHING NOTIFY NOTNULL NOW NOWAIT NULL_P NULLIF
@@ -803,8 +809,8 @@ static char *mys_return_body_text;
 	PACK_KEYS PARALLEL PARSER PARTIAL PARTITION PARTITIONS PASSING PASSWORD PLACING PLANS PLUGINS POLICY
 	POSITION PRECEDES PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
 	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROCESSLIST PROGRAM PUBLICATION
+	QUERY QUICK QUOTE
 
-    QUICK QUOTE
 
 	RANGE READ READS REAL REASSIGN RECHECK RECURSIVE REF REFERENCES REFERENCING
 	REFRESH REGEXP REINDEX RELATIVE_P RELEASE RENAME REPAIR REPEAT REPEATABLE REPLACE REPLICA 
@@ -813,8 +819,8 @@ static char *mys_return_body_text;
 
 	SAVEPOINT SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT SELETC SEPARATOR SEQUENCE SEQUENCES
 	SERIALIZABLE SERVER SESSION 
-    SESSION_USER SET SETS SETOF SHARE SHARED SHOW
 	SIGNED SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SPATIAL SQL_BIG_RESULT SQL_BUFFER_RESULT SQL_CACHE SQL_NO_CACHE SQL_SMALL_RESULT SQL_P 
+    SESSION_USER SET SETS SETOF SHARE SHARED SHOW
     SQLEXCEPTION SQLSTATE STABLE STANDALONE_P
 	START STATEMENT STATISTICS STATS_AUTO_RECALC STATS_PERSISTENT STATS_SAMPLE_PAGES STATUS STD STDDEV STDIN STDOUT STORAGE STORED STRICT_P STRIP_P
 	SUBPARTITION SUBPARTITIONS SUBSCRIPTION SUBSTR SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
@@ -825,7 +831,7 @@ static char *mys_return_body_text;
 	TRUNCATE TRUSTED TYPE_P TYPES_P
 
 	UESCAPE UNBOUNDED UNCOMMITTED UNDEFINED UNENCRYPTED UNICODE UNION UNIQUE UNKNOWN
-	UNLISTEN UNLOCK UNLOGGED UNSIGNED UNTIL UPDATE USE USER USING
+	UNLISTEN UNLOCK UNLOGGED UNSIGNED UNTIL UPDATE USE USER_RESOURCES USER USING
     UTC_DATE UTC_TIME UTC_TIMESTAMP
 
 	VACUUM VALID VALIDATE VALIDATOR VALUE_P VALUES VARBINARY VARCHAR VARIABLES VARIADIC VARYING
@@ -4067,29 +4073,7 @@ LockTables:
 MysFlushStmt:
 			FLUSH flush_option_list
 				{
-					MysVariableSetStmt *rt;
-					SelectStmt *result;
-					ResTarget *target;
-					Node *funcCall;
-
-					rt = makeNode(MysVariableSetStmt);
-					result = makeNode(SelectStmt);
-					target = makeNode(ResTarget);
-					target->name = NULL;
-					target->indirection = NIL;
-					funcCall = (Node *) makeFuncCall(
-						list_make2(makeString(pstrdup("mysql")),
-								   makeString(pstrdup("set_system_session_variable"))),
-						list_make2(makeStringConst(pstrdup("halo_mysql_dummy_stmt_return_ok"), -1),
-								   makeStringConst(pstrdup("1"), -1)),
-						COERCE_EXPLICIT_CALL, @1);
-					target->val = funcCall;
-					target->location = -1;
-					result->targetList = lappend(result->targetList,
-												 ((Node *) target));
-					rt->varSetStmt = (Node *) result;
-
-					$$ = (Node *) rt;
+					$$ = (Node *) mys_make_noop_stmt(@1);
 				}
 		;
 
@@ -4104,6 +4088,7 @@ flush_option:
 			| ENGINE LOGS
 			| PRIVILEGES
 			| STATUS
+			| QUERY CACHE
 			| TABLE opt_flush_tables_payload
 			| TABLES opt_flush_tables_payload
 		;
@@ -18499,6 +18484,23 @@ opt_array_bounds:
 SimpleTypename:
 			GenericType								{ $$ = $1; }
 			| Numeric								{ $$ = $1; }
+			| ENUM_P '(' opt_enum_val_list ')'
+				{
+					/*
+					 * MySQL's ENUM column/variable type.  openHalo has no
+					 * enum semantic type yet; lower it to varchar so routines
+					 * and tables carrying one still work (value validation is
+					 * not enforced -- documented limitation).
+					 */
+					$$ = makeTypeName(pstrdup("varchar"));
+					$$->location = @1;
+				}
+			| SET '(' opt_enum_val_list ')'
+				{
+					/* MySQL's SET type; lowered to varchar like ENUM above. */
+					$$ = makeTypeName(pstrdup("varchar"));
+					$$->location = @1;
+				}
             | BINARY                                {
                 //$$ = SystemTypeName("bytea");
                 $$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
@@ -22737,6 +22739,7 @@ unreserved_keyword:
 			| DEPENDS
 			| DEPTH
             | DESCRIBE
+			| DES_KEY_FILE
 			| DETACH
 			| DICTIONARY
             | DIRECTORY
@@ -22787,6 +22790,7 @@ unreserved_keyword:
 			| HASH
 			| HEADER_P
 			| HOLD
+			| HOSTS
 			| HOUR_P
 			| IDENTIFIED
 			| IDENTITY_P
@@ -22896,6 +22900,7 @@ unreserved_keyword:
 			| PROCESSLIST
 			| PROGRAM
 			| PUBLICATION
+			| QUERY
 			| QUICK
 			| QUOTE
 			| RANGE
@@ -23000,6 +23005,7 @@ unreserved_keyword:
 			| UNLOGGED
 			| UNTIL
 			| UPDATE
+			| USER_RESOURCES
 			| VACUUM
 			| VALID
 			| VALIDATE
@@ -23406,6 +23412,7 @@ bare_label_keyword:
 			| DEPTH
 			| DESC
 			| DESCRIBE
+			| DES_KEY_FILE
 			| DETACH
 			| DICTIONARY
             | DIRECTORY
@@ -23473,6 +23480,7 @@ bare_label_keyword:
 			| HASH
 			| HEADER_P
 			| HOLD
+			| HOSTS
 			| IDENTIFIED
 			| IDENTITY_P
 			| IF_P
@@ -23627,6 +23635,7 @@ bare_label_keyword:
 			| PROCESSLIST
 			| PROGRAM
 			| PUBLICATION
+			| QUERY
 			| QUICK
 			| QUOTE
 			| RANGE
@@ -23770,6 +23779,7 @@ bare_label_keyword:
 			| UNTIL
 			| UPDATE
 			| USER
+			| USER_RESOURCES
 			| USING
             | UTC_DATE
             | UTC_TIME
@@ -24135,6 +24145,38 @@ mys_make_maintenance_select(const char *funcname, List *rel_list)
 											  (Node *) result, (Node *) sel);
 	}
 	return (Node *) result;
+}
+
+/*
+ * A no-op statement that returns OK: "SELECT * FROM
+ * mysql.set_system_session_variable('halo_mysql_dummy_stmt_return_ok','1')",
+ * the same trick the LOCK/UNLOCK TABLES lowering uses.
+ */
+static Node *
+mys_make_noop_stmt(int location)
+{
+	MysVariableSetStmt *rt;
+	SelectStmt *result;
+	ResTarget *target;
+	Node *funcCall;
+
+	rt = makeNode(MysVariableSetStmt);
+	result = makeNode(SelectStmt);
+	target = makeNode(ResTarget);
+	target->name = NULL;
+	target->indirection = NIL;
+	funcCall = (Node *) makeFuncCall(
+		list_make2(makeString(pstrdup("mysql")),
+				   makeString(pstrdup("set_system_session_variable"))),
+		list_make2(makeStringConst(pstrdup("halo_mysql_dummy_stmt_return_ok"), -1),
+				   makeStringConst(pstrdup("1"), -1)),
+		COERCE_EXPLICIT_CALL, location);
+	target->val = funcCall;
+	target->location = -1;
+	result->targetList = lappend(result->targetList, (Node *) target);
+	rt->varSetStmt = (Node *) result;
+
+	return (Node *) rt;
 }
 
 /*

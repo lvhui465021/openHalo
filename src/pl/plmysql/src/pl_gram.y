@@ -113,7 +113,7 @@ static	PLMySQL_stmt	*make_execsql_stmt(int firsttoken, int location,
 										   PLword *word);
 static	void			mysql_check_dynamic_sql_context(int firsttoken,
 													  PLword *word, int location);
-static	void			mysql_check_transaction_context(int location);
+static	bool			mysql_tx_disallowed_here(void);
 static	void			mysql_check_implicit_commit_context(int firsttoken,
 															PLword *word, int location);
 static	PLMySQL_stmt_fetch *read_fetch_direction(void);
@@ -2040,13 +2040,13 @@ stmt_commit		: K_COMMIT opt_transaction_chain ';'
 					{
 						PLMySQL_stmt_commit *new;
 
-						mysql_check_transaction_context(@1);
 
 						new = palloc(sizeof(PLMySQL_stmt_commit));
 						new->cmd_type = PLMYSQL_STMT_COMMIT;
 						new->lineno = plmysql_location_to_lineno(@1);
 						new->stmtid = ++plmysql_curr_compile->nstatements;
 						new->chain = $2;
+						new->disallowed = mysql_tx_disallowed_here();
 
 						$$ = (PLMySQL_stmt *)new;
 					}
@@ -2056,13 +2056,13 @@ stmt_rollback	: K_ROLLBACK opt_transaction_chain ';'
 					{
 						PLMySQL_stmt_rollback *new;
 
-						mysql_check_transaction_context(@1);
 
 						new = palloc(sizeof(PLMySQL_stmt_rollback));
 						new->cmd_type = PLMYSQL_STMT_ROLLBACK;
 						new->lineno = plmysql_location_to_lineno(@1);
 						new->stmtid = ++plmysql_curr_compile->nstatements;
 						new->chain = $2;
+						new->disallowed = mysql_tx_disallowed_here();
 
 						$$ = (PLMySQL_stmt *)new;
 					}
@@ -2080,13 +2080,13 @@ stmt_start		: K_START K_TRANSACTION ';'
 					{
 						PLMySQL_stmt_savepoint *new;
 
-						mysql_check_transaction_context(@1);
 
 						new = palloc(sizeof(PLMySQL_stmt_savepoint));
 						new->cmd_type = PLMYSQL_STMT_START;
 						new->lineno = plmysql_location_to_lineno(@1);
 						new->stmtid = ++plmysql_curr_compile->nstatements;
 						new->name = NULL;
+						new->disallowed = mysql_tx_disallowed_here();
 
 						$$ = (PLMySQL_stmt *)new;
 					}
@@ -2102,13 +2102,13 @@ stmt_savepoint	: K_SAVEPOINT any_identifier ';'
 					{
 						PLMySQL_stmt_savepoint *new;
 
-						mysql_check_transaction_context(@1);
 
 						new = palloc(sizeof(PLMySQL_stmt_savepoint));
 						new->cmd_type = PLMYSQL_STMT_SAVEPOINT;
 						new->lineno = plmysql_location_to_lineno(@1);
 						new->stmtid = ++plmysql_curr_compile->nstatements;
 						new->name = $2;
+						new->disallowed = mysql_tx_disallowed_here();
 
 						$$ = (PLMySQL_stmt *)new;
 					}
@@ -2118,13 +2118,13 @@ stmt_rollback_to: K_ROLLBACK K_TO opt_savepoint_kw any_identifier ';'
 					{
 						PLMySQL_stmt_savepoint *new;
 
-						mysql_check_transaction_context(@1);
 
 						new = palloc(sizeof(PLMySQL_stmt_savepoint));
 						new->cmd_type = PLMYSQL_STMT_ROLLBACK_TO;
 						new->lineno = plmysql_location_to_lineno(@1);
 						new->stmtid = ++plmysql_curr_compile->nstatements;
 						new->name = $4;
+						new->disallowed = mysql_tx_disallowed_here();
 
 						$$ = (PLMySQL_stmt *)new;
 					}
@@ -2134,13 +2134,13 @@ stmt_release		: K_RELEASE opt_savepoint_kw any_identifier ';'
 					{
 						PLMySQL_stmt_savepoint *new;
 
-						mysql_check_transaction_context(@1);
 
 						new = palloc(sizeof(PLMySQL_stmt_savepoint));
 						new->cmd_type = PLMYSQL_STMT_RELEASE_SAVEPOINT;
 						new->lineno = plmysql_location_to_lineno(@1);
 						new->stmtid = ++plmysql_curr_compile->nstatements;
 						new->name = $3;
+						new->disallowed = mysql_tx_disallowed_here();
 
 						$$ = (PLMySQL_stmt *)new;
 					}
@@ -2988,24 +2988,18 @@ mysql_check_dynamic_sql_context(int firsttoken, PLword *word, int location)
 }
 
 /*
- * MySQL allows explicit COMMIT/ROLLBACK inside a stored PROCEDURE, but
- * rejects them while a stored FUNCTION or TRIGGER is being compiled
- * (ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG).  Unlike PostgreSQL's plpgsql, which
- * this grammar was cloned from and which allows COMMIT/ROLLBACK in any
- * procedure-language routine, MySQL draws this line at the routine kind.
+ * MySQL allows explicit transaction-control statements (COMMIT/ROLLBACK/
+ * START TRANSACTION/SAVEPOINT...) inside a stored FUNCTION's or trigger's
+ * BODY at CREATE time and rejects them only when such a statement actually
+ * runs (ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG, 1422).  This helper only
+ * computes that predicate; the exec side checks the node's disallowed flag
+ * and raises 1422 when the statement is reached.
  */
-static void
-mysql_check_transaction_context(int location)
+static bool
+mysql_tx_disallowed_here(void)
 {
-	if (plmysql_curr_compile->fn_prokind != PROKIND_FUNCTION &&
-		plmysql_curr_compile->fn_is_trigger == PLMYSQL_NOT_TRIGGER)
-		return;
-
-	mysSetPendingMySQLErrno(1422); /* ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG */
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("Explicit or implicit commit is not allowed in stored function or trigger"),
-			 parser_errposition(location)));
+	return plmysql_curr_compile->fn_prokind == PROKIND_FUNCTION ||
+		plmysql_curr_compile->fn_is_trigger != PLMYSQL_NOT_TRIGGER;
 }
 
 /*

@@ -5090,6 +5090,14 @@ plmysql_release_all_savepoints(void)
 static int
 exec_stmt_commit(PLMySQL_execstate *estate, PLMySQL_stmt_commit *stmt)
 {
+	if (stmt->disallowed)
+	{
+		mysSetPendingMySQLErrno(1422); /* ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG */
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("Explicit or implicit commit is not allowed in stored function or trigger")));
+	}
+
 	if (estate->in_stmt_wrapper)
 	{
 		ReleaseCurrentSubTransaction();
@@ -5121,6 +5129,14 @@ exec_stmt_commit(PLMySQL_execstate *estate, PLMySQL_stmt_commit *stmt)
 static int
 exec_stmt_rollback(PLMySQL_execstate *estate, PLMySQL_stmt_rollback *stmt)
 {
+	if (stmt->disallowed)
+	{
+		mysSetPendingMySQLErrno(1422);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("Explicit or implicit commit is not allowed in stored function or trigger")));
+	}
+
 	if (estate->in_stmt_wrapper)
 	{
 		ReleaseCurrentSubTransaction();
@@ -5154,6 +5170,14 @@ exec_stmt_rollback(PLMySQL_execstate *estate, PLMySQL_stmt_rollback *stmt)
 static int
 exec_stmt_start(PLMySQL_execstate *estate, PLMySQL_stmt_savepoint *stmt)
 {
+	if (stmt->disallowed)
+	{
+		mysSetPendingMySQLErrno(1422);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("Explicit or implicit commit is not allowed in stored function or trigger")));
+	}
+
 	if (estate->in_stmt_wrapper)
 	{
 		ReleaseCurrentSubTransaction();
@@ -5181,6 +5205,15 @@ exec_stmt_start(PLMySQL_execstate *estate, PLMySQL_stmt_savepoint *stmt)
 static int
 exec_stmt_savepoint(PLMySQL_execstate *estate, PLMySQL_stmt_savepoint *stmt)
 {
+	if (stmt->disallowed)
+	{
+		mysSetPendingMySQLErrno(1422);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("Explicit or implicit commit is not allowed in stored function or trigger")));
+	}
+
+
 	if (estate->in_stmt_wrapper)
 	{
 		ReleaseCurrentSubTransaction();
@@ -5204,8 +5237,18 @@ exec_stmt_savepoint(PLMySQL_execstate *estate, PLMySQL_stmt_savepoint *stmt)
 static int
 exec_stmt_rollback_to(PLMySQL_execstate *estate, PLMySQL_stmt_savepoint *stmt)
 {
-	int			target = plmysql_savepoint_find(stmt->name);
+	int			target;
 	PLMySQL_savepoint_entry *entry;
+
+	if (stmt->disallowed)
+	{
+		mysSetPendingMySQLErrno(1422);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("Explicit or implicit commit is not allowed in stored function or trigger")));
+	}
+
+	target = plmysql_savepoint_find(stmt->name);
 
 	if (target < 0)
 	{
@@ -5244,6 +5287,14 @@ static int
 exec_stmt_release(PLMySQL_execstate *estate, PLMySQL_stmt_savepoint *stmt)
 {
 	int			target = plmysql_savepoint_find(stmt->name);
+
+	if (stmt->disallowed)
+	{
+		mysSetPendingMySQLErrno(1422);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("Explicit or implicit commit is not allowed in stored function or trigger")));
+	}
 
 	if (target < 0)
 	{
