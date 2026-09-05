@@ -343,7 +343,10 @@ delimiter 为整参数、引号感知、convert_to_format_v1 回显)。
    命名空间独立)。
 4. **handler 内 SELECT 局部变量返回 NULL**(触发次数正确,值错)。
 5. **显示差异**(值全对):`count(*)`→`count` 列名、`@var`→`?column?`、
-   `show procedure status` 的 Definer/时间戳/字符集元数据、InnoDB 大小写。
+    (**2026-09-05 已修**:mys_gram.y 未加别名的 target_el 按 MySQL 规则
+    以表达式自身拼写命名,`count(*)` 与裸 `@var` 已与 MySQL 一致;
+    `@var := expr` 赋值形与复杂实参仍回退——部分支持)、
+    `show procedure status` 的 Definer/时间戳/字符集元数据、InnoDB 大小写。
 6. **过宽松**(35 条 MySQL 报错而 openHalo 成功)与 INSERT IGNORE 截断处
    理(1406 vs 1265)、max_heap_table_size 未知、SET 子查询右值等。
 
@@ -375,7 +378,18 @@ v1 回显归一)后 sp.test not_found=0。已知待补:--echo 输出行、Warnin
 4. **触发器内语句失败的主行效果**:MySQL(MyISAM)保留已执行行效果,
    openHalo 回滚整个语句(11 处);UPDATE IGNORE 的 fire 语义亦不同。
 5. **SHOW WARNINGS 恒空**:INSERT IGNORE 的 Note、sql_mode 弃用 Warning
-   均不产生(17 处 warnings_diff 根因)。
+   均不产生(17 处 warnings_diff 根因)。**2026-09-05 已修(协议层)**:
+   adapter.c 建立按连接的诊断区(统一 Error/Warning/Note 条目队列),
+   Warning/Note 经 emit_log_hook 捕获、Error 由 sendErrPacket() 以最终
+   MySQL errno 入队(SIGNAL MYSQL_ERRNO 单次消费语义保持),每条语句
+   在 processCommand() 入口清空、诊断语句(SHOW WARNINGS/ERRORS/
+   COUNT(*))豁免,OK/EOF 包 warning_count 同源刷新;SHOW COUNT(*) 返回
+   MySQL 标量形状(@@session.warning_count/error_count 恒一行);
+   IGNORE 吞掉的错误降级为 Warning 行。回归 test_042。注意:语料里
+   INSERT IGNORE 的 1265/1062 等行仍缺,因为重写层在跳过行时不产生
+   任何 ereport——该部分属重写/执行器,不在诊断区修复范围内;NOTICE
+   级事件在 client_min_messages=error 下到不了 hook,MySQL Note 行
+   需相应事件改发 WARNING 或后续单独处理。
 
 ### 9.6 首轮等价校准总结
 
