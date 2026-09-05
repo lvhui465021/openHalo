@@ -1,0 +1,43 @@
+ngram: Chinese ngram full-text-search parser for openHalo
+========================================================
+
+A text-search parser that tokenizes text into sliding N-grams of
+characters (N = 2 by default), aimed at Chinese/Japanese/Korean content
+that has no word boundaries.  Registered as a PostgreSQL text search
+parser plus a ready-made configuration, so it plugs into to_tsvector /
+to_tsquery / ts_headline and GIN expression indexes.
+
+This is a port of openGauss's ts_zh_ngram
+(src/common/backend/tsearch/ts_zh_ngram.cpp + ts_zh_ngram.h,
+Copyright (c) 2020 Huawei Technologies Co.,Ltd., Mulan PSL v2 -- the
+original license headers are kept in the source files).
+
+Differences from the openGauss original (all behavior-neutral for the
+common case):
+
+  * packaged as an extension (CREATE EXTENSION ngram) instead of being
+    wired into the core catalog;
+  * openGauss reads three knobs (gram size, punctuation/grapsymbol
+    ignoring) from per-text-search-configuration options or the
+    ngram_* session GUCs; PostgreSQL has neither, so the openGauss
+    defaults are used unconditionally: gram_size = 2 (MySQL ngram's
+    default token_size), punctuation ignored (treated as separators),
+    graphic symbols kept;
+  * token ids follow the openGauss naming (zh_words / en_word / numeric
+    / alnum / grapsymbol / multisymbol), but like the original every
+    emitted token currently carries the multisymbol id -- the six-type
+    distinction is kept for config mapping compatibility only;
+  * GBK branch retained, but only if the server encoding supports it
+    (UTF-8 databases take the UTF-8 path).
+
+Usage:
+
+    CREATE EXTENSION ngram;
+
+    SELECT to_tsvector('ngram', '中文全文检索');
+    -- '中文':1 '文全':2 '全文':3 '文检':4 '检索':5
+
+    CREATE TABLE posts (id int, body text);
+    CREATE INDEX posts_gin ON posts USING gin (to_tsvector('ngram', body));
+    SELECT * FROM posts
+     WHERE to_tsvector('ngram', body) @@ to_tsquery('ngram', '检索');

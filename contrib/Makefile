@@ -27,6 +27,7 @@ SUBDIRS = \
 		isn		\
 		lo		\
 		ltree		\
+		ngram		\
 		oid2name	\
 		old_snapshot	\
 		pageinspect	\

@@ -1,0 +1,5 @@
+# ngram extension
+comment = 'Chinese ngram full-text-search parser, ported from openGauss ts_zh_ngram'
+default_version = '1.0'
+module_pathname = '$libdir/ngram'
+relocatable = true
