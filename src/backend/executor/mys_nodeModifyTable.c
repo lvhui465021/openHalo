@@ -930,20 +930,38 @@ ExecInsert(ModifyTableContext *context,
                 ItemPointerData conflictTid;
                 List	   *arbiterIndexes;
                 arbiterIndexes = resultRelInfo->ri_onConflictArbiterIndexes; /*获取执行约束检查的索引列表*/
-                if (!ExecCheckIndexConstraints(resultRelInfo, slot, estate,
-                                               &conflictTid, arbiterIndexes))
-                do
+                for (;;)
                 {
+                        if (ExecCheckIndexConstraints(resultRelInfo, slot, estate,
+                                                      &conflictTid, arbiterIndexes))
+                                break;		/* no conflict: insert normally */
                         tupleid = &conflictTid;
-                        ExecDeleteAct(context, resultRelInfo, tupleid, false);
-                        // if(ExecDeleteAct(context, resultRelInfo, tupleid, false))
-                        // 	elog(INFO,"aa");
-                        // else
-                        // 	elog(INFO,"bb");
 
+                        /*
+                         * MySQL's REPLACE deletes the conflicting row before
+                         * inserting the new one, and DELETE triggers must
+                         * fire for that delete.  Mirror ExecDelete's
+                         * sequence (BEFORE ROW triggers -> heap delete ->
+                         * AFTER ROW triggers) instead of the bare
+                         * ExecDeleteAct the previous code used, which
+                         * bypassed the trigger machinery.
+                         */
+                        if (resultRelInfo->ri_TrigDesc &&
+                            resultRelInfo->ri_TrigDesc->trig_delete_before_row)
+                        {
+                            if (!ExecBRDeleteTriggers(estate, context->epqstate,
+                                                      resultRelInfo, tupleid,
+                                                      NULL, NULL))
+                                continue;	/* trigger said "skip this row" */
+                        }
+
+                        ExecDeleteAct(context, resultRelInfo, tupleid, false);
+
+                        if (resultRelInfo->ri_TrigDesc &&
+                            resultRelInfo->ri_TrigDesc->trig_delete_after_row)
+                            ExecARDeleteTriggers(estate, resultRelInfo, tupleid,
+                                                 NULL, NULL);
                 }
-                while (!ExecCheckIndexConstraints(resultRelInfo, slot, estate,
-                                                &conflictTid, arbiterIndexes));
 
             }
 

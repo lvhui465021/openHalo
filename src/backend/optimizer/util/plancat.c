@@ -665,10 +665,44 @@ infer_arbiter_indexes(PlannerInfo *root)
 	 * specification or named constraint.  ON CONFLICT DO UPDATE statements
 	 * must always provide one or the other (but parser ought to have caught
 	 * that already).
+	 *
+	 * MySQL's REPLACE INTO lowers to ON CONFLICT DO REPLACE with no
+	 * inference: every unique index of the target table is a potential
+	 * arbiter (a conflicting row on any of them is deleted before the new
+	 * row is inserted).  Without this, the executor's pre-check sees an
+	 * empty arbiter list, finds no conflict, and the plain INSERT dies on
+	 * the unique violation -- which is exactly the REPLACE-does-not-fire-
+	 * delete-triggers bug from the corpus calibration.
 	 */
 	if (onconflict->arbiterElems == NIL &&
 		onconflict->constraint == InvalidOid)
+	{
+		if (onconflict->action == ONCONFLICT_REPLACE)
+		{
+			varno = root->parse->resultRelation;
+			rte = rt_fetch(varno, root->parse->rtable);
+			relation = table_open(rte->relid, NoLock);
+			indexList = RelationGetIndexList(relation);
+			foreach(l, indexList)
+			{
+				Relation	idxRel = index_open(lfirst_oid(l), NoLock);
+				Form_pg_index idxForm = idxRel->rd_index;
+
+				/*
+				 * Unique, non-partial, immediately-checked indexes only:
+				 * those are the constraints REPLACE can conflict on.  A
+				 * partial unique index would silently skip rows.
+				 */
+				if (idxForm->indisunique && idxForm->indimmediate &&
+					RelationGetIndexPredicate(idxRel) == NIL)
+					results = lappend_oid(results, idxForm->indexrelid);
+				index_close(idxRel, NoLock);
+			}
+			table_close(relation, NoLock);
+			return results;
+		}
 		return NIL;
+	}
 
 	/*
 	 * We need not lock the relation since it was already locked, either by
