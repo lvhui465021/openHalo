@@ -246,7 +246,11 @@ static emit_log_hook_type mys_prev_emit_log_hook = NULL;
 
 static void mysEnqueueCondition(const char *level, int code, const char *message);
 static void mys_emit_log_hook_impl(ErrorData *edata);
-static MysDiagKind mysDiagStmtKind(const char *stmt);
+static const char *mysConditionLevelForCode(int elevel, int code);
+static MysDiagKind mysDiagStmtKind(const char *stmt, int *limitOffset,
+									int *limitCount);
+static MysDiagKind mysDiagTail(const char *p, MysDiagKind kind,
+							   int *limitOffset, int *limitCount);
 static MysWarningEntry *mysGetWarning(int i);
 
 /*
@@ -296,9 +300,33 @@ mys_emit_log_hook_impl(ErrorData *edata)
 		edata->elevel != INFO)
 		return;
 
-	mysEnqueueCondition((edata->elevel == WARNING) ? "Warning" : "Note",
-						convertErrorCode(edata->sqlerrcode),
-						edata->message ? edata->message : "");
+	{
+		int			code = convertErrorCode(edata->sqlerrcode);
+
+		mysEnqueueCondition(mysConditionLevelForCode(edata->elevel, code),
+							code,
+							edata->message ? edata->message : "");
+	}
+}
+
+/*
+ * MySQL decides a condition's displayed severity (Error/Warning/Note) from
+ * the errno's own semantics, not from how the backend reported it.  When an
+ * errno is a MySQL "Note"-class condition (here: the ones we actually
+ * produce as PG WARNINGs, because NOTICE-level reports never reach the hook
+ * under client_min_messages=error), report it as Note regardless of PG's
+ * level.
+ */
+static const char *
+mysConditionLevelForCode(int elevel, int code)
+{
+	switch (code)
+	{
+		case 1050:				/* ER_TABLE_EXISTS_ERROR: CREATE TABLE IF NOT EXISTS */
+			return "Note";
+		default:
+			return (elevel == WARNING) ? "Warning" : "Note";
+	}
 }
 
 /*
@@ -374,11 +402,20 @@ mysGetWarning(int i)
  * These read the current diagnostics area, so the statement-start clear
  * must skip them.  Anything else, including other SHOW forms and trailing
  * clauses such as LIMIT, returns MYS_DIAG_NONE.
+ *
+ * SHOW WARNINGS/ERRORS accept MySQL's optional [LIMIT [offset,] count]
+ * clause; when present and valid, the out-params limitOffset/limitCount
+ * (both >= 0) receive it.  Callers not interested pass NULL.
  */
 static MysDiagKind
-mysDiagStmtKind(const char *stmt)
+mysDiagStmtKind(const char *stmt, int *limitOffset, int *limitCount)
 {
 	const char *p = stmt;
+
+	if (limitOffset)
+		*limitOffset = 0;
+	if (limitCount)
+		*limitCount = -1;		/* -1 = no limit */
 
 	while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r'))
 		p++;
@@ -387,22 +424,19 @@ mysDiagStmtKind(const char *stmt)
 	p += 4;
 	while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r'))
 		p++;
+
 	if (strncasecmp(p, "warnings", 8) == 0)
-	{
-		p += 8;
-		while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r') || (*p == ';'))
-			p++;
-		return (*p == '\0') ? MYS_DIAG_SHOW_WARNINGS : MYS_DIAG_NONE;
-	}
+		return mysDiagTail(p + 8, MYS_DIAG_SHOW_WARNINGS,
+						   limitOffset, limitCount);
 	if (strncasecmp(p, "errors", 6) == 0)
-	{
-		p += 6;
-		while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r') || (*p == ';'))
-			p++;
-		return (*p == '\0') ? MYS_DIAG_SHOW_ERRORS : MYS_DIAG_NONE;
-	}
+		return mysDiagTail(p + 6, MYS_DIAG_SHOW_ERRORS,
+						   limitOffset, limitCount);
 	if (strncasecmp(p, "count", 5) == 0)
 	{
+		int			off = 0;
+		int			cnt = -1;
+		MysDiagKind kind;
+
 		p += 5;
 		while ((*p == ' ') || (*p == '\t'))
 			p++;
@@ -412,21 +446,106 @@ mysDiagStmtKind(const char *stmt)
 		while ((*p == ' ') || (*p == '\t'))
 			p++;
 		if (strncasecmp(p, "warnings", 8) == 0)
-		{
-			p += 8;
-			while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r') || (*p == ';'))
-				p++;
-			return (*p == '\0') ? MYS_DIAG_COUNT_WARNINGS : MYS_DIAG_NONE;
-		}
-		if (strncasecmp(p, "errors", 6) == 0)
-		{
-			p += 6;
-			while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r') || (*p == ';'))
-				p++;
-			return (*p == '\0') ? MYS_DIAG_COUNT_ERRORS : MYS_DIAG_NONE;
-		}
+			kind = MYS_DIAG_COUNT_WARNINGS, p += 8;
+		else if (strncasecmp(p, "errors", 6) == 0)
+			kind = MYS_DIAG_COUNT_ERRORS, p += 6;
+		else
+			return MYS_DIAG_NONE;
+		kind = mysDiagTail(p, kind, &off, &cnt);
+		if (kind == MYS_DIAG_NONE)
+			return MYS_DIAG_NONE;
+		if (off != 0 || cnt != -1)
+			return MYS_DIAG_NONE;	/* LIMIT is not valid after COUNT(*) */
+		if (limitOffset)
+			*limitOffset = off;
+		if (limitCount)
+			*limitCount = cnt;
+		return kind;
 	}
 	return MYS_DIAG_NONE;
+}
+
+/*
+ * Parse the tail after "SHOW WARNINGS"/"SHOW ERRORS": whitespace and an
+ * optional trailing ';', then optionally "LIMIT [offset,] count".  Returns
+ * the given kind on success, MYS_DIAG_NONE otherwise.
+ */
+static MysDiagKind
+mysDiagTail(const char *p, MysDiagKind kind, int *limitOffset, int *limitCount)
+{
+	bool		hasLimit = false;
+
+	for (;;)
+	{
+		while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r') ||
+			   (*p == ';'))
+			p++;
+		if (*p == '\0')
+			break;
+		if (!hasLimit && strncasecmp(p, "limit", 5) == 0 &&
+			((p[5] == ' ') || (p[5] == '\t') || (p[5] == '\n') ||
+			 (p[5] == '\r') || (p[5] == ';') || (p[5] == '\0')))
+		{
+			p += 5;
+			hasLimit = true;
+			break;				/* numeric part is parsed below */
+		}
+		return MYS_DIAG_NONE;
+	}
+	if (hasLimit)
+	{
+		int			offset = 0;
+		int			count = 0;
+		bool		any = false;
+
+		while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r'))
+			p++;
+		/* first number: count, or offset if a ',' follows */
+		while ((*p >= '0') && (*p <= '9'))
+		{
+			offset = offset * 10 + (*p - '0');
+			if (offset > 100000000)
+				return MYS_DIAG_NONE;
+			p++;
+			any = true;
+		}
+		if (!any)
+			return MYS_DIAG_NONE;
+		while ((*p == ' ') || (*p == '\t'))
+			p++;
+		if (*p == ',')
+		{
+			p++;
+			while ((*p == ' ') || (*p == '\t'))
+				p++;
+			any = false;
+			while ((*p >= '0') && (*p <= '9'))
+			{
+				count = count * 10 + (*p - '0');
+				if (count > 100000000)
+					return MYS_DIAG_NONE;
+				p++;
+				any = true;
+			}
+			if (!any)
+				return MYS_DIAG_NONE;
+		}
+		else
+		{
+			count = offset;		/* single number = row count */
+			offset = 0;
+		}
+		while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r') ||
+			   (*p == ';'))
+			p++;
+		if (*p != '\0')
+			return MYS_DIAG_NONE;
+		if (limitOffset)
+			*limitOffset = offset;
+		if (limitCount)
+			*limitCount = count;
+	}
+	return kind;
 }
 static Oid informationSchemaID = InvalidOid;
 static int systemVarType = 0;
@@ -661,7 +780,8 @@ static int createServerPort(int family,
 static int lockAFUnix(const char *unixSocketDir, const char *unixSocketPath);
 static int setupAFUnix(const char *sockPath);
 static void closeSocket(int code, Datum arg);
-static void simulateShowWarnErrReturn(MysDiagKind diagKind);
+static void simulateShowWarnErrReturn(MysDiagKind diagKind, int limitOffset,
+									  int limitCount);
 static void sendScalarDiagColDefPacket(const char *colName);
 static void simulateShowFieldsReturn(void);
 static bool simulateChecksumTable(char *stmt);
@@ -691,6 +811,7 @@ static void sendOKPacketSpecialInfo(const char *info);
 static void sendEOFPacketFlush(void);
 static void sendEOFPacketNoFlush(void);
 static void sendErrPacket(int errCode, const char *errMsg, const char *sqlState);
+static void sendErrPacketDirect(int mySQLErrorCode, const char *errMsg, const char *sqlState);
 static void sendSyntaxError(const char *command);
 static void sendUnsupportError(const char *command);
 static void endExtendPreStmt(void);
@@ -759,7 +880,7 @@ sendOKPacket(void)
 void 
 sendErrorPacket(int errCode, const char *errMsg)
 {
-    sendErrPacket(errCode, errMsg, "HY000");
+    sendErrPacketDirect(errCode, errMsg, "HY000");
 }
 
 static void
@@ -1273,6 +1394,12 @@ endCommand(QueryCompletion *qc, CommandDest dest)
     {
         sendOKPacket();
     }
+    else if (qc->commandTag == CMDTAG_DO)
+    {
+        /* DO returns no result set: reply OK, not the bare EOF the generic
+         * fall-through used to send (which clients cannot parse). */
+        sendOKPacket();
+    }
     else if (qc->commandTag == CMDTAG_SET)
     {
         if (setUserSystemVar == 0)
@@ -1580,7 +1707,7 @@ processCommand(int *firstChar, StringInfo inBuf)
      */
     if (*firstChar == MYS_REQ_QUERY)
     {
-        if (mysDiagStmtKind(inBuf->data + inBuf->offset) == MYS_DIAG_NONE)
+        if (mysDiagStmtKind(inBuf->data + inBuf->offset, NULL, NULL) == MYS_DIAG_NONE)
             mysClearWarnings();
     }
     else if (*firstChar == MYS_REQ_EXECUTE)
@@ -1650,7 +1777,7 @@ processCommand(int *firstChar, StringInfo inBuf)
                 int errCode = 1065;
                 char *sqlState = "42000";
                 char *errMsg = "Query was empty";
-                sendErrPacket(errCode, errMsg, sqlState);
+                sendErrPacketDirect(errCode, errMsg, sqlState);
             }
             return 1;
         }
@@ -1718,17 +1845,19 @@ processCommand(int *firstChar, StringInfo inBuf)
             }
             else 
             {
-                sendErrPacket(1049, "Invalid client data", "42000");
+                sendErrPacketDirect(1049, "Invalid client data", "42000");
                 return 1;
             }
         }
         else if (0 == strncasecmp(stmt, "show", 4))
         {
             MysDiagKind diagKind;
+            int         limitOffset;
+            int         limitCount;
             secondWord = stmt + 5;
             skipSpaces(&secondWord);
 
-            diagKind = mysDiagStmtKind(stmt);
+            diagKind = mysDiagStmtKind(stmt, &limitOffset, &limitCount);
             if (0 == strncasecmp(secondWord, "grants", 6))
             {
                 simulateShowGrants();
@@ -1738,7 +1867,7 @@ processCommand(int *firstChar, StringInfo inBuf)
             }
             else if (diagKind != MYS_DIAG_NONE)
             {
-                simulateShowWarnErrReturn(diagKind);
+                simulateShowWarnErrReturn(diagKind, limitOffset, limitCount);
                 return 1;
             }
             else
@@ -1765,7 +1894,7 @@ processCommand(int *firstChar, StringInfo inBuf)
             }
             else
             {
-                sendErrPacket(1049, "\"alter database\" is forbidden in Halo-MySQL", "42000");
+                sendErrPacketDirect(1049, "\"alter database\" is forbidden in Halo-MySQL", "42000");
                 return 1;
             }
         }
@@ -1781,7 +1910,7 @@ processCommand(int *firstChar, StringInfo inBuf)
                     int errCode = 1064;
                     char *sqlState = "42000";
                     char *errMsg = "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near ';select 123 as abc' at line 1";
-                    sendErrPacket(errCode, errMsg, sqlState);
+                    sendErrPacketDirect(errCode, errMsg, sqlState);
                     return 1;
                 }
             }
@@ -1796,7 +1925,7 @@ processCommand(int *firstChar, StringInfo inBuf)
                 int errCode = 1065;
                 char *sqlState = "42000";
                 char *errMsg = "Query was empty";
-                sendErrPacket(errCode, errMsg, sqlState);
+                sendErrPacketDirect(errCode, errMsg, sqlState);
                 return 1;
             }
         }
@@ -1878,7 +2007,7 @@ processCommand(int *firstChar, StringInfo inBuf)
         }
         else if (rewriteRet == 3)
         {
-            sendErrPacket(1295, "This command is not supported in the prepared statement protocol yet", "HY000");
+            sendErrPacketDirect(1295, "This command is not supported in the prepared statement protocol yet", "HY000");
             return 1;
         }
         else 
@@ -1938,7 +2067,7 @@ processCommand(int *firstChar, StringInfo inBuf)
         }
         else 
         {
-            sendErrPacket(1049, "Invalid client data", "42000");
+            sendErrPacketDirect(1049, "Invalid client data", "42000");
             return 1;
         }
     }
@@ -4408,10 +4537,12 @@ sendScalarDiagColDefPacket(const char *colName)
  * Serving these leaves the area intact, matching MySQL.
  */
 static void 
-simulateShowWarnErrReturn(MysDiagKind diagKind)
+simulateShowWarnErrReturn(MysDiagKind diagKind, int limitOffset,
+						  int limitCount)
 {
     int     i;
     int     total = mysGetWarningCount();
+    int     emitted = 0;
 
     if (diagKind == MYS_DIAG_COUNT_WARNINGS || diagKind == MYS_DIAG_COUNT_ERRORS)
     {
@@ -4470,6 +4601,16 @@ simulateShowWarnErrReturn(MysDiagKind diagKind)
 
         if (diagKind == MYS_DIAG_SHOW_ERRORS && strcmp(level, "Error") != 0)
             continue;
+
+        /* SHOW WARNINGS/ERRORS [LIMIT [offset,] count] */
+        if (emitted < limitOffset)
+        {
+            emitted++;
+            continue;
+        }
+        if (limitCount >= 0 && emitted >= limitOffset + limitCount)
+            break;
+        emitted++;
 
         code = mysGetWarningCode(i);
         msg = mysGetWarningMessage(i);
@@ -5789,17 +5930,33 @@ sendEOFPacketNoFlush()
     }
 }
 
+/*
+ * sendErrPacket: report an error whose code is a PostgreSQL SQLSTATE code
+ * (edata->sqlerrcode from the error path): convert it to the MySQL errno,
+ * which also consumes any SIGNAL-chosen pending MYSQL_ERRNO exactly once.
+ * Call sites that already hold a concrete MySQL errno (1049/1295/...) must
+ * use sendErrPacketDirect() instead -- feeding an errno through
+ * convertErrorCode() would treat it as an unmapped code and return the
+ * generic 1105.
+ */
 static void 
 sendErrPacket(int errCode, const char *errMsg, const char *sqlState)
 {
+    sendErrPacketDirect(convertErrorCode(errCode), errMsg, sqlState);
+}
+
+/*
+ * sendErrPacketDirect: report an error with an already-final MySQL errno.
+ */
+static void 
+sendErrPacketDirect(int mySQLErrorCode, const char *errMsg, const char *sqlState)
+{
     char *payloadBuf;
     int payloadLen;
-    int mySQLErrorCode;
     int sqlStateMarker;
     int msgLen;
     char canonicalState[6];
 
-    mySQLErrorCode = convertErrorCode(errCode);
     warnErrCode = mySQLErrorCode;
     msgLen = strlen(errMsg);
     msgLen = msgLen > 1023 ? 1023 : msgLen;
@@ -5809,9 +5966,10 @@ sendErrPacket(int errCode, const char *errMsg, const char *sqlState)
     /*
      * Append the Error condition to the diagnostics area (SHOW WARNINGS /
      * SHOW ERRORS / SHOW COUNT(*)).  The errno is final here -- including
-     * any SIGNAL-chosen MYSQL_ERRNO, which the convertErrorCode() call
-     * above just consumed -- so this is the only place Error rows are
-     * captured (the emit_log_hook deliberately skips ERROR-level reports).
+     * any SIGNAL-chosen MYSQL_ERRNO, which the convertErrorCode() call in
+     * sendErrPacket() just consumed -- so this is the only place Error rows
+     * are captured (the emit_log_hook deliberately skips ERROR-level
+     * reports).
      */
     mysEnqueueCondition("Error", mySQLErrorCode, warnErrMsg);
 
@@ -5845,7 +6003,7 @@ sendUnsupportError(const char *command)
     int errCode = 1047;
     const char *errMsg = "Unknown command";
     const char *sqlState = "08S01";
-    sendErrPacket(errCode, errMsg, sqlState);
+    sendErrPacketDirect(errCode, errMsg, sqlState);
     elog(WARNING, "Halo-MySQL unsupport sql: [%s]", command);
 }
 

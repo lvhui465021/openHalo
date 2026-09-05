@@ -1248,6 +1248,13 @@ mys_transformCreateStmt(CreateStmt *stmt, const char *queryString)
 	/*
 	 * If the relation already exists and the user specified "IF NOT EXISTS",
 	 * bail out with a NOTICE.
+	 *
+	 * MySQL dialect: this must be a WARNING (not a NOTICE) so it is still
+	 * reported while MySQL-protocol sessions run with
+	 * client_min_messages=error (which suppresses NOTICEs before the
+	 * emit_log_hook runs).  MySQL 5.7 records the same event as a Note
+	 * (code 1050) in the diagnostics area; the adapter's warning queue
+	 * demotes this code back to "Note".
 	 */
 	if (stmt->if_not_exists && OidIsValid(existing_relid))
 	{
@@ -1261,7 +1268,7 @@ mys_transformCreateStmt(CreateStmt *stmt, const char *queryString)
 		checkMembershipInCurrentExtension(&address);
 
 		/* OK to skip */
-		ereport(NOTICE,
+		ereport(WARNING,
 				(errcode(ERRCODE_DUPLICATE_TABLE),
 				 errmsg("relation \"%s\" already exists, skipping",
 						stmt->relation->relname)));

@@ -120,10 +120,12 @@ mysApplySqlMode(const char *value, bool remember_text)
 	List	   *value_list = NIL;
 	ListCell   *lc;
 	uint64		mode = 0;
+	uint64		old_mode;
 
 	if (value == NULL)
 		value = "";
 
+	old_mode = mys_sqlMode;
 	if (remember_text)
 		mysSqlModeText = pstrdup(value);
 
@@ -196,6 +198,25 @@ mysApplySqlMode(const char *value, bool remember_text)
 
 	pfree(raw_value);
 	list_free(value_list);
+
+	/*
+	 * MySQL 5.7 compatibility: an explicit SET sql_mode that changes whether
+	 * NO_AUTO_CREATE_USER is set (in either direction) produces warning 3090
+	 * (ER_WARN_DEPRECATED_SQLMODE, "Changing sql mode 'NO_AUTO_CREATE_USER'
+	 * is deprecated..."), since the mode no longer has any effect in 5.7.
+	 * Only explicit client SETs (remember_text) warn, matching MySQL, and
+	 * the mode name is still accepted silently otherwise.  The errno rides
+	 * the pending-MYSQL_ERRNO slot so the diagnostics-area conversion picks
+	 * up 3090 instead of an unmapped generic code.
+	 */
+	if (remember_text &&
+		((old_mode ^ mode) & MYS_MODE_NO_AUTO_CREATE_USER) != 0)
+	{
+		mysSetPendingMySQLErrno(3090);
+		ereport(WARNING,
+				(errmsg("Changing sql mode 'NO_AUTO_CREATE_USER' is deprecated. "
+						"It will be removed in a future release.")));
+	}
 
 	mys_sqlMode = mode;
 	isStrictTransTablesOn =
