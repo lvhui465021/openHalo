@@ -64,6 +64,7 @@
 const ParserRoutine *GetMysParserEngine(void);	/* Get MySQL Parser Engine */
 
 static List *mys_raw_parser(const char *str, RawParseMode mode);
+static char *mys_rewrite_bare_call(const char *str);
 static bool check_uescapechar(unsigned char escape);
 static unsigned int hexval(unsigned char c);
 static void check_unicode_value(pg_wchar c);
@@ -338,6 +339,30 @@ mys_raw_parser(const char *str, RawParseMode mode)
 	mys_yy_extra_type yyextra;
 	int			yyresult;
 
+	/*
+	 * MySQL lets one write CALL sp_name without parentheses.  The grammar
+	 * cannot accept a bare function name at statement end (LALR reduce/
+	 * reduce between ColId and type_function_name), so when a CALL statement
+	 * is clearly called with no argument list we rewrite it to CALL name().
+	 * This is purely lexical: only whole statements that start with the CALL
+	 * keyword and run to a terminator with no '(' get touched.
+	 */
+	if (mode == RAW_PARSE_DEFAULT)
+	{
+		char	   *rewritten = mys_rewrite_bare_call(str);
+
+		if (rewritten != NULL)
+		{
+			/*
+			 * The rewritten text is longer than the original statement, so
+			 * the MySQL-protocol packet length in stmtLen no longer fits:
+			 * force the scanner to size the buffer with strlen().
+			 */
+			stmtLen = 0;
+			str = rewritten;
+		}
+	}
+
 	/* initialize the flex scanner */
 	yyscanner = mys_scanner_init(str, &yyextra.core_yy_extra,
 							 &MysScanKeywords, MysScanKeywordTokens);
@@ -375,6 +400,313 @@ mys_raw_parser(const char *str, RawParseMode mode)
 		return NIL;
 
 	return yyextra.parsetree;
+}
+
+/*
+ * mys_rewrite_bare_call
+ *
+ * MySQL allows "CALL sp_name" without parentheses (an invocation with no
+ * arguments).  Rewrite such statements to "CALL sp_name()" so the existing
+ * grammar handles them.  The scan is quote-, backtick- and comment-aware and
+ * only ever fires when a whole statement starts with the CALL keyword and
+ * runs -- through nothing but an optionally schema-qualified name -- to a
+ * statement terminator (';' or end of input) without hitting '('.  Anything
+ * else (CALL used as a column/alias name inside another statement, strings,
+ * comments, parenthesized calls) is left untouched.
+ *
+ * Returns a palloc'd rewritten copy, or NULL when no rewrite is needed.
+ */
+
+/*
+ * Small scanning helpers shared by both passes: skip whitespace and
+ * MySQL comments starting at *pp (advances *pp past them).
+ */
+static void
+mys_skip_ws_comments(const char *str, int n, int *pp)
+{
+	int			p = *pp;
+
+	for (;;)
+	{
+		while (p < n && (str[p] == ' ' || str[p] == '\t' ||
+						 str[p] == '\n' || str[p] == '\r' ||
+						 str[p] == '\f' || str[p] == '\v'))
+			p++;
+		if (p + 1 < n && str[p] == '-' && str[p + 1] == '-')
+		{
+			while (p < n && str[p] != '\n')
+				p++;
+		}
+		else if (p + 1 < n && str[p] == '/' && str[p + 1] == '*')
+		{
+			p += 2;
+			while (p + 1 < n && !(str[p] == '*' && str[p + 1] == '/'))
+				p++;
+			if (p + 1 < n)
+				p += 2;
+		}
+		else if (p < n && str[p] == '#')
+		{
+			while (p < n && str[p] != '\n')
+				p++;
+		}
+		else
+			break;
+	}
+	*pp = p;
+}
+
+/*
+ * mys_scan_call_name: starting at *pp (just past the CALL keyword, after
+ * whitespace/comments were skipped), scan an optionally schema-qualified
+ * routine name.  On success leave *pp right after the last name part and
+ * return true; otherwise return false and leave *pp unchanged.
+ */
+static bool
+mys_scan_call_name(const char *str, int n, int *pp)
+{
+	int			p = *pp;
+	bool		got_part = false;
+
+	for (;;)
+	{
+		if (p < n && str[p] == '`')
+		{
+			p++;
+			while (p < n)
+			{
+				if (str[p] == '`')
+				{
+					if (p + 1 < n && str[p + 1] == '`')
+						p += 2;
+					else
+					{
+						p++;
+						break;
+					}
+				}
+				else
+					p++;
+			}
+			if (p > n)
+				return false;
+			got_part = true;
+		}
+		else if (p < n && (isalpha((unsigned char) str[p]) ||
+						   str[p] == '_' || str[p] == '$'))
+		{
+			while (p < n && (isalnum((unsigned char) str[p]) ||
+							 str[p] == '_' || str[p] == '$'))
+				p++;
+			got_part = true;
+		}
+		else
+			break;
+
+		mys_skip_ws_comments(str, n, &p);
+		if (p < n && str[p] == '.')
+		{
+			p++;
+			mys_skip_ws_comments(str, n, &p);
+			continue;
+		}
+		break;
+	}
+
+	if (!got_part)
+		return false;
+	*pp = p;
+	return true;
+}
+
+static char *
+mys_rewrite_bare_call(const char *str)
+{
+	int			n = strlen(str);
+	int			i;
+	int			quote = 0;		/* '\'' or '"' when inside a string, 0 else */
+	int			prev_sig = -1;	/* previous significant char, -1 = start */
+	bool		in_line_comment = false;
+	bool		in_block_comment = false;
+	int			max_rewrites = 64;
+	int			*npos;
+	int			nrewrites = 0;
+
+	/* First pass: find bare CALL statements and remember their positions. */
+	npos = (int *) palloc(sizeof(int) * max_rewrites);
+
+	i = 0;
+	while (i < n)
+	{
+		char		c = str[i];
+		char		next = (i + 1 < n) ? str[i + 1] : '\0';
+
+		if (in_line_comment)
+		{
+			if (c == '\n')
+				in_line_comment = false;
+			i++;
+			continue;
+		}
+		if (in_block_comment)
+		{
+			if (c == '*' && next == '/')
+				i += 2;
+			else
+				i++;
+			continue;
+		}
+		if (quote != 0)
+		{
+			if (c == '\\')		/* backslash escapes the next character */
+				i += 2;
+			else if (c == quote)
+			{
+				/* doubled quote is an escaped quote inside the string */
+				if (next == quote)
+					i += 2;
+				else
+				{
+					quote = 0;
+					i++;
+				}
+			}
+			else
+				i++;
+			continue;
+		}
+		if (c == '\'' || c == '"')
+		{
+			quote = c;
+			i++;
+			continue;
+		}
+		if (c == '#' || (c == '-' && next == '-'))
+		{
+			in_line_comment = true;
+			i++;
+			continue;
+		}
+		if (c == '/' && next == '*')
+		{
+			in_block_comment = true;
+			i += 2;
+			continue;
+		}
+		if (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+			c == '\f' || c == '\v')
+		{
+			i++;
+			continue;
+		}
+		if (c == '`')
+		{
+			/* backquoted identifier: skip to the closing backquote */
+			i++;
+			while (i < n)
+			{
+				if (str[i] == '`')
+				{
+					if (i + 1 < n && str[i + 1] == '`')
+						i += 2;
+					else
+					{
+						i++;
+						break;
+					}
+				}
+				else
+					i++;
+			}
+			prev_sig = '`';
+			continue;
+		}
+
+		/*
+		 * Only after ';' or at the very beginning may a CALL keyword open a
+		 * statement.
+		 */
+		if ((prev_sig == ';' || prev_sig == -1) &&
+			(c == 'c' || c == 'C') && i + 4 <= n &&
+			pg_strncasecmp(str + i, "call", 4) == 0)
+		{
+			int			j = i + 4;
+			bool		ok = true;
+
+			/* keyword must be followed by a non-identifier char */
+			if (j < n && (isalnum((unsigned char) str[j]) ||
+						  str[j] == '_' || str[j] == '$' || str[j] == '`'))
+				ok = false;
+
+			if (ok)
+			{
+				mys_skip_ws_comments(str, n, &j);
+				ok = mys_scan_call_name(str, n, &j);
+			}
+
+			if (ok)
+				mys_skip_ws_comments(str, n, &j);
+
+			/*
+			 * Bare call: the name runs straight into a terminator with no
+			 * '(' in between.
+			 */
+			if (ok && (j >= n || str[j] == ';'))
+			{
+				if (nrewrites < max_rewrites)
+					npos[nrewrites++] = j;
+				i = j;
+				continue;
+			}
+			i = i + 4;
+			prev_sig = 'l';
+			continue;
+		}
+
+		prev_sig = (unsigned char) c;
+		i++;
+	}
+
+	if (nrewrites == 0)
+	{
+		pfree(npos);
+		return NULL;
+	}
+
+	/* Second pass: copy the text, inserting "()" at each recorded site. */
+	{
+		char	   *out = palloc(n + 2 * nrewrites + 1);
+		int			o = 0;
+		int			r = 0;
+
+		quote = 0;
+		prev_sig = -1;
+		in_line_comment = false;
+		in_block_comment = false;
+
+		for (i = 0; i < n; i++)
+		{
+			/* Insert a "()" before any recorded bare-call terminator. */
+			while (r < nrewrites && npos[r] == i)
+			{
+				out[o++] = '(';
+				out[o++] = ')';
+				r++;
+			}
+			out[o++] = str[i];
+		}
+		while (r < nrewrites && npos[r] == n)
+		{
+			out[o++] = '(';
+			out[o++] = ')';
+			r++;
+		}
+		out[o] = '\0';
+		Assert(r == nrewrites);
+		Assert(o == n + 2 * nrewrites);
+		pfree(npos);
+		return out;
+	}
 }
 
 static bool
