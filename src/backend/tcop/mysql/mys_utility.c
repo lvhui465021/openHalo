@@ -1441,6 +1441,53 @@ mys_standard_ProcessUtility(PlannedStmt *pstmt,
 			{
 				DropStmt   *stmt = (DropStmt *) parsetree;
 
+				/*
+				 * MySQL DROP TABLE semantics for views: a view is not a
+				 * table, so with IF EXISTS it is silently skipped (and NOT
+				 * dropped -- MySQL requires DROP VIEW), while without IF
+				 * EXISTS it is an error.  PostgreSQL instead reports
+				 * ""%s" is not a table" for DROP TABLE IF EXISTS on a
+				 * view, which the corpus hits (sp.test drops a view that
+				 * was created under a table name).  Emulate MySQL: filter
+				 * views out of an IF EXISTS drop (no-op when only views
+				 * remain).
+				 */
+				if (stmt->removeType == OBJECT_TABLE && stmt->missing_ok)
+				{
+					ListCell   *lc;
+					List	   *kept = NIL;
+					bool		skippedAny = false;
+
+					foreach(lc, stmt->objects)
+					{
+						/* mys grammar stores each object as a name list */
+						List	   *names = (List *) lfirst(lc);
+						RangeVar   *rv;
+						Oid			relid;
+
+						if (list_length(names) == 1)
+							rv = makeRangeVar(NULL, strVal(linitial(names)), -1);
+						else
+							rv = makeRangeVar(strVal(linitial(names)),
+											  strVal(lsecond(names)), -1);
+						relid = RangeVarGetRelid(rv, NoLock, true);
+						if (OidIsValid(relid) &&
+							get_rel_relkind(relid) == RELKIND_VIEW)
+							skippedAny = true;	/* MySQL: IF EXISTS no-op */
+						else
+							kept = lappend(kept, names);
+					}
+					if (skippedAny)
+					{
+						if (kept == NIL)
+						{
+							qc->commandTag = CMDTAG_DROP_TABLE;
+							break;
+						}
+						stmt->objects = kept;
+					}
+				}
+
 				if (EventTriggerSupportsObjectType(stmt->removeType))
                     mys_ProcessUtilitySlow(pstate, pstmt, queryString,
                                            context, params, queryEnv,
