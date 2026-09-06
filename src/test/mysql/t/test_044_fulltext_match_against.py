@@ -61,6 +61,29 @@ def run(cluster):
         cur.close()
     # hmm: helpers above open/close their own connections; keep one below
 
+    # -- bare FULLTEXT (cols) form without KEY/INDEX (sp.test uses it) ------
+    with cluster.mysql(dbname="public") as conn:
+        cur = conn.cursor()
+        cur.execute("""CREATE TABLE t044_bare (
+            id int unsigned auto_increment not null primary key,
+            title VARCHAR(200), body text,
+            fulltext (title, body))""")
+        cur.execute("INSERT INTO t044_bare (title, body) VALUES ('hello','quick brown fox')")
+        cur.execute("SELECT id FROM t044_bare WHERE MATCH(title, body) AGAINST('brown')")
+        _assert(cur.fetchall() == ((1,),),
+                "bare FULLTEXT (cols) table form should support MATCH")
+        cur.execute("DROP TABLE t044_bare")
+        cur.close()
+    # -- CREATE DATABASE ... DEFAULT CHARACTER SET accepted (sp.test) -------
+    with cluster.mysql(dbname="public") as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE DATABASE IF NOT EXISTS t044_db1 DEFAULT CHARACTER SET utf8")
+        cur.execute("CREATE DATABASE IF NOT EXISTS t044_db2 DEFAULT CHARACTER SET utf8 "
+                    "COLLATE utf8_general_ci")
+        cur.execute("DROP DATABASE IF EXISTS t044_db1")
+        cur.execute("DROP DATABASE IF EXISTS t044_db2")
+        cur.close()
+
     # -- natural language mode: any query word matches (OR), score ranks --
     got = _ids(cluster, "SELECT id FROM t044_ft WHERE MATCH(body) AGAINST('quick brown') ORDER BY id")
     _assert(got == [1, 4], "natural 'quick brown' should match rows 1,4, got %r" % got)
