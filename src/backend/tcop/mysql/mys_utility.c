@@ -1442,6 +1442,97 @@ mys_standard_ProcessUtility(PlannedStmt *pstmt,
 				DropStmt   *stmt = (DropStmt *) parsetree;
 
 				/*
+				 * MySQL keeps the view namespace separate from (temporary)
+				 * tables, so DROP VIEW t1 still finds and drops the view
+				 * while a same-named temporary table exists -- PostgreSQL's
+				 * name resolution lets the temporary table shadow the view
+				 * and then reports "t1" is not a view.  sp.test relies on
+				 * this (DROP VIEW between CREATE TEMPORARY TABLE and its
+				 * DROP).  Re-qualify shadowed view names with their real
+				 * schema.  When only a non-view object of that name exists,
+				 * DROP VIEW IF EXISTS is a silent no-op like MySQL (a NOTE);
+				 * without IF EXISTS leave the object alone so the native
+				 * error fires.
+				 */
+				if (stmt->removeType == OBJECT_VIEW)
+				{
+					ListCell   *lc;
+					List	   *kept = NIL;
+					bool		changed = false;
+
+					foreach(lc, stmt->objects)
+					{
+						List	   *names = (List *) lfirst(lc);
+
+						if (list_length(names) == 1)
+						{
+							const char *vname = strVal(linitial(names));
+							Oid			firstid;
+							Oid			viewid = InvalidOid;
+
+							firstid = RangeVarGetRelid(
+								makeRangeVar(NULL, pstrdup(vname), -1),
+								NoLock, true);
+							if (OidIsValid(firstid) &&
+								get_rel_relkind(firstid) == RELKIND_VIEW)
+								viewid = firstid;
+							else
+							{
+								/* look past any shadowing (temp) table */
+								List	   *path = fetch_search_path(true);
+								ListCell   *nslc;
+
+								foreach(nslc, path)
+								{
+									Oid			ns = lfirst_oid(nslc);
+									Oid			oid =
+										get_relname_relid(vname, ns);
+
+									if (OidIsValid(oid) &&
+										get_rel_relkind(oid) == RELKIND_VIEW)
+									{
+										viewid = oid;
+										break;
+									}
+								}
+							}
+							if (OidIsValid(viewid) &&
+								viewid != firstid)
+							{
+								/* shadowed: qualify with the view's real
+								 * schema so the native drop finds it */
+								char	   *schema =
+									get_namespace_name(get_rel_namespace(viewid));
+
+								names = list_make2(makeString(schema),
+												   linitial(names));
+								changed = true;
+							}
+							else if (!OidIsValid(viewid))
+							{
+								if (stmt->missing_ok)
+									changed = true;	/* MySQL: silent no-op */
+								else
+									kept = lappend(kept, names);
+								continue;
+							}
+							kept = lappend(kept, names);
+						}
+						else
+							kept = lappend(kept, names);
+					}
+					if (changed)
+					{
+						if (kept == NIL)
+						{
+							qc->commandTag = CMDTAG_DROP_VIEW;
+							break;
+						}
+						stmt->objects = kept;
+					}
+				}
+
+				/*
 				 * MySQL DROP TABLE semantics for views: a view is not a
 				 * table, so with IF EXISTS it is silently skipped (and NOT
 				 * dropped -- MySQL requires DROP VIEW), while without IF
