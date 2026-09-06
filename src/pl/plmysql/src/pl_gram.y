@@ -138,6 +138,8 @@ static	void			 check_labels(const char *start_label,
 									  int end_location);
 static	PLMySQL_expr	*read_cursor_args(PLMySQL_var *cursor,
 										  int until);
+static void plmysql_check_sysvar_set(const char *query);
+
 
 %}
 
@@ -1166,6 +1168,34 @@ stmt_set		: K_SET set_assign_list
 						/* "SET @uservar = expr;" -- see the comment above */
 						plmysql_push_back_token(MysqlUserVariableName);
 						$$ = list_make1(make_execsql_stmt(K_SET, @1, NULL));
+					}
+				| K_SET MysSysVarName
+					{
+						/*
+						 * "SET @@sysvar = expr" (with optional
+						 * GLOBAL./SESSION./local. prefixes -- the MySQL core
+						 * lexer returns the whole "@@name[.parts]" as one
+						 * MysSysVarName token) is likewise a system-variable
+						 * statement, not a plmysql local assignment; hand it
+						 * to SPI verbatim the same way, so it runs through
+						 * the top-level SET machinery a client session
+						 * already uses.
+						 *
+						 * MySQL resolves the variable name while compiling
+						 * the stored routine (ER_UNKNOWN_SYSTEM_VARIABLE,
+						 * 1193), so validate the statement text here too;
+						 * the token value carried by MysSysVarName across
+						 * the core-scanner boundary is not trustworthy in
+						 * this grammar, so the name is re-read from the
+						 * captured statement.
+						 */
+						PLMySQL_stmt *svstmt =
+							make_execsql_stmt(K_SET, @1, NULL);
+						PLMySQL_stmt_execsql *svexec =
+							(PLMySQL_stmt_execsql *) svstmt;
+
+						plmysql_check_sysvar_set(svexec->sqlstmt->query);
+						$$ = list_make1(svstmt);
 					}
 				| K_SET T_WORD
 					{
@@ -2779,6 +2809,82 @@ read_datatype(int tok)
  * firsttoken is that token's code and location its starting location.
  * If firsttoken == T_WORD, pass its yylval value as "word", else pass NULL.
  */
+/*
+ * plmysql_check_sysvar_set
+ *
+ * MySQL validates system-variable names when compiling a stored routine
+ * (ER_UNKNOWN_SYSTEM_VARIABLE, 1193).  For body statements handed to SPI
+ * verbatim (SET @@name = ..., with optional GLOBAL./SESSION./local.
+ * prefixes) the validation happens only at execution otherwise, so scan
+ * the captured statement text here and reject unknown names at compile
+ * time, mirroring MySQL.
+ */
+static void
+plmysql_check_sysvar_set(const char *query)
+{
+	const char *p;
+	bool		in_sq = false;
+	bool		in_dq = false;
+
+	for (p = query; *p != '\0'; p++)
+	{
+		if (in_sq)
+		{
+			if (*p == '\\' && p[1] != '\0')
+				p++;
+			else if (*p == '\'')
+				in_sq = false;
+			continue;
+		}
+		if (in_dq)
+		{
+			if (*p == '\\' && p[1] != '\0')
+				p++;
+			else if (*p == '"')
+				in_dq = false;
+			continue;
+		}
+		if (*p == '\'')
+		{
+			in_sq = true;
+			continue;
+		}
+		if (*p == '"')
+		{
+			in_dq = true;
+			continue;
+		}
+		if (p[0] == '@' && p[1] == '@')
+		{
+			const char *name = p + 2;
+			const char *end = name;
+			char	   *copy;
+			char	   *vname;
+
+			while (*end != '\0' &&
+				   (isalnum((unsigned char) *end) || *end == '_' ||
+					*end == '$' || *end == '.'))
+				end++;
+			if (end == name)
+				continue;
+			copy = pnstrdup(name, end - name);
+			vname = copy;
+			if (pg_strncasecmp(vname, "global.", 7) == 0 ||
+				pg_strncasecmp(vname, "session.", 8) == 0 ||
+				pg_strncasecmp(vname, "local.", 6) == 0)
+				vname = strchr(vname, '.') + 1;
+			if (!isSystemVariable(vname))
+			{
+				mysSetPendingMySQLErrno(1193);
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("Unknown system variable '%s'", vname)));
+			}
+			p = end - 1;
+		}
+	}
+}
+
 static PLMySQL_stmt *
 make_execsql_stmt(int firsttoken, int location, PLword *word)
 {
