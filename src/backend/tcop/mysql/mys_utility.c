@@ -991,6 +991,8 @@ static void mys_ProcessUtilitySlow(ParseState *pstate,
                                    DestReceiver *dest,
                                    QueryCompletion *qc);
 static void mys_ExecDropStmt(DropStmt *stmt, bool isTopLevel);
+static void mys_prune_mysql_view_dependencies(DropStmt *stmt);
+static bool mys_drop_mysql_routine(DropStmt *stmt);
 static void MysExecSetVariableStmt(ParseState *pstate, MysVariableSetStmt *parsetree, ParamListInfo params, bool isTopLevel);
 static void MysExecSelectIntoStmt(ParseState *pstate, MysSelectIntoStmt *parsetree, ParamListInfo params, QueryCompletion *qc);
 static void mys_prep_outfile_copy_stmt(CopyStmt *stmt);
@@ -1440,6 +1442,33 @@ mys_standard_ProcessUtility(PlannedStmt *pstmt,
 		case T_DropStmt:
 			{
 				DropStmt   *stmt = (DropStmt *) parsetree;
+
+				/*
+				 * MySQL's DROP FUNCTION/PROCEDURE refers to stored routines
+				 * only (see mys_drop_mysql_routine): handle plain
+				 * unqualified-name drops here, in front of the
+				 * event-trigger/standard split so both routes behave the
+				 * same.  View dependencies on routines are pruned first,
+				 * mirroring mys_ExecDropStmt.
+				 */
+				if (stmt->removeType == OBJECT_FUNCTION ||
+					stmt->removeType == OBJECT_PROCEDURE)
+				{
+					/*
+					 * mys_drop_mysql_routine() itself prunes view rewrite
+					 * dependencies of the routines it resolves; calling
+					 * mys_prune_mysql_view_dependencies() here would run the
+					 * standard (native-inclusive) name resolution first and
+					 * explode on ambiguous native names such as md5.
+					 */
+					if (mys_drop_mysql_routine(stmt))
+					{
+						qc->commandTag =
+							(stmt->removeType == OBJECT_PROCEDURE) ?
+							CMDTAG_DROP_PROCEDURE : CMDTAG_DROP_FUNCTION;
+						break;
+					}
+				}
 
 				/*
 				 * MySQL keeps the view namespace separate from (temporary)
@@ -2775,11 +2804,181 @@ mys_prune_mysql_view_dependencies(DropStmt *stmt)
 	}
 }
 
+/*
+ * mys_drop_mysql_routine
+ *
+ * MySQL's DROP FUNCTION / DROP PROCEDURE names only *stored* routines:
+ * native (built-in) functions cannot be dropped and are invisible to the
+ * name lookup, so "DROP FUNCTION IF EXISTS pi" before any stored pi exists
+ * is a silent no-op and "DROP FUNCTION pi" after one was created drops the
+ * stored routine (sp.test's IGNORE_SPACE section).  The plain PostgreSQL
+ * resolution would instead find pg_catalog/mysql-schema natives (pi, md5,
+ * ...) and fail.  Handled here: statements whose objects are unqualified
+ * routine names with no argument list; resolve them in the user schemas of
+ * the search path only, exactly like MySQL resolves in the current
+ * database, and drop what was found.
+ */
+/*
+ * Delete pg_depend rows (rewrite-rule DEPENDENCY_NORMAL entries) that make
+ * PostgreSQL refuse to drop a routine still referenced by stored view
+ * definitions -- MySQL drops the routine and leaves the view invalid.
+ * (Body of mys_prune_mysql_view_dependencies for a single resolved oid.)
+ */
+static void
+mys_prune_routine_view_deps(Oid funcoid)
+{
+	Relation	depRel;
+	SysScanDesc scan;
+	ScanKeyData key[2];
+	HeapTuple	tuple;
+
+	depRel = table_open(DependRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_refclassid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(ProcedureRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_refobjid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(funcoid));
+
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+							  NULL, 2, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tuple);
+
+		if (dep->refclassid == ProcedureRelationId &&
+			dep->refobjid == funcoid &&
+			dep->classid == RewriteRelationId &&
+			dep->deptype == DEPENDENCY_NORMAL)
+			simple_heap_delete(depRel, &tuple->t_self);
+	}
+	systable_endscan(scan);
+	table_close(depRel, RowExclusiveLock);
+
+	CommandCounterIncrement();
+}
+
+static bool
+mys_drop_mysql_routine(DropStmt *stmt)
+
+{
+	ListCell   *lc;
+	ObjectAddresses *objects;
+	bool		any = false;
+
+	if (stmt->removeType != OBJECT_FUNCTION &&
+		stmt->removeType != OBJECT_PROCEDURE)
+		return false;
+
+	/* every object must be a plain unqualified name with no arg list */
+	foreach(lc, stmt->objects)
+	{
+		ObjectWithArgs *owa = castNode(ObjectWithArgs, lfirst(lc));
+
+		if (list_length(owa->objname) != 1 || owa->objargs != NIL)
+			return false;
+		any = true;
+	}
+	if (!any)
+		return false;
+
+	objects = new_object_addresses();
+
+	foreach(lc, stmt->objects)
+	{
+		ObjectWithArgs *owa = castNode(ObjectWithArgs, lfirst(lc));
+		const char *name = strVal(linitial(owa->objname));
+		char		prokind = (stmt->removeType == OBJECT_PROCEDURE) ?
+			PROKIND_PROCEDURE : PROKIND_FUNCTION;
+		Oid			mysql_namespace = get_namespace_oid("mysql", true);
+		int			pathlen = fetch_search_path_array(NULL, 0);
+		Oid		   *path = (Oid *) palloc(sizeof(Oid) * Max(pathlen, 1));
+		Oid			funcoid = InvalidOid;
+		int			n;
+
+		fetch_search_path_array(path, pathlen);
+
+		for (n = 0; n < pathlen && !OidIsValid(funcoid); n++)
+		{
+			const char *schname;
+			FuncCandidateList clist;
+			FuncCandidateList cand;
+
+			if (path[n] == PG_CATALOG_NAMESPACE ||
+				(OidIsValid(mysql_namespace) && path[n] == mysql_namespace))
+				continue;
+			schname = get_namespace_name(path[n]);
+			if (schname == NULL)
+				continue;
+
+			/* any function of the name in this schema? (path masking) */
+			clist = FuncnameGetCandidates(list_make2(makeString(pstrdup(schname)),
+													 makeString(pstrdup(name))),
+										   -1, NIL, false, false, false, true);
+			if (clist == NULL)
+				continue;
+
+			for (cand = clist; cand != NULL; cand = cand->next)
+			{
+				HeapTuple	tup = SearchSysCache1(PROCOID,
+												 ObjectIdGetDatum(cand->oid));
+
+				if (HeapTupleIsValid(tup))
+				{
+					if (((Form_pg_proc) GETSTRUCT(tup))->prokind == prokind)
+						funcoid = cand->oid;
+					ReleaseSysCache(tup);
+				}
+				if (OidIsValid(funcoid))
+					break;
+			}
+			break;				/* first user schema with the name decides */
+		}
+
+		if (!OidIsValid(funcoid))
+		{
+			if (!stmt->missing_ok)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_FUNCTION),
+						 errmsg("%s %s does not exist",
+								stmt->removeType == OBJECT_PROCEDURE ?
+								"procedure" : "function",
+								name)));
+			}
+			continue;			/* IF EXISTS: silently skip */
+		}
+
+		mys_prune_routine_view_deps(funcoid);
+
+		{
+			ObjectAddress address;
+			ObjectAddressSet(address, ProcedureRelationId, funcoid);
+
+			if (!pg_namespace_ownercheck(get_object_namespace(&address),
+										 GetUserId()))
+				check_object_ownership(GetUserId(), stmt->removeType,
+									   address, (Node *) owa, NULL);
+			add_exact_object_address(&address, objects);
+		}
+	}
+
+	performMultipleDeletions(objects, stmt->behavior, 0);
+	free_object_addresses(objects);
+	return true;
+}
+
 static void
 mys_ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 {
 	if (stmt->removeType == OBJECT_TRIGGER)
 		mys_preprocess_mysql_drop_trigger(stmt);
+
+	if (mys_drop_mysql_routine(stmt))
+		return;
 
 	if (stmt->removeType == OBJECT_FUNCTION ||
 		stmt->removeType == OBJECT_PROCEDURE ||
