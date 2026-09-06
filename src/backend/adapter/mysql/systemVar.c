@@ -1374,6 +1374,30 @@ rectifySystemVarValue(const char *varName, char **varValue,
 						 *varValue);
 				return;
 			}
+			else if (strcmp(varName, "default_storage_engine") == 0)
+			{
+				/*
+				 * MySQL stores storage-engine names in canonical case
+				 * (InnoDB, MyISAM, MEMORY, ...) regardless of how the SET
+				 * statement spelled them, and @@default_storage_engine
+				 * displays that canonical form.
+				 */
+				static const char *const engines[] = {
+					"InnoDB", "MyISAM", "MEMORY", "CSV", "ARCHIVE",
+					"BLACKHOLE", "MRG_MYISAM", "FEDERATED", "EXAMPLE",
+					"PERFORMANCE_SCHEMA", NULL
+				};
+				int			e;
+
+				for (e = 0; engines[e] != NULL; e++)
+				{
+					if (pg_strcasecmp(*varValue, engines[e]) == 0)
+					{
+						*varValue = pstrdup(engines[e]);
+						return;
+					}
+				}
+			}
             else 
             {
                 int varValueLen;
