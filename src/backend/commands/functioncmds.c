@@ -1457,6 +1457,7 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 	DefElem    *rows_item = NULL;
 	DefElem    *support_item = NULL;
 	DefElem    *parallel_item = NULL;
+	DefElem    *comment_item = NULL;
 	ObjectAddress address;
 
 	rel = table_open(ProcedureRelationId, RowExclusiveLock);
@@ -1483,6 +1484,26 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 						NameListToString(stmt->func->objname))));
 
 	is_procedure = (procForm->prokind == PROKIND_PROCEDURE);
+
+	/*
+	 * MySQL routine characteristic COMMENT 'text' is not a native ALTER
+	 * FUNCTION option; pull it out (like CREATE FUNCTION does) and store it
+	 * as the routine's pg_description at the end.
+	 */
+	comment_item = NULL;
+	foreach(l, stmt->actions)
+	{
+		DefElem    *defel = (DefElem *) lfirst(l);
+
+		if (defel && IsA(defel, DefElem) &&
+			strcmp(defel->defname, "comment") == 0)
+		{
+			comment_item = defel;
+			break;
+		}
+	}
+	if (comment_item)
+		stmt->actions = list_delete_ptr(stmt->actions, comment_item);
 
 	/* Examine requested actions. */
 	foreach(l, stmt->actions)
@@ -1605,6 +1626,10 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 
 	table_close(rel, NoLock);
 	heap_freetuple(tup);
+
+	if (comment_item)
+		CreateComments(funcOid, ProcedureRelationId, 0,
+					   defGetString(comment_item));
 
 	return address;
 }
