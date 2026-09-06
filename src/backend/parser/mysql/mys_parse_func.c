@@ -51,6 +51,7 @@
 
 #include "access/htup_details.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
@@ -1082,6 +1083,111 @@ ParseComplexProjection(ParseState *pstate, const char *funcname,
  * the fargs list must be passed if the caller wants actual argument position
  * information to be returned into the NamedArgExpr nodes.
  */
+
+/*
+ * mys_native_first_candidates
+ *
+ * Gather FuncnameGetCandidates' results for an unqualified name one schema
+ * at a time -- the native schemas ("mysql", then pg_catalog) first, then
+ * the remaining search-path schemas in their original order -- merging the
+ * per-schema lists with MySQL's native-precedence masking: identical
+ * argument signatures from an earlier (native) schema mask later ones,
+ * while distinct signatures all survive.
+ */
+static FuncCandidateList
+mys_native_first_candidates(List *funcname, int nargs, List *argnames,
+							bool expand_variadic, bool expand_defaults,
+							bool include_out_arguments)
+{
+	const char *plainname = strVal(linitial(funcname));
+	List	   *schema_order = NIL;	/* Oids, natives first */
+	FuncCandidateList result = NULL;
+	FuncCandidateList result_tail = NULL;
+	ListCell   *lc;
+	Oid			mysql_namespace;
+
+	mysql_namespace = get_namespace_oid("mysql", true);
+
+	/* native schemas first */
+	if (OidIsValid(mysql_namespace))
+		schema_order = lappend_oid(schema_order, mysql_namespace);
+	schema_order = lappend_oid(schema_order, PG_CATALOG_NAMESPACE);
+
+	/* then the rest of the search path, in order, minus the natives */
+	{
+		int			pathlen = fetch_search_path_array(NULL, 0);
+		Oid		   *path = (Oid *) palloc(sizeof(Oid) * Max(pathlen, 1));
+		int			n;
+
+		fetch_search_path_array(path, pathlen);
+		for (n = 0; n < pathlen; n++)
+		{
+			if (path[n] == PG_CATALOG_NAMESPACE ||
+				(OidIsValid(mysql_namespace) && path[n] == mysql_namespace))
+				continue;
+			schema_order = lappend_oid(schema_order, path[n]);
+		}
+	}
+
+	foreach(lc, schema_order)
+	{
+		const char *schname = get_namespace_name(lfirst_oid(lc));
+		List	   *qualified;
+		FuncCandidateList sc;
+		FuncCandidateList node;
+
+		if (schname == NULL)
+			continue;
+		qualified = list_make2(makeString(pstrdup(schname)),
+							   makeString(pstrdup(plainname)));
+		sc = FuncnameGetCandidates(qualified, nargs, argnames,
+								   expand_variadic, expand_defaults,
+								   include_out_arguments, true);
+
+		for (node = sc; node != NULL; )
+		{
+			FuncCandidateList nxt = node->next;
+			FuncCandidateList other;
+			bool		dup = false;
+
+			if (node->oid == InvalidOid)
+			{
+				/* ambiguous-expansion sentinel: always keep, mask later */
+				dup = false;
+			}
+			else
+			{
+				for (other = result; other != NULL; other = other->next)
+				{
+					if (other->oid == InvalidOid)
+						continue;
+					if (other->nargs != node->nargs)
+						continue;
+					if (node->nargs > 0 &&
+						memcmp(other->args, node->args,
+							   node->nargs * sizeof(Oid)) != 0)
+						continue;
+					dup = true;	/* identical signature already present */
+					break;
+				}
+			}
+			if (!dup)
+			{
+				node->next = NULL;
+				if (result_tail != NULL)
+					result_tail->next = node;
+				else
+					result = node;
+				result_tail = node;
+			}
+			node = nxt;
+		}
+	}
+
+	return result;
+}
+
+
 FuncDetailCode
 mys_func_get_detail(List *funcname,
                     List *fargs,
@@ -1116,6 +1222,29 @@ mys_func_get_detail(List *funcname,
 	raw_candidates = FuncnameGetCandidates(funcname, nargs, fargnames,
 										   expand_variadic, expand_defaults,
 										   include_out_arguments, false);
+
+	/*
+	 * Native (built-in) functions outrank stored functions of the same
+	 * name for an unqualified call, exactly like MySQL: creating a stored
+	 * routine whose name collides with a native function only emits
+	 * warning 1585, and the native function keeps winning (sp.test's
+	 * IGNORE_SPACE section does this with pi, database, current_user and
+	 * md5).  openHalo implements the natives in the "mysql" schema and in
+	 * pg_catalog.  FuncnameGetCandidates collects across the whole search
+	 * path but earlier-schema entries mask identical ones in later schemas,
+	 * which is why an unqualified call never sees the native overload once a
+	 * same-signature stored routine exists; re-gather the candidates one
+	 * schema at a time with the native schemas first and identical
+	 * signatures masked in that order (keeping every overload -- a
+	 * mysql-schema sum(text)/sum(boolean) must not hide pg_catalog's
+	 * numeric sums).
+	 */
+	if (list_length(funcname) == 1)
+		raw_candidates = mys_native_first_candidates(funcname, nargs,
+													 fargnames,
+													 expand_variadic,
+													 expand_defaults,
+													 include_out_arguments);
 
 	/*
 	 * Quickly check if there is an exact match to the input datatypes (there
