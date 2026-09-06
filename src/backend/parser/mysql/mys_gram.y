@@ -7241,6 +7241,39 @@ ConstraintElem:
                     // 处理索引的注释需要修改几个struct，
                     // 为了避免修改struct，将索引的注释丢掉。
                 }
+            | FULLTEXT '(' index_params ')' index_options
+                {
+                    Constraint *n = makeNode(Constraint);
+					n->contype = CONSTR_KEY;
+					n->location = @1;
+                    n->conname = NULL;   /* MySQL auto-names the index */
+                    n->access_method = NULL;
+                    if (list_length($3) == 1)
+                    {
+                        if ($5 != NIL)
+                        {
+                            ListCell *lc;
+                            foreach (lc, $5)
+                            {
+                                Node *node = lfirst(lc);
+                                Value* value = (Value*)node;
+                                n->access_method = value->val.str;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        n->access_method = DEFAULT_INDEX_TYPE;
+                    }
+					n->keys = $3;
+					n->including = NIL;
+					n->options = NIL;
+					n->indexname = NULL;
+					n->indexspace = NULL;
+                    n->deferrable = false;
+                    n->initdeferred = false;
+					$$ = (Node *)n;
+                }
 			| EXCLUDE access_method_clause '(' ExclusionConstraintList ')'
 				opt_c_include opt_definition OptConsTableSpace OptWhereClause
 				ConstraintAttributeSpec
@@ -14625,6 +14658,21 @@ createdb_opt_item:
 			createdb_opt_name opt_equal SignedIconst
 				{
 					$$ = makeDefElem($1, (Node *)makeInteger($3), @1);
+				}
+			| opt_default CHARACTER SET ColId
+				{
+					/* MySQL: DEFAULT CHARACTER SET charset -- the schema is
+					 * created in the server encoding; option is accepted and
+					 * ignored. */
+					$$ = makeDefElem("character_set", (Node *)makeString($4), @1);
+				}
+			| opt_default CHARSET ColId
+				{
+					$$ = makeDefElem("character_set", (Node *)makeString($3), @1);
+				}
+			| opt_default COLLATE ColId
+				{
+					$$ = makeDefElem("collate", (Node *)makeString($3), @1);
 				}
 			| createdb_opt_name opt_equal opt_boolean_or_string
 				{
