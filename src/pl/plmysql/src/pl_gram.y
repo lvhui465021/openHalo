@@ -2989,7 +2989,16 @@ make_execsql_stmt(int firsttoken, int location, PLword *word)
 	execsql->is_select = (!have_into &&
 						  ((firsttoken == T_WORD && word != NULL &&
 							!word->quoted && word->ident != NULL &&
-							pg_strcasecmp(word->ident, "select") == 0) ||
+							(pg_strcasecmp(word->ident, "select") == 0 ||
+							 /*
+							  * MySQL lets a stored program run SHOW
+							  * statements that produce a result set
+							  * (SHOW PROCEDURE STATUS, SHOW CREATE
+							  * PROCEDURE/FUNCTION, ...).  The mys grammar
+							  * parses them into SELECTs, so count and
+							  * stream them exactly like a bare SELECT.
+							  */
+							 pg_strcasecmp(word->ident, "show") == 0)) ||
 						   (firsttoken == '(' && first_word != NULL &&
 							pg_strcasecmp(first_word, "select") == 0) ||
 						   /*
